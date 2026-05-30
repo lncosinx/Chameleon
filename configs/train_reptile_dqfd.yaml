@@ -1,0 +1,55 @@
+# 阶段二训练配置：DQfD + Reptile 元预训练
+# 对应设计文档 §3.3–3.4
+
+meta_iterations: 20000
+inner_steps: 5
+inner_lr: 0.0003
+meta_lr: 0.05
+batch_size: 32
+sequence_len: 32
+burn_in_len: 8         # R2D2 式隐状态重建步数
+gamma: 0.99
+n_step: 5
+
+# DQfD 损失权重
+lambda_td: 1.0
+lambda_nstep: 1.0
+lambda_margin: 1.0
+lambda_l2: 0.00001
+margin: 0.5
+
+# 数值安全
+mellowmax_alpha: 1.0   # 先取 1.0，按 Q_max/Q_mean 在 {0.5,1,2} 中调
+
+# 阶段二专家/自游走混合比例（课程式）
+expert_ratio_start: 0.9
+expert_ratio_end: 0.5
+expert_ratio_decay_iters: 8000
+
+# 地图采样概率（前期/中期/后期）
+map_schedule:
+  early:
+    random: 0.45
+    warehouse: 0.20
+    maze: 0.20
+    room: 0.15
+  mid:
+    random: 0.30
+    warehouse: 0.30
+    maze: 0.25
+    room: 0.15
+  late:
+    random: 0.20
+    warehouse: 0.30
+    maze: 0.30
+    room: 0.20
+
+# 并行（目标硬件 2×RTX 5090 + 47 核 CPU）
+parallel:
+  task_parallel_gpus: [0, 1]   # 双卡 task-并行 Reptile：两卡各跑一个 task 的 inner loop
+  num_env_workers: 40          # CPU 多进程 env/观测构建（spawn，不碰 CUDA）
+  num_lacam_workers: 4         # C++ 绑定，按需生成/介入
+  start_method: spawn
+  shared_buffer_dtype: uint8   # patch 共享内存 zero-copy，禁用 pickle
+  use_amp: true
+  use_torch_compile: true      # + CUDA graphs，砍 kernel launch 开销

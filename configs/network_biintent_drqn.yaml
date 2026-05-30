@@ -1,0 +1,15 @@
+# 网络架构配置 — BiIntent-GAT-DRQN
+# 对应设计文档 §2
+
+obs_radius: 5
+patch_channels: 4      # Pogema 原生 3 通道 + 追加足迹通道 1
+cnn_channels: [32, 64, 64]
+scalar_feat_dim: 8     # 目标相对方向(2)+上一步动作 one-hot(5)+到达标志(1)
+intent_dim: 64
+comm_dim: 64
+comm_radius: 4         # r_c < obs_radius(=5)，且仅与视野内邻居通信
+comm_topk: 6           # 每体最多聚合 k 个最近邻，抑制拓扑雪崩
+gru_hidden_dim: 256
+dueling_hidden_dim: 256
+num_actions: 5
+num_attention_heads: 4

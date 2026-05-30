@@ -1,0 +1,22 @@
+# 阶段三微调配置：目标地图低滞后近 on-policy
+# 对应设计文档 §3.6–3.8
+
+rollout_segment_len: 32     # 每段同步采样长度
+num_parallel_envs: 64
+max_policy_version_lag: 1   # 同步段内权重冻结
+sync_after_each_segment: true
+reuse_epochs_per_segment: 1 # 近 on-policy：每段数据基本只用 1 次
+
+# LaCAM 实时专家介入退火
+expert_prob_start: 0.5
+expert_prob_end: 0.02
+expert_decay_steps: 200000
+
+# 损失退火
+lambda_margin_start: 1.0
+lambda_margin_end: 0.0       # 末期专家项归零，退化为纯近 on-policy Q 学习
+
+# 硬件分工（阶段三无 task 并行）
+learner_gpu: 0               # GPU0 = learner（训练）
+actor_gpu: 1                 # GPU1 = batched 推理 actor
+num_env_workers: 40           # 并行 env（同步段采样，lag≤1）

@@ -1,0 +1,22 @@
+# Pogema warehouse 地图配置（规则货架、窄通道、瓶颈）
+# 对齐 pogema-benchmark/raw_data_LMAPF/03-warehouse/03-warehouse.yaml
+# 需经 pogema-toolbox 加载/生成
+map_type: warehouse
+map_size: 64
+num_agents: 8           # 开发起步，逐步放大到 64→96→128
+obs_radius: 5
+max_episode_steps: 256
+
+# warehouse 结构参数（pogema-toolbox WarehouseConfig 默认值）
+warehouse:
+  wall_width: 5
+  wall_height: 2
+  walls_in_row: 5
+  walls_rows: 5
+  bottom_gap: 5
+  horizontal_gap: 1
+  vertical_gap: 3
+
+collision_system: soft
+on_target: restart
+# observation_type 不设（Pogema 2.x 默认即返回 (3,K,K) 局部观测数组）

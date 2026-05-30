@@ -1,0 +1,23 @@
+# Pogema maze 地图配置（长通道、多转角，考验记忆与死锁恢复）
+# 对齐 pogema-benchmark/raw_data_LMAPF/02-mazes/02-mazes.yaml
+# 需经 pogema-toolbox 加载/生成
+map_type: maze
+map_size: 64
+num_agents: 8           # 开发起步，逐步放大到 32→64
+obs_radius: 5
+max_episode_steps: 128
+
+# maze 结构参数（pogema-toolbox MazeRangeSettings）
+maze:
+  width_min: 20
+  width_max: 64
+  height_min: 20
+  height_max: 64
+  obstacle_density_min: 0.2
+  obstacle_density_max: 0.4
+  wall_components_min: 1
+  wall_components_max: 8
+
+collision_system: soft
+on_target: restart
+# observation_type 不设（Pogema 2.x 默认即返回 (3,K,K) 局部观测数组）

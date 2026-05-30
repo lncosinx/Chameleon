@@ -1,0 +1,13 @@
+# Chameleon — 基于 LaCAM-DQfD-Reptile 的部分可观测 MAPF
+#
+# 核心依赖
+pogema>=1.4.0
+torch>=2.0.0
+numpy>=1.22
+numba>=0.57
+pyyaml>=6.0
+
+# pogema-toolbox（需从 git 安装，不在此处 pin 版本）
+# git+https://github.com/Cognitive-AI-Systems/pogema-toolbox.git
+
+# 可选：LaCAM C++ 绑定（需单独构建）

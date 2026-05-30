@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project — checkpoints & logs
+checkpoints/
+logs/
+data/
+
+# Project — C++ build artifacts
+lacam/build/
+lacam/build_pybind/
+*.o
+*.a
+
+# Project — compiled extension (rebuild on server)
+# lacam/_lacam*.so
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Claude Code
+.claude/
+
+# Pogema toolbox (vendored)
+pogema-toolbox/
+pogema-benchmark/
+
+# Misc
+*.log
+tmp/

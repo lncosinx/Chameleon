@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.16)
+project(lacam_pybind)
+
+# Find pybind11
+find_package(pybind11 REQUIRED)
+
+# LaCAM static library
+add_library(lacam STATIC IMPORTED)
+set_target_properties(lacam PROPERTIES
+    IMPORTED_LOCATION /tmp/lacam/build/liblacam.a
+)
+target_include_directories(lacam INTERFACE /tmp/lacam/lacam/include)
+
+# Python module
+pybind11_add_module(_lacam lacam_bind.cpp)
+target_link_libraries(_lacam PRIVATE lacam)
+target_compile_options(_lacam PRIVATE -O3)
+target_compile_features(_lacam PRIVATE cxx_std_17)

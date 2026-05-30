@@ -1,0 +1,24 @@
+# Pogema room 地图配置（房间+门洞，考验门口协同）
+# 结构同 maze 生成器（pogema-toolbox 无独立 room generator），
+# 通过 MazeRangeSettings 调整参数模拟房间结构。
+# 也可用 pogema-toolbox movingai/puzzles 地图族作为 held-out。
+map_type: room
+map_size: 64
+num_agents: 8           # 开发起步，逐步放大
+obs_radius: 5
+max_episode_steps: 128
+
+# room 结构参数
+room:
+  width_min: 20
+  width_max: 64
+  height_min: 20
+  height_max: 64
+  obstacle_density_min: 0.1
+  obstacle_density_max: 0.3
+  wall_components_min: 2
+  wall_components_max: 12
+
+collision_system: soft
+on_target: restart
+# observation_type 不设（Pogema 2.x 默认即返回 (3,K,K) 局部观测数组）
