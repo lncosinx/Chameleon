@@ -110,13 +110,14 @@
 - **交付物**：`models/encoders.py`（PatchEncoder + Goal/Action/Status 编码）
 - **验收门**：`(B,4,11,11)`→patch 特征、`(B,8)`→标量特征，shape 正确，可反传。
 
-### T3.2 通信模块（FOV 内 top-k 双向注意力）
+### T3.2 通信模块（FOV 内 软稀疏+迟滞 双向注意力）
 - **依赖**：T3.1
 - **交付物**：`models/communication.py`
-- **做什么**：意图编码；邻居选择须**同时**满足 `dist≤comm_radius(=4)` 且 `comm_radius<obs_radius` 且 **FOV 内可见**，再取最近 `comm_topk=6`；批量稀疏多头注意力（`index_select`/`scatter`，**禁止 per-agent Python 循环**）；attention 稀疏化/温度控制。
+- **做什么**：意图编码；候选邻居须**同时**满足 `dist≤comm_radius(=4)` 且 `comm_radius<obs_radius` 且 **FOV 内可见**；邻居选择用**软稀疏注意力(entmax/sparsemax)+迟滞($\tau_{out}<\tau_{in}$)**，**不要用 hard top-k 做选择**；`comm_topk=6` 仅作算力上限(非零邻居超额时封顶)；批量稀疏多头注意力（`index_select`/`scatter`，**禁止 per-agent Python 循环**）。
 - **约束**：INVARIANT 10；语言与性能策略（批量稀疏、无 per-agent 循环）
 - **验收门**：
-  - 邻居数 ≤ 6、全部在 FOV 内；无邻居时 `c_i=0`。
+  - 邻居全部在 FOV 内、生效邻居数 ≤ 算力上限；无邻居时 `c_i=0`。
+  - **防闪烁检验**：构造两个邻居得分接近的边界场景，令一体微动一步，验证 **hard top-k 会翻转、而软稀疏+迟滞下 `EdgeFlipRate` 显著更低**（这是本任务的核心验收点，不是可选）。
   - 用 `num_agents=96` 跑一次前向，**无 Python 逐体循环**（代码审查）；记录耗时作 §4 基线。
 
 ### T3.3 循环核 + Dueling Q 头 + 组装
@@ -210,6 +211,13 @@
 - **做什么**：**留一个训练中从未出现的地图族**做泛化测试（对应设计文档 H2）。
 - **验收门**：报告 held-out 上的 SR，作为泛化的诚实证据（不得用训练同族新布局冒充）。
 
+### T7.4 通信消融阶梯（H5：双向意图通信是否值得其复杂度）
+- **依赖**：T7.2, T3.2
+- **交付物**：`scripts/evaluate_policy.py` 的消融模式 + 结果表
+- **做什么**：跑设计文档 §7-H5 的四档（A 全量软稀疏+意图+注意力 / B 去注意力换 mean-pool / C 去意图只传位置 / D 无通信），在 maze/room 上对比 **SR / DeadlockCount / WaitRate / EdgeFlipRate**。
+- **约束**：评估关专家介入；与 §4.6 降级路线挂钩（B 即降级档位 2）。
+- **验收门**：输出四档对照表并给出判决：A≈D⟹砍通信；A≈B⟹退 mean-pool；A≈C⟹只传位置；A 显著最优⟹保留全量。**让数据判决，不靠论证。**
+
 ---
 
 ## 全局完成定义（DoD）
@@ -217,17 +225,18 @@
 - [ ] `CLAUDE.md` 的 14 条 INVARIANT 在代码中都有对应断言或测试
 - [ ] env-step/s ≥ 目标，profiler 报告归档
 - [ ] 四地图族训练 + held-out 泛化结果归档
+- [ ] 通信消融阶梯（H5）结果归档并据此定型通信复杂度
 - [ ] 全程固定种子可复现；四类 checkpoint 齐全
 
 ---
 
 ## 进度勾选
-- [x] T0.1 (2026-05-30, env_check.py 全通过, MOVES=[[0,0],[-1,0],[1,0],[0,-1],[0,1]], wait=0 ✓, pogema 2.0.0a, 1 GPU dev)  - [x] T0.2 (2026-05-30, 7 configs 全解析, seed.py 可复现, logger.py 写就)
-- [x] T1.1 (2026-05-30, 四族全部 reset+20步不崩, obs (3,11,11) ✓, INVARIANT 2/3 断言通过)  - [x] T1.2 (2026-05-30, 4ch patch+8d scalar, 足迹衰减 ρ=0.9, INVARIANT 2/5/6 断言通过)  - [x] T1.3 (2026-05-30, -inf 掩码+mellowmax 无 NaN, batch mask 一致, INVARIANT 7)  - [x] T1.4 (2026-05-30, BFS 测地距离+BFS shaping+奖励隔离, INVARIANT 3/4/14)  - [x] Phase1门 (2026-05-30, 四族×50ep×64步, 0 NaN, (obs,action,reward,done,mask) 完整)
-- [x] T2.1 (2026-05-30, 四族各20/20成功, prioritized fallback, lacam_runner 接口就绪)  - [x] T2.2 (2026-05-30, 动作映射+可解释性过滤+hard_case_manager, INVARIANT 1/2/11)  - [x] T2.3 (2026-05-30, expert_demo_buffer 序列采样 32+8 OK, 字段齐全)
-- [x] T3.1 (2026-05-30, PatchEncoder+ScalarEncoder shape OK, 可反传)  - [x] T3.2 (2026-05-30, FOV内 top-k=6, 无邻居 c=0, 无 per-agent 循环)  - [x] T3.3 (2026-05-30, e2e (2,16,4)→Q (2,16,4,5), -inf mask, 719K params)
-- [x] T4.1 (2026-05-30, masked mellowmax NaN-free, α monotonic, α=1.0)  - [x] T4.2 (2026-05-30, TD+n-step+margin+L2, margin_excluded 梯度零, INVARIANT 11/12)
-- [x] T5.1 (2026-05-30, shared_rollout+selfplay+collator, 字段齐全)  - [x] T5.2 (2026-05-30, profiler 就绪, 分段计时+吞吐估算)
-- [x] T6.1 (2026-05-30, Reptile+DQfD 单卡跑通, loss 0.344→0.318↓, Q 不发散, ckpt OK)  - [ ] T6.2 (双GPU升级待服务器)  - [ ] Phase6性能门
-- [x] T7.1 (2026-05-30, recent_online+finetune_online+finetune_target_map 就绪, lag≤1, 退火策略实现)  - [x] T7.2 (2026-05-30, evaluator 产 SR/AR/Makespan/WaitRate/Q诊断, evaluate_policy 入口, 关专家介入)  - [ ] T7.3 (held-out待服务器)
-- [ ] DoD (T6.2+T7.3+性能门+14 INVARIANT全覆盖待服务器)
+- [ ] T0.1  - [ ] T0.2
+- [ ] T1.1  - [ ] T1.2  - [ ] T1.3  - [ ] T1.4  - [ ] Phase1门
+- [ ] T2.1  - [ ] T2.2  - [ ] T2.3
+- [ ] T3.1  - [ ] T3.2  - [ ] T3.3
+- [ ] T4.1  - [ ] T4.2
+- [ ] T5.1  - [ ] T5.2
+- [ ] T6.1  - [ ] T6.2  - [ ] Phase6性能门
+- [ ] T7.1  - [ ] T7.2  - [ ] T7.3  - [ ] T7.4
+- [ ] DoD

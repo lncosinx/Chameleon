@@ -8,7 +8,13 @@ scalar_feat_dim: 8     # 目标相对方向(2)+上一步动作 one-hot(5)+到达
 intent_dim: 64
 comm_dim: 64
 comm_radius: 4         # r_c < obs_radius(=5)，且仅与视野内邻居通信
-comm_topk: 6           # 每体最多聚合 k 个最近邻，抑制拓扑雪崩
+comm_topk_cap: 6       # 仅算力上限（非零邻居超额时封顶 GAT 计算量）；
+                        # 邻居选择用软稀疏(entmax)+迟滞(τ_out<τ_in)，不用 hard top-k
+entmax_alpha: 1.5      # 软稀疏度：1=softmax, 2=sparsemax, 默认 1.5
+tau_in: 0.05           # 迟滞进入阈值
+tau_out: 0.02          # 迟滞退出阈值 (τ_out < τ_in)
+stickiness_bonus: 0.1  # 已活跃邻居的 logit 加分
+ema_decay: 0.0         # 跨步通信特征 EMA 平滑（0=不平滑）
 gru_hidden_dim: 256
 dueling_hidden_dim: 256
 num_actions: 5

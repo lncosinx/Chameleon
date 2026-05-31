@@ -14,6 +14,7 @@ BiIntent-GAT-DRQN：完整网络组装。
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Tuple, Optional, Dict
@@ -49,8 +50,13 @@ class BiIntentGATDRQN(nn.Module):
         intent_dim: int = 64,
         comm_dim: int = 64,
         comm_radius: int = 4,
-        comm_topk: int = 6,
+        comm_topk_cap: int = 6,          # 仅算力上限
         num_attention_heads: int = 4,
+        entmax_alpha: float = 1.5,       # 软稀疏度
+        tau_in: float = 0.05,            # 迟滞进入阈值
+        tau_out: float = 0.02,           # 迟滞退出阈值
+        stickiness_bonus: float = 0.1,   # 活跃邻居加分
+        ema_decay: float = 0.0,          # 跨步 EMA 平滑
         # GRU
         gru_hidden_dim: int = 256,
         # Dueling Q
@@ -77,13 +83,18 @@ class BiIntentGATDRQN(nn.Module):
         # 意图投影
         self.intent_proj = nn.Linear(self.fused_dim, intent_dim)
 
-        # 双向意图注意力
+        # 双向意图注意力（软稀疏 + 迟滞）
         self.communication = BiIntentAttention(
             intent_dim=intent_dim,
             comm_dim=comm_dim,
             comm_radius=comm_radius,
-            comm_topk=comm_topk,
+            comm_topk_cap=comm_topk_cap,
             num_heads=num_attention_heads,
+            entmax_alpha=entmax_alpha,
+            tau_in=tau_in,
+            tau_out=tau_out,
+            stickiness_bonus=stickiness_bonus,
+            ema_decay=ema_decay,
         )
 
         # 通信后的特征维度 = fused_dim + intent_dim（通信输出维度 = intent_dim）
@@ -143,17 +154,22 @@ class BiIntentGATDRQN(nn.Module):
         # fused: (B, T, N, d_patch + d_scalar)
         fused = torch.cat([patch_feat, scalar_feat], dim=-1)
 
-        # ---- 2. 通信（逐时间步） ----
+        # ---- 2. 通信（逐时间步，带迟滞状态） ----
         intent = self.intent_proj(fused)  # (B, T, N, intent_dim)
 
+        # 重置通信模块的跨时间步状态
+        self.communication.reset_state(batch_size=B)
+
         comm_list = []
-        attn_list = []
+        edge_flip_rates = []
+        avg_neighbors_list = []
         for t in range(T):
             intent_t = intent[:, t]        # (B, N, intent_dim)
             pos_t = positions[:, t]        # (B, N, 2)
-            comm_t, attn_t = self.communication(intent_t, pos_t)
+            comm_t, comm_info = self.communication(intent_t, pos_t)
             comm_list.append(comm_t)
-            attn_list.append(attn_t)
+            edge_flip_rates.append(comm_info.get("edge_flip_rate", 0.0))
+            avg_neighbors_list.append(comm_info.get("avg_neighbors", 0.0))
 
         comm_feat = torch.stack(comm_list, dim=1)  # (B, T, N, intent_dim)
 
@@ -182,11 +198,9 @@ class BiIntentGATDRQN(nn.Module):
             "q_mean": q_values.detach().mean().item(),
             "q_max": q_values.detach().max().item(),
             "q_min": q_values.detach().min().item(),
+            "edge_flip_rate": float(np.mean(edge_flip_rates)) if edge_flip_rates else 0.0,
+            "avg_neighbors": float(np.mean(avg_neighbors_list)) if avg_neighbors_list else 0.0,
         }
-        if attn_list:
-            avg_attn = torch.stack(attn_list, dim=1)  # (B, T, N, K)
-            info["attn_mean"] = avg_attn.detach().mean().item()
-            info["attn_entropy"] = -(avg_attn * (avg_attn + 1e-8).log()).sum(dim=-1).detach().mean().item()
 
         return q_values, h_final, info
 

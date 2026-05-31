@@ -1,10 +1,22 @@
 # Chameleon — 基于 LaCAM-DQfD-Reptile 的部分可观测 MAPF
 
+## 镜像构建
+
+```bash
+cd Chameleon
+docker build \
+  --network=host \
+  --build-arg http_proxy=http://127.0.0.1:20171 \    #代理端口设置，不需要可以删掉
+  --build-arg https_proxy=http://127.0.0.1:20171 \   #代理端口设置，不需要可以删掉
+  -t chameleon:05301957 .
+
+```
+
 ## 依赖安装
 
 ```bash
 # Pogema 环境 + toolbox（仓库/迷宫/房间地图）
-pip install pogema==1.4.0
+# pip install pogema==2.0.0a 安装pogema-toolbox会自动安装pogema
 git clone https://github.com/Cognitive-AI-Systems/pogema-toolbox.git
 cd pogema-toolbox && pip install -e . && cd ..
 

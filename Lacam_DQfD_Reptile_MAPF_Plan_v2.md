@@ -8,7 +8,7 @@
 > 4. **Reptile + target 网络**：明确 target 在每个 inner loop 内 **冻结于 θ_meta**，每个 task 起始重置；阶段三微调采用周期性 target 同步。
 > 5. **阶段三**：由"replay + 版本滞后 ≤2"改为 **低滞后同步式近 on-policy（lag ≤ 1）**，避免权重滞后导致的不收敛/慢收敛。明确阶段二（DQfD）必须 off-policy、阶段三转 near-on-policy 的分工。
 > 6. **mellowmax**：删除 `alpha=0.1`（过小→近 hard max→易高估）。改为扫描 `α∈{0.5,1,2}`，按 `Q_max/Q_mean` 走势选取。
-> 7. **通信**：约束 `r_c < obs_radius`，仅与视野内智能体通信；新增 **top-k 邻居截断 + 注意力稀疏化** 主动抑制"拓扑雪崩"（不再只监控）。
+> 7. **通信**：约束 `r_c < obs_radius`，仅与视野内智能体通信；邻居选择改为 **软稀疏注意力(entmax)+迟滞**，`top-k` 降级为纯算力上限（更正早期"top-k 抑制雪崩"的措辞——hard top-k 会引入通信图闪烁）。规模由 FOV+稀疏控制，时间稳定性由迟滞/软化保证。
 > 8. **循环回放**：新增 **R2D2 式 burn-in**，缓解隐状态陈旧。
 > 9. **预训练混合比例**：由固定 70/30 改为 **课程式**（早期专家为主，后期逐步增加自游走）。
 > 10. **大幅扩写第 4 章「训练速度优化」**：新增 **语言选型（为何绝大部分用 Python、Rust 非杠杆，编译顺序 numpy→numba→Rust）**、**元学习两层并行（CPU 多进程采样 + 双 GPU task-并行 Reptile）**、**目标硬件 2×RTX 5090 + 47 核的进程布局（阶段二/阶段三）**，以及 launch-受限的诊断分流；保留吞吐目标、瓶颈顺序与 GAT 降级备选。
@@ -169,14 +169,14 @@ scalar_feat_dim: 8     # 目标相对方向(2)+上一步动作 one-hot(5)+到达
 intent_dim: 64
 comm_dim: 64
 comm_radius: 4         # 修正：r_c < obs_radius(=5)，且仅与视野内邻居通信
-comm_topk: 6           # 新增：每体最多聚合 k 个最近邻，抑制拓扑雪崩
+comm_topk: 6           # 仅算力上限(封顶 GAT 计算量)；邻居选择用软稀疏+迟滞，非"抑制雪崩"
 gru_hidden_dim: 256
 dueling_hidden_dim: 256
 num_actions: 5
 num_attention_heads: 4
 ```
 
-**动作空间（按 Pogema 2.0.0a 实测，`GridConfig.MOVES`）**：
+**动作空间（按 Pogema 1.4.0 实测，`GridConfig.MOVES`）**：
 
 | action_id | 含义 | (drow, dcol) |
 |---|---|---|
@@ -278,12 +278,18 @@ hard case 来源：LaCAM 失败、策略 rollout 失败、高碰撞、高停滞�
 - **PatchEncoder**：CNN 对 `(4,11,11)` patch 快速提特征。
 - **GoalEncoder / ActionEncoder / StatusEncoder**：对目标相对方向、上一步动作、到达标志编码（合为 `scalar_feat_dim`）。
 
-#### models/communication.py — **加 FOV 约束与 top-k**
-- **IntentEncoder**：生成自身意图向量 $\mathbf{z}_i\in\mathbb{R}^{64}$。
-- **NeighborSelector**：邻居须**同时**满足 (a) 距离 $\le r_c$ 且 $r_c < \text{obs\_radius}$，(b) **在自身 FOV 内可见**；再取最近 **top-k**（`comm_topk=6`）截断。
-- **BiIntentAttention**：多头注意力聚合 top-k 邻居意图，得 $\mathbf{c}_i$。对 attention 权重做**稀疏化/温度控制**，主动抑制"拓扑雪崩"。
+#### models/communication.py — **FOV 约束 + 防闪烁的稀疏邻居选择**
 
-> 通信只在 FOV 内、top-k 截断，从机制上限制级联范围（不再只靠指标监控）。
+> **更正(相对 v1/早期措辞)**:hard top-k 截断**会引入通信图闪烁(flickering)**——当第 k 与第 k+1 名邻居得分接近时,任一体微动一步就使排名交换,边在相邻时间步反复通断,导致 (a) 聚合特征 $\mathbf{c}_i$ 跳变、GRU 输入不连续,(b) hard 选择不可导、边界梯度来回翻、训练方差大,(c) 让行决策走/停振荡。因此 **top-k 只压住了通信图的*规模*(雪崩),却用*时间稳定性*换规模(闪烁)**——这是两个不同的病,不能用 top-k 同时声称解决。下面把邻居选择改为**软稀疏 + 迟滞**,把 top-k 降级为纯粹的算力上限。
+- **IntentEncoder**：生成自身意图向量 $\mathbf{z}_i\in\mathbb{R}^{64}$。
+- **NeighborSelector**：候选邻居须**同时**满足 (a) 距离 $\le r_c$ 且 $r_c < \text{obs\_radius}$，(b) **在自身 FOV 内可见**。在候选集上**不做 hard top-k**，改为：
+  - **主方案——软稀疏注意力**：对所有候选邻居用带温度的**稀疏 softmax(entmax/sparsemax)** 算权重,让不相关邻居权重被自然压到 0。稀疏性由可导的权重衰减实现,**不闪烁**;
+  - **迟滞(hysteresis)**:维持/纳入邻居用阈值 $\tau_{in}$、踢出用更宽松的 $\tau_{out}<\tau_{in}$,已在集合内的邻居要明显变差才被踢,避免边界反复横跳;
+  - **粘滞项(可选)**:对"上一步已在集合内"的邻居给一个小加分,制造切换惯性;
+  - **`comm_topk=6` 仅作算力上限**:当软稀疏后非零邻居仍超过 k 时,取权重最高的 k 个以封顶 GAT 计算量($O(Nk)$),**不再把它当作"抑制雪崩的机制"**。
+- **BiIntentAttention**：多头注意力聚合选中邻居意图,得 $\mathbf{c}_i$。配合上面的软稀疏 + 迟滞,通信图在时间上平滑;必要时对 $\mathbf{c}_i$ 跨步做轻度 EMA 平滑进一步抑制高频抖动。
+
+> 通信只在 FOV 内、软稀疏选择(算力上限 k),从机制上限制级联*规模*,同时用迟滞/软化保证时间*稳定性*。"和谁通信"(选择层)与"通信内容/如何聚合"(意图+注意力)是两个不同层面——见 §7 的消融阶梯(H5)验证后者是否值得其复杂度。
 
 #### models/recurrent_core.py
 DRQN 循环记忆，建议 GRU：$h_i^t = \text{GRU}(x_i^t, h_i^{t-1})$，$x_i^t$ 为融合局部观测+通信后的特征。对 maze/room 尤为重要。
@@ -349,9 +355,9 @@ Flatten -> Linear -> d_patch (=128)
 目标方向/上一步动作/到达标志经 MLP 得 $d_{\text{scalar}}$，与 patch 特征拼接。
 
 ### 2.5 双向意图通信
-意图 $\mathbf{z}_i = g_\theta(\text{patch}\oplus\text{scalar})$。邻接：$j\in\mathcal{N}_i \iff \lVert p_i-p_j\rVert\le r_c \wedge j\in\text{FOV}_i$，再取最近 top-k。多头注意力：
+意图 $\mathbf{z}_i = g_\theta(\text{patch}\oplus\text{scalar})$。候选邻接：$j\in\mathcal{N}_i^{\text{cand}} \iff \lVert p_i-p_j\rVert\le r_c \wedge j\in\text{FOV}_i$。在候选集上用**稀疏 softmax(entmax)** 算权重(不相关邻居权重→0),配合迟滞 $\tau_{out}<\tau_{in}$ 保证时间稳定;`comm_topk` 仅在非零邻居超额时封顶算力。多头注意力：
 
-$$\alpha_{ij}=\text{softmax}_j\big(\text{score}(\mathbf{z}_i,\mathbf{z}_j)\big),\quad \mathbf{c}_i=\sum_{j\in\mathcal{N}_i^{\text{topk}}}\alpha_{ij}\,W\mathbf{z}_j$$
+$$\alpha_{ij}=\text{entmax}_j\big(\text{score}(\mathbf{z}_i,\mathbf{z}_j)\big),\quad \mathbf{c}_i=\sum_{j\in\mathcal{N}_i}\alpha_{ij}\,W\mathbf{z}_j$$
 
 无邻居则 $\mathbf{c}_i = \mathbf{0}$。
 
@@ -570,10 +576,11 @@ Q 的 mean/max/min/std；**Expert Q advantage** $=Q(s,a^E)-\max_{a\ne a^E}Q(s,a)
 ### 5.6 专家与模仿
 LaCAM 成功率、模仿匹配准确度 `Acc_E`、专家 wait 比率 `Wait_E`、微调实时干预占比 `InterventionRate`。
 
-### 5.7 通信与拓扑雪崩监控
-在 $r_c$（FOV 内、top-k）下构建动态图 $G^t$：
-- **最大连通分支规模 MaxCC**：频繁接近 $N$ ⟹ 局部通信退化为大范围无序网络（拓扑雪崩）。
+### 5.7 通信图监控（规模 + 时间稳定性）
+在 $r_c$（FOV 内、软稀疏选择）下构建动态图 $G^t$：
+- **最大连通分支规模 MaxCC**：频繁接近 $N$ ⟹ 局部通信退化为大范围无序网络（拓扑雪崩，*规模*失控）。
 - **平均邻居数**：长期≈0 ⟹ $r_c$ 过小/分布过稀；过大 ⟹ 计算开销与噪声上升。
+- **边翻转率 EdgeFlipRate（闪烁指标，新增）**：相邻两步 $G^t$ 与 $G^{t+1}$ 的边集对称差占比 $\frac{|E^t \triangle E^{t+1}|}{|E^t \cup E^{t+1}|}$。高 ⟹ 通信图闪烁（*时间稳定性*失控），应加强迟滞/软化或调 $\tau_{in},\tau_{out}$。这是判断"是否被 hard 选择的边界抖动困扰"的直接证据。
 - **Attention 熵**：高熵（≈$\log k$）⟹ 无差别关注、避障混乱；低熵 ⟹ 聚焦关键冲突邻居（窄门口堵路者），通常对应更高效避碰。
 
 ### 5.8 系统性能
@@ -617,6 +624,16 @@ Actor FPS、Learner Update FPS、IPC 等待、序列化耗时、显存拷贝、�
 - **H2（泛化）**：Reptile 元参数 $\theta^\*$ 在少量微调（目标 < 30 epoch）后即可适应。**验证**：必须**留出一个训练中从未出现的地图族（held-out family）**作真正的泛化测试，而非用训练同族的新布局冒充"完全陌生"。
 - **H3（奖励）**：BFS 势函数 shaping 相比无稠密 shaping，在 maze/room 上降低 DeadlockCount 与 RepeatRate。**验证**：`{无稠密, BFS-PBRS}` 在 maze/room 上对比这两个指标；并验证 BFS-PBRS 不改变收敛到的策略质量（策略不变性的经验检查）。
 - **H4（速度）**：在 §4 优化后达到 ≥ 4×10³ env-step/s（对标的 1/10）。**验证**：profiler 报告 + 端到端吞吐。
+- **H5（通信复杂度是否值得）**：双向意图 + 注意力相比更朴素的聚合,在强协同地图(maze/room)上更优。**注意**:"和谁通信"(选择层:软稀疏/迟滞)与"通信内容+如何聚合"(意图向量+注意力)是两个不同层面,本假设只检验后者是否值得其复杂度。**验证——消融阶梯**(与 §4.6 降级路线挂钩,一举两得):
+
+  | 档 | 邻居选择 | 内容 | 聚合 |
+  |---|---|---|---|
+  | A 全量 | 软稀疏(entmax)+迟滞 | 双向意图 $\mathbf{z}_j$ | 多头注意力 |
+  | B 去注意力 | 软稀疏+迟滞 | 双向意图 | 带权 mean-pool |
+  | C 去意图 | 软稀疏+迟滞 | 仅相对位置/速度 | 多头注意力 |
+  | D 无通信 | — | — | — |
+
+  在 maze/room 上对比 **SR / DeadlockCount / WaitRate / EdgeFlipRate**：A≈D ⟹ 通信整体无用应砍；A≈B ⟹ 注意力多余,退 mean-pool（即 §4.6 档位 2）；A≈C ⟹ 意图向量多余,只传位置；A 显著最优 ⟹ 复杂度值得。**让数据判决"是否多余",不靠设计阶段论证。**
 
 ---
 
@@ -624,4 +641,4 @@ Actor FPS、Learner Update FPS、IPC 等待、序列化耗时、显存拷贝、�
 
 核心：**LaCAM 专家（特权，仅训练期）→ DQfD 模仿（off-policy 阶段二）→ Reptile 跨四地图族元初始化 → 目标地图低滞后近 on-policy 微调（阶段三）**。
 
-网络为**共享参数去中心化 Dueling DRQN**，不使用 QMIX、不构造 $Q_{tot}$；输入为 **Pogema 原生 3 通道（障碍/智能体含自身/目标边界投影）+ 追加足迹通道 + 标量特征（目标方向/上一步动作/到达）**；用 **FOV 内 top-k 双向意图注意力**实现避让并主动抑制拓扑雪崩；用**数值安全 masked mellowmax**抑制高估；用 **BFS 测地距离的势函数 shaping**（策略不变、不破坏部分可观测）替代被删除的点积对齐奖励，规避迷宫绕行陷阱。已如实声明 IQL 非平稳性、中心化→去中心化的时序模仿丢失等核心风险，并配以指标与机制缓解。
+网络为**共享参数去中心化 Dueling DRQN**，不使用 QMIX、不构造 $Q_{tot}$；输入为 **Pogema 原生 3 通道（障碍/智能体含自身/目标边界投影）+ 追加足迹通道 + 标量特征（目标方向/上一步动作/到达）**；用 **FOV 内软稀疏(entmax)+迟滞的双向意图注意力**实现避让（控制通信图*规模*与*时间稳定性*,top-k 仅作算力上限）；用**数值安全 masked mellowmax**抑制高估；用 **BFS 测地距离的势函数 shaping**（策略不变、不破坏部分可观测）替代被删除的点积对齐奖励，规避迷宫绕行陷阱。已如实声明 IQL 非平稳性、中心化→去中心化的时序模仿丢失、hard top-k 闪烁等核心风险，并配以指标（含 EdgeFlipRate）与机制缓解，通信复杂度由 H5 消融判决。

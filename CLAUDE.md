@@ -43,7 +43,7 @@
    - 阶段二 DQfD = **off-policy**（replay 复用专家+自游走），不可能做成纯 on-policy（专家轨迹按定义非当前策略产生）。
    - 阶段三 = **同步式近 on-policy**，`max_policy_version_lag=1`，每段 rollout 在冻结权重下采样、用完即同步、基本只用 1 次。
 
-10. **通信约束**：`comm_radius=4 < obs_radius=5`，**只与 FOV 内可见邻居通信**，再取最近 `comm_topk=6`。这是抑制"拓扑雪崩"的机制，不能放宽成全局通信。
+10. **通信约束**：`comm_radius=4 < obs_radius=5`，**只与 FOV 内可见邻居通信**。邻居选择用**软稀疏注意力(entmax)+迟滞($\tau_{out}<\tau_{in}$)**，**不要用 hard top-k 做选择**——hard top-k 会引起通信图闪烁(边界排名交换→边反复通断→特征跳变/梯度噪声/让行振荡)。`comm_topk=6` 仅作**算力上限**(封顶 GAT 计算量)，不是"抑制雪崩的机制"。规模由 FOV+稀疏控制，时间稳定性由迟滞/软化保证。不可放宽成全局通信。监控 `EdgeFlipRate` 防闪烁。
 
 11. **专家 margin 样本过滤**：同一 `(局部patch+足迹+目标方向)` 下专家动作不唯一（对称让行）的样本，**剔除出 margin loss**（其 TD 项可留）。wait 动作 margin 按比例降权。
 
@@ -59,7 +59,7 @@
 
 - **默认全 Python（PyTorch）。Rust 不是默认杠杆。** 网络计算全是 GPU kernel，Rust 无用；env 是 Pogema 内核，不重写；LaCAM 已是 C++ 绑定。
 - **唯一可能用编译加速的是 CPU 观测/奖励热点**，顺序严格为 **numpy 向量化 → numba → 最后才 Rust**，且 Rust 仅在 profile 确认热点、且向量化不掉、并能 zero-copy 操作共享 numpy 缓冲时才考虑。
-- **热路径禁止 per-agent / per-step 的 Python 循环**：全体 agent × 全部并行 env 合成**一次**前向；GAT 用批量稀疏 top-k（`index_select`/`scatter`）；GRU 一次性展开整段 `sequence_len`。
+- **热路径禁止 per-agent / per-step 的 Python 循环**：全体 agent × 全部并行 env 合成**一次**前向；GAT 用批量 entmax 软稀疏注意力（非 hard top-k）；GRU 一次性展开整段 `sequence_len`。
 - 标配：`torch.compile` + CUDA graphs（砍 launch 开销）、AMP 混合精度、patch 用 uint8/fp16、共享内存 zero-copy 传 patch、**禁用 pickle 大对象**。
 - **profile 优先**。诊断分流：
   - GPU 利用率上不去 → launch 开销/Python 循环（**Rust 救不了**，做批量化/编译/重叠）。
@@ -102,7 +102,7 @@ envs/         pogema_env_wrapper（random 用 pogema 原生 generator；warehous
               / action_mask(-inf) / reward_builder(BFS-PBRS) / potential_field(BFS 距离场)
 lacam/        lacam_runner(C++绑定) / lacam_dataset_builder / trajectory_converter(动作映射+可解释性过滤)
               / hard_case_manager
-models/       encoders / communication(FOV内 top-k 双向意图注意力) / recurrent_core(GRU)
+models/       encoders / communication(FOV内 软稀疏entmax+迟滞 双向意图注意力, top-k仅算力上限) / recurrent_core(GRU)
               / q_heads(Dueling) / biintent_drqn(组装)
 losses/       q_target(masked mellowmax) / td_losses(1-step+n-step) / dqfd_losses(总损失)
 buffers/      expert_demo / selfplay / recent_online(lag≤1) / shared_rollout(连续内存)
@@ -154,7 +154,7 @@ python scripts/evaluate_policy.py --ckpt <finetuned_ckpt> --config configs/env_m
 | `patch_channels` | 4 | 原生3 + 足迹1 |
 | `scalar_feat_dim` | 8 | 方向(2)+上一步动作(5)+到达(1) |
 | `num_actions` | 5 | wait,up,down,left,right |
-| `comm_radius` / `comm_topk` | 4 / 6 | r_c < obs_radius，FOV 内 |
+| `comm_radius` / `comm_topk` | 4 / 6 | r_c < obs_radius，FOV 内；选择用软稀疏+迟滞，topk 仅算力上限 |
 | `gru_hidden_dim` | 256 | DRQN 记忆 |
 | `inner_steps` / `inner_lr` / `meta_lr` | 5 / 3e-4 / 0.05 | Reptile |
 | `n_step` / `gamma` | 5 / 0.99 | |
@@ -186,4 +186,5 @@ python scripts/evaluate_policy.py --ckpt <finetuned_ckpt> --config configs/env_m
 - [ ] 非法动作是否用 `-inf` 掩码？
 - [ ] env-worker 里是否误建了 CUDA 上下文？
 - [ ] 热路径是否残留 per-agent/per-step 的 Python 循环？
+- [x] 通信邻居选择是否用了软稀疏+迟滞（而非 hard top-k 做选择）？EdgeFlipRate 是否在监控？
 - [ ] 是否在没 profile 的情况下就动手写 Rust？（不要）
