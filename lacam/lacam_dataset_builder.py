@@ -127,7 +127,9 @@ def build_dataset_from_rollout(
     max_steps = min(max(len(p) for p in expert_paths) - 1, wrapper.max_episode_steps)
 
     obs_builder.reset()
-    obs_list, _ = wrapper.reset()
+    # 必须用与调用方相同的 seed 重置，保证地图与 LaCAM 解算时一致。
+    # 不传 seed 会生成新随机地图，导致 agent 在错误地图上执行原路径（到不了目标）。
+    obs_list, _ = wrapper.reset(seed=wrapper._seed)
 
     prev_actions = np.zeros(N, dtype=np.int64)
     prev_dones = [False] * N
@@ -149,62 +151,79 @@ def build_dataset_from_rollout(
         expert_actions_per_step.append(step_actions)
 
     samples = []
+    # ever_done：累计完成掩码，单调递增（一旦 True 永远 True）。
+    # 防止 Pogema finish 模式下 terminated 在到达步后重置为 False，
+    # 导致已完成 agent 被再次采样。
+    ever_done = [False] * N
 
     for t in range(max_steps):
-        # 观测（使用 prev_actions = 上一步专家动作）
+        # 在本步开始时保存累计完成状态，用于决定是否跳过采样
+        prev_ever_done = list(ever_done)
+
+        # ---- 观测（step 前的状态 s_t）----
+        agents_xy = wrapper.get_agents_xy()
         patches, scalars = _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder)
 
-        # 掩码（向量化版本）
-        agents_xy = wrapper.get_agents_xy()
-        agents_arr = np.array(agents_xy, dtype=np.int32)[np.newaxis]  # (1, N, 2)
-        mask = build_action_mask_batch(agents_arr, obstacles)[0]       # (N, 5) bool
-
-        # Reward（使用上一步动作和上一步状态）
-        targets_xy = wrapper.get_targets_xy()
-        rewards, _ = reward_builder.compute(
-            obstacles=obstacles,
-            prev_agents_xy=prev_agents,
-            agents_xy=agents_xy,
-            targets_xy=targets_xy,
-            prev_targets_xy=prev_goals,
-            prev_actions=prev_actions,
-            prev_dones=prev_dones,
-        )
+        # ---- 动作掩码（step 前）----
+        agents_arr = np.array(agents_xy, dtype=np.int32)[np.newaxis]
+        mask = build_action_mask_batch(agents_arr, obstacles)[0]  # (N, 5) bool
+        for i in range(N):
+            if prev_ever_done[i]:
+                mask[i] = False  # 已完成体全置非法，推理时 Q 值全 -inf
 
         expert_actions = expert_actions_per_step[t]
 
-        # 执行专家动作
+        # ---- 执行专家动作，获得 s_{t+1} ----
         obs_list, _, dones, _ = wrapper.step(expert_actions)
 
+        # ---- 在 step 之后计算奖励（正确的 RL 时序：R(s_t, a_t, s_{t+1})）----
+        # 奖励在 step 之后计算，curr_pos = s_{t+1}，才能正确捕获到达稀疏奖励（+1.0）。
+        agents_xy_next = wrapper.get_agents_xy()
+        targets_xy_next = wrapper.get_targets_xy()
+        rewards, _ = reward_builder.compute(
+            obstacles=obstacles,
+            prev_agents_xy=agents_xy,           # s_t（step 前）
+            agents_xy=agents_xy_next,           # s_{t+1}（step 后）
+            targets_xy=targets_xy_next,
+            prev_targets_xy=wrapper.get_targets_xy() if t == 0 else prev_goals,
+            prev_actions=prev_actions,
+            prev_dones=prev_ever_done,
+        )
+
+        # ---- 更新累计完成状态 ----
+        step_dones = dones if isinstance(dones, list) else [bool(dones)] * N
         for i in range(N):
-            if prev_dones[i]:
+            if step_dones[i]:
+                ever_done[i] = True
+
+        # ---- 收集样本（仅限本步之前未完成的 agent）----
+        for i in range(N):
+            if prev_ever_done[i]:
                 continue
 
             obs_hash = compute_observation_hash(patches[i], scalars[i])
-
             sample = {
-                "obs_patch": patches[i].copy(),       # (4, K, K)
-                "obs_scalar": scalars[i].copy(),       # (8,)
-                "obs_hash": obs_hash,
-                "_agent_idx": i,                        # 用于 next_obs 填充，稍后清理
-                "hidden_init": None,                    # 由 buffer 管理
-                "action_expert": expert_actions[i],
-                "reward": rewards[i],
-                "next_obs_patch": None,                 # 下一步填充
+                "obs_patch":       patches[i].copy(),
+                "obs_scalar":      scalars[i].copy(),
+                "obs_hash":        obs_hash,
+                "_agent_idx":      i,
+                "hidden_init":     None,
+                "action_expert":   expert_actions[i],
+                "reward":          rewards[i],
+                "next_obs_patch":  None,
                 "next_obs_scalar": None,
-                "done": dones[i] if isinstance(dones, (list, np.ndarray)) else dones,
-                "action_mask": mask[i].copy(),          # (5,) bool
-                "map_type": map_type,
-                "task_id": task_id,
+                "done":            ever_done[i],
+                "action_mask":     mask[i].copy(),
+                "map_type":        map_type,
+                "task_id":         task_id,
                 "margin_excluded": False,
-                "margin_weight": 0.5 if expert_actions[i] == 0 else 1.0,
+                "margin_weight":   0.5 if expert_actions[i] == 0 else 1.0,
             }
             samples.append(sample)
 
         prev_actions = np.array(expert_actions, dtype=np.int64)
-        prev_dones = dones if isinstance(dones, list) else [dones] * N
-        prev_agents = agents_xy
-        prev_goals = targets_xy
+        prev_agents  = agents_xy_next
+        prev_goals   = targets_xy_next
 
     # 填充 next_obs / next_action_mask：
     # 样本按 [a0t0, a1t0, …, aN-1t0, a0t1, …] 交错存储，
@@ -217,6 +236,12 @@ def build_dataset_from_rollout(
             samples[cur]["next_obs_patch"]    = samples[nxt]["obs_patch"]
             samples[cur]["next_obs_scalar"]   = samples[nxt]["obs_scalar"]
             samples[cur]["next_action_mask"]  = samples[nxt]["action_mask"]  # I2 修复
+        # terminal step：next_obs 填零（done=True 时 TD target = reward，next_obs 乘以 0 不影响结果）
+        if agent_indices:
+            last = agent_indices[-1]
+            samples[last]["next_obs_patch"]  = np.zeros_like(samples[last]["obs_patch"])
+            samples[last]["next_obs_scalar"] = np.zeros_like(samples[last]["obs_scalar"])
+            samples[last]["next_action_mask"] = np.ones(5, dtype=bool)
 
     # 清理辅助字段
     for s in samples:

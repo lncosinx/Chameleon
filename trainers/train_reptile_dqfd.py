@@ -1,21 +1,22 @@
 """
-DQfD + Reptile 联合训练器（单 GPU）。
+DQfD + Reptile 联合训练器。
 
-Reptile 元学习：外层更新 θ ← θ + ε·(θ_inner - θ)
-内层 K=5 步串行 SGD，target 冻结于 θ_meta。
+- ReptileDQfDTrainer   — 单 GPU 版
+- DualGPUReptileTrainer — 双 GPU task-parallel 版（§4.4/§4.5）
+
+Reptile 外层更新 θ ← θ + ε · avg_j(θ_inner_j − θ)
+内层 K=5 步串行 SGD，target 冻结于 θ_meta（INVARIANT 8）。
 DQfD 总损失：L = λ_td·L_TD + λ_n·L_n + λ_margin·L_margin + λ_l2·||θ||²
-
-INVARIANT 8: target 在 inner loop 内冻结于 θ_meta
-INVARIANT 13: burn_in_len=8 步 R2D2 burn-in
 """
 from __future__ import annotations
 
+import threading
 import torch
 import torch.nn as nn
 import numpy as np
-import time
 import copy
-from typing import Dict, Optional, Tuple
+from contextlib import nullcontext
+from typing import Dict, List, Optional, Tuple
 from copy import deepcopy
 
 from models.biintent_drqn import BiIntentGATDRQN
@@ -73,72 +74,78 @@ class ReptileDQfDTrainer:
         self.meta_iter = 0
         self.total_meta_iters = config.get("meta_iterations", 20000)
 
-    def meta_step(
+    def run_inner_loop(
         self,
-        expert_buffer,      # ExpertDemoBuffer
-        selfplay_buffer,    # SelfPlayBuffer
-        env_factory,        # callable: (map_type, seed) → PogemaWrapper
+        expert_buffer,
+        selfplay_buffer,
+        theta_meta_cpu: Dict[str, torch.Tensor],
+        exp_ratio_val: float,
+        buffer_lock=None,       # threading.Lock 或 None（单 GPU 不需要）
         seed: int = None,
-    ) -> Dict[str, float]:
+        pre_batches: Optional[List] = None,  # 预采样 expert batch 列表（DualGPU 优化路径）
+    ) -> Dict:
         """
-        执行一次 meta-iteration：采样 task → K 步 inner loop → outer update。
+        在当前 GPU 上执行 K 步 inner loop，返回 θ_inner（CPU state dict）。
+
+        不做 outer update——由调用方（meta_step 或 DualGPUReptileTrainer）负责。
+        这是 task-parallel 的执行单元：每个 GPU 在各自线程中独立调用此方法。
+
+        Args:
+            theta_meta_cpu:  起始参数（CPU tensors），每次 meta-iter 重置。
+            exp_ratio_val:   当前专家混合比例。
+            buffer_lock:     多线程时保护 buffer 采样的锁；None = 单线程不加锁。
+            seed:            RNG 种子（保证两卡采样不同 batch）。
 
         Returns:
-            metrics dict
+            dict with keys:
+              theta_inner: CPU state dict (θ after K inner steps)
+              loss_mean:   inner loop 平均 loss
         """
-        # 保存 meta 参数 θ
-        theta_meta = {k: v.clone() for k, v in self.net.state_dict().items()}
+        rng = np.random.default_rng(seed)
+        ctx = buffer_lock if buffer_lock is not None else nullcontext()
 
-        # 采样地图类型
-        map_type = self.scheduler.sample(
-            self.meta_iter, self.total_meta_iters, adaptive=False
+        # 将 θ_meta 加载到本 GPU
+        self.net.load_state_dict(
+            {k: v.to(self.device) for k, v in theta_meta_cpu.items()}
         )
+        # cuDNN GRU 要求权重连续；load_state_dict 后显式调用以消除警告和潜在性能损失
+        self.net.gru.gru.flatten_parameters()
 
-        # 采样任务（生成环境 + 专家数据或自游走）
-        task_seed = seed or (100000 + self.meta_iter)
-        exp_ratio = expert_ratio(
-            self.meta_iter, self.total_meta_iters,
-            self.expert_ratio_start, self.expert_ratio_end,
-            self.expert_ratio_decay_iters,
-        )
-
-        # ---- Inner loop (K steps) ----
-        # θ_target 冻结于 θ_meta（INVARIANT 8）
+        # target 冻结于 θ_meta（INVARIANT 8）
         target_net = deepcopy(self.net)
-        target_net.load_state_dict(theta_meta)
+        target_net.gru.gru.flatten_parameters()   # deepcopy 后重新打包 cuDNN 权重
         target_net.eval()
         for p in target_net.parameters():
             p.requires_grad = False
 
-        inner_optimizer = torch.optim.Adam(
-            self.net.parameters(), lr=self.inner_lr
-        )
+        inner_optimizer = torch.optim.Adam(self.net.parameters(), lr=self.inner_lr)
 
         inner_losses = []
         for k in range(self.inner_steps):
-            # 课程式混合比例（设计文档§3.3.1）
-            n_expert   = max(1, int(self.batch_size * exp_ratio))
+            n_expert   = max(1, int(self.batch_size * exp_ratio_val))
             n_selfplay = self.batch_size - n_expert
 
-            # 从 expert buffer 采样序列
-            expert_batch = None
-            n_expert_seqs = max(1, n_expert // self.sequence_len)
-            try:
-                expert_batch = expert_buffer.sample(
-                    batch_size=n_expert_seqs,
-                    sequence_len=self.sequence_len,
-                    burn_in_len=self.burn_in_len,
-                )
-            except (ValueError, IndexError):
-                pass
+            # 优先使用预采样 batch（DualGPUReptileTrainer 主线程预采，消除锁竞争）
+            # 回退：thread-safe buffer 采样（单 GPU 路径或未预采样时）
+            if pre_batches is not None and k < len(pre_batches):
+                expert_batch = pre_batches[k]
+            else:
+                expert_batch = None
+                with ctx:
+                    try:
+                        expert_batch = expert_buffer.sample(
+                            batch_size=max(1, n_expert // self.sequence_len),
+                            sequence_len=self.sequence_len,
+                            burn_in_len=self.burn_in_len,
+                            rng=rng,
+                        )
+                    except (ValueError, IndexError):
+                        pass
 
-            # 从 selfplay buffer 采样单条样本并构成 batch
             selfplay_batch = None
             if selfplay_buffer is not None and len(selfplay_buffer) >= n_selfplay and n_selfplay > 0:
-                sp_samples = selfplay_buffer.sample(
-                    n=n_selfplay,
-                    rng=np.random.default_rng(self.meta_iter * 1000 + k),
-                )
+                with ctx:
+                    sp_samples = selfplay_buffer.sample(n=n_selfplay, rng=rng)
                 if sp_samples:
                     from buffers.batch_collator import collate_samples_to_tensors
                     selfplay_batch = collate_samples_to_tensors(
@@ -146,7 +153,6 @@ class ReptileDQfDTrainer:
                         device=self.device, pin_memory=False,
                     )
 
-            # 至少需要 expert_batch 才能训练（margin loss 依赖专家动作）
             if expert_batch is not None:
                 loss, info = self._inner_step(
                     expert_batch, target_net, inner_optimizer,
@@ -154,26 +160,58 @@ class ReptileDQfDTrainer:
                 )
                 inner_losses.append(info.get("loss_total", 0.0))
 
-        # ---- Outer update ----
-        # θ ← θ + ε · (θ_inner - θ_meta)
-        with torch.no_grad():
-            for name, param in self.net.named_parameters():
-                meta_param = theta_meta[name]
-                # Reptile: θ = θ + ε*(θ - θ_meta)
-                # 由于我们现在是 θ = θ_inner（inner loop 已在 θ 上做 SGD），
-                # 所以更新为 θ_meta + ε*(θ - θ_meta)
-                param.copy_(meta_param + self.meta_lr * (param - meta_param))
-
-        self.meta_iter += 1
-
-        metrics = {
-            "meta_iter": self.meta_iter,
-            "map_type": map_type,
-            "expert_ratio": exp_ratio,
-            "inner_loss_mean": np.mean(inner_losses) if inner_losses else 0.0,
+        # 返回 θ_inner（CPU，避免 GPU 内存在跨线程传递时的 CUDA 上下文问题）
+        theta_inner = {k: v.detach().cpu() for k, v in self.net.state_dict().items()}
+        return {
+            "theta_inner": theta_inner,
+            "loss_mean": float(np.mean(inner_losses)) if inner_losses else 0.0,
         }
 
-        return metrics
+    def meta_step(
+        self,
+        expert_buffer,
+        selfplay_buffer,
+        env_factory=None,
+        seed: int = None,
+    ) -> Dict[str, float]:
+        """
+        执行一次 meta-iteration（单 GPU）：
+        run_inner_loop → outer update。
+        """
+        theta_meta = {k: v.detach().cpu().clone()
+                      for k, v in self.net.state_dict().items()}
+
+        map_type = self.scheduler.sample(
+            self.meta_iter, self.total_meta_iters, adaptive=False
+        )
+        exp_ratio_val = expert_ratio(
+            self.meta_iter, self.total_meta_iters,
+            self.expert_ratio_start, self.expert_ratio_end,
+            self.expert_ratio_decay_iters,
+        )
+
+        result = self.run_inner_loop(
+            expert_buffer=expert_buffer,
+            selfplay_buffer=selfplay_buffer,
+            theta_meta_cpu=theta_meta,
+            exp_ratio_val=exp_ratio_val,
+            buffer_lock=None,
+            seed=seed or (100000 + self.meta_iter),
+        )
+
+        # Outer update: θ = θ_meta + ε·(θ_inner - θ_meta)
+        with torch.no_grad():
+            for name, param in self.net.named_parameters():
+                delta = result["theta_inner"][name].to(self.device) - theta_meta[name].to(self.device)
+                param.copy_(theta_meta[name].to(self.device) + self.meta_lr * delta)
+
+        self.meta_iter += 1
+        return {
+            "meta_iter":       self.meta_iter,
+            "map_type":        map_type,
+            "expert_ratio":    exp_ratio_val,
+            "inner_loss_mean": result["loss_mean"],
+        }
 
     def _inner_step(
         self,
@@ -220,7 +258,10 @@ class ReptileDQfDTrainer:
         positions      = torch.zeros(B, T, 1, 2, device=self.device)
         next_positions = torch.zeros(B, T, 1, 2, device=self.device)
 
-        # ---- 在线网络：Q(s, ·) ----
+        # ---- 在线网络：Q(s, ·) ——训练时不传 action_masks ----
+        # 专家数据中约 3% 的样本存在动作掩码与专家动作不一致（多体碰撞时序差异）。
+        # 若传入 action_masks，专家动作对应的 Q 值被置为 -inf，TD loss = inf。
+        # 掩码只在推理/评估和 mellowmax target 中生效，训练时保持 Q 值有限。
         hidden = self.net.init_hidden(B, 1, self.device)
         q_online, _, _ = self.net(
             obs_patches.unsqueeze(2),      # (B, T, 1, 4, K, K)
@@ -228,7 +269,7 @@ class ReptileDQfDTrainer:
             positions,
             hidden,
             burn_in_len=self.burn_in_len,
-            action_masks=action_masks.unsqueeze(2),  # (B, T, 1, 5)
+            action_masks=None,             # 训练时不掩码，确保 Q(s,a_expert) 有限
         )  # (B, T, 1, 5)
 
         # ---- target 网络：Q(s', ·) ——必须用 next_obs ----
@@ -371,3 +412,206 @@ class ReptileDQfDTrainer:
     def load_state_dict(self, state: dict):
         self.net.load_state_dict(state["net"])
         self.meta_iter = state.get("meta_iter", 0)
+
+
+# =============================================================================
+# 双 GPU task-parallel Reptile 训练器（设计文档 §4.4 / §4.5）
+# =============================================================================
+
+class DualGPUReptileTrainer:
+    """
+    双 GPU task-parallel Reptile + DQfD 训练器。
+
+    两卡各跑一个不同 task 的完整 K 步 inner loop（threading 并行），
+    meta-iter 末平均增量做一次 outer 更新（非逐步 DDP）。
+
+        GPU 0: task A  inner loop (K 步 DQfD)  ──┐
+        GPU 1: task B  inner loop (K 步 DQfD)  ──┘→ avg Δ → outer update
+
+    吞吐目标：相比单 GPU 接近翻倍，元梯度方差减半。
+    CUDA 内核在 GPU kernel 期间释放 GIL，两卡真正并行。
+
+    用法:
+        trainer = DualGPUReptileTrainer(net, cfg, devices=["cuda:0","cuda:1"])
+        for _ in range(total_iters):
+            metrics = trainer.meta_step(expert_buffer, selfplay_buffer)
+    """
+
+    def __init__(
+        self,
+        net_template: BiIntentGATDRQN,
+        cfg: dict,
+        devices: List[str] = None,
+    ):
+        """
+        Args:
+            net_template: 网络实例（用作架构模板，内部 deepcopy 到各 GPU）。
+            cfg:          train_reptile_dqfd.yaml 配置字典。
+            devices:      GPU 设备列表，默认 ["cuda:0","cuda:1"]。
+        """
+        if devices is None:
+            devices = ["cuda:0", "cuda:1"]
+        self.devices = [torch.device(d) for d in devices]
+
+        # 为每个 GPU 创建独立的 sub-trainer（各自持有一份网络）
+        self.sub_trainers: List[ReptileDQfDTrainer] = []
+        for device in self.devices:
+            net_copy = deepcopy(net_template)
+            self.sub_trainers.append(ReptileDQfDTrainer(net_copy, cfg, device=device))
+
+        # θ_meta 统一保存在 CPU（outer update 的基准；不绑定特定 GPU）
+        self._meta_state: Dict[str, torch.Tensor] = {
+            k: v.detach().cpu().clone()
+            for k, v in net_template.state_dict().items()
+        }
+
+        # 超参
+        self.meta_lr   = cfg.get("meta_lr",   0.05)
+        self.meta_iter = 0
+        self.total_meta_iters = cfg.get("meta_iterations", 20000)
+        self.expert_ratio_start       = cfg.get("expert_ratio_start",       0.9)
+        self.expert_ratio_end         = cfg.get("expert_ratio_end",         0.5)
+        self.expert_ratio_decay_iters = cfg.get("expert_ratio_decay_iters", 8000)
+
+        self.scheduler = MapScheduler(cfg.get("map_schedule", None))
+
+        # 共享 buffer 访问锁（两线程同时采样时使用）
+        self._buffer_lock = threading.Lock()
+
+    @property
+    def net(self) -> BiIntentGATDRQN:
+        """返回 GPU0 的网络（用于 checkpoint 保存 / 评估接口兼容）。"""
+        return self.sub_trainers[0].net
+
+    def meta_step(
+        self,
+        expert_buffer,
+        selfplay_buffer,
+        env_factory=None,
+        seed: int = None,
+    ) -> Dict[str, float]:
+        """
+        执行一次 meta-iteration（双 GPU 并行）：
+
+        1. 主线程顺序预采样两张 GPU 所需的全部 expert batch（消除跨线程锁竞争）
+        2. 两线程在各自 GPU 上并行跑 K 步 inner loop（纯 GPU compute，无 Python 锁）
+        3. 收集两份 θ_inner
+        4. 平均增量，做 outer update
+        5. 将新 θ_meta 同步回两卡
+        """
+        theta_meta = self._meta_state   # 当前 θ_meta（CPU tensors）
+
+        exp_ratio_val = expert_ratio(
+            self.meta_iter, self.total_meta_iters,
+            self.expert_ratio_start, self.expert_ratio_end,
+            self.expert_ratio_decay_iters,
+        )
+
+        # 采样两个不同的地图类型（尽量不同，增加 meta-gradient 多样性）
+        map_types = [
+            str(self.scheduler.sample(self.meta_iter,     self.total_meta_iters)),
+            str(self.scheduler.sample(self.meta_iter + 1, self.total_meta_iters)),
+        ]
+
+        # ---- 预采样：主线程顺序采样，消除跨线程 buffer 锁竞争 ----
+        # 每张 GPU 用不同 seed 保证任务多样性；线程只做 GPU compute（CUDA 调用释放 GIL）
+        ref = self.sub_trainers[0]   # 取超参（两个 sub_trainer 超参相同）
+        n_expert_seqs = max(1, max(1, int(ref.batch_size * exp_ratio_val)) // ref.sequence_len)
+        all_pre_batches: List[List[Optional[dict]]] = []
+        for idx in range(len(self.devices)):
+            task_seed = (seed or self.meta_iter * 1000) + idx * 99991
+            rng = np.random.default_rng(task_seed)
+            batches: List[Optional[dict]] = []
+            for _ in range(ref.inner_steps):
+                try:
+                    b = expert_buffer.sample(
+                        batch_size=n_expert_seqs,
+                        sequence_len=ref.sequence_len,
+                        burn_in_len=ref.burn_in_len,
+                        rng=rng,
+                    )
+                    batches.append(b)
+                except (ValueError, IndexError):
+                    batches.append(None)
+            all_pre_batches.append(batches)
+
+        # ---- 并行 inner loop（线程仅做 GPU compute）----
+        results: Dict[int, Optional[Dict]] = {0: None, 1: None}
+        errors:  Dict[int, Optional[Exception]] = {0: None, 1: None}
+
+        def _run_task(idx: int):
+            try:
+                task_seed = (seed or self.meta_iter * 1000) + idx * 99991
+                results[idx] = self.sub_trainers[idx].run_inner_loop(
+                    expert_buffer   = expert_buffer,
+                    selfplay_buffer = selfplay_buffer,
+                    theta_meta_cpu  = theta_meta,
+                    exp_ratio_val   = exp_ratio_val,
+                    buffer_lock     = None,             # 已预采样，无需锁
+                    seed            = task_seed,
+                    pre_batches     = all_pre_batches[idx],
+                )
+            except Exception as exc:
+                errors[idx] = exc
+
+        threads = [threading.Thread(target=_run_task, args=(i,),
+                                    name=f"inner-gpu{i}")
+                   for i in range(len(self.devices))]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        # 错误处理：任一线程崩溃则上报
+        for idx, exc in errors.items():
+            if exc is not None:
+                raise RuntimeError(f"GPU {idx} inner loop failed") from exc
+
+        # 过滤掉无法采样 batch 的任务（buffer 太小时）
+        valid = [r for r in results.values() if r is not None]
+        if not valid:
+            self.meta_iter += 1
+            return {"meta_iter": self.meta_iter, "inner_loss_mean": 0.0,
+                    "map_types": map_types, "expert_ratio": exp_ratio_val, "num_gpus": 0}
+
+        # ---- Outer update（在 CPU 上完成，节省 GPU 显存）----
+        # θ_new = θ_meta + ε · (1/|B|) · Σ_j (θ_inner_j − θ_meta)
+        new_meta_state: Dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            for name in theta_meta:
+                deltas = [r["theta_inner"][name] - theta_meta[name]
+                          for r in valid if name in r["theta_inner"]]
+                avg_delta = torch.stack(deltas).mean(dim=0)
+                new_meta_state[name] = theta_meta[name] + self.meta_lr * avg_delta
+
+        self._meta_state = new_meta_state
+
+        # 同步新 θ_meta 到所有 sub-trainer（各自 GPU）
+        for trainer in self.sub_trainers:
+            trainer.net.load_state_dict(
+                {k: v.to(trainer.device) for k, v in new_meta_state.items()}
+            )
+
+        self.meta_iter += 1
+        loss_vals = [r["loss_mean"] for r in valid if r["loss_mean"] > 0]
+
+        return {
+            "meta_iter":       self.meta_iter,
+            "map_types":       map_types,
+            "expert_ratio":    exp_ratio_val,
+            "inner_loss_mean": float(np.mean(loss_vals)) if loss_vals else 0.0,
+            "num_gpus":        len(valid),
+        }
+
+    def state_dict(self) -> dict:
+        """兼容 save_checkpoint：net 字段保存 θ_meta。"""
+        return {
+            "net":      self._meta_state,   # CPU state dict，可直接被 load_state_dict 使用
+            "meta_iter": self.meta_iter,
+        }
+
+    def load_state_dict(self, state: dict):
+        self._meta_state = {k: v.cpu() for k, v in state["net"].items()}
+        self.meta_iter   = state.get("meta_iter", 0)
+        for trainer in self.sub_trainers:
+            trainer.net.load_state_dict(
+                {k: v.to(trainer.device) for k, v in self._meta_state.items()}
+            )

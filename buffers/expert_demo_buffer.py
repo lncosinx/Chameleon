@@ -1,46 +1,126 @@
 """
-专家演示回放缓冲。
+专家演示回放缓冲（列式预分配，uint8 patches）。
 
-存储 LaCAM 成功专家轨迹，每条样本含：
-    obs_patch, obs_scalar, hidden_init,
-    action_expert, reward, next_obs_patch, next_obs_scalar,
-    done, action_mask, map_type, task_id, margin_excluded, margin_weight
+存储格式：所有字段预分配为连续 numpy 数组（columnar storage），
+patches 用 uint8 存储（采样时才归一化为 float32），消除 per-sample
+Python 对象开销。
 
-支持按 sequence_len 采样定长序列（含 R2D2 burn-in）。
+内存估算（capacity=4M）：
+  obs_patches    uint8  (4M, 4, 11, 11)  → 1.94 GB
+  next_obs_patch uint8  (4M, 4, 11, 11)  → 1.94 GB
+  obs_scalars   float32 (4M, 8)          → 0.13 GB
+  next_obs_scalars float32 (4M, 8)       → 0.13 GB
+  其余小字段                              → ~0.10 GB
+  合计 ≈ 4.2 GB（vs 旧 Python dict 方案的 50-60 GB）
 """
 from __future__ import annotations
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional
-from collections import deque
+from typing import Dict, List, Optional
+
+
+# 如果加载时 K 尚未确定，先用占位容量 0，第一次 add 时自动 _init_arrays。
+_UNINIT_K = -1
 
 
 class ExpertDemoBuffer:
     """
-    专家演示回放缓冲（循环队列）。
+    专家演示回放缓冲（循环队列，列式预分配）。
 
     用法:
-        buf = ExpertDemoBuffer(capacity=100000)
-        buf.add(sample)  # 或 buf.add_batch(samples)
+        buf = ExpertDemoBuffer(capacity=4_000_000)
+        buf.add(sample)   # sample dict 字段见 _init_arrays
         batch = buf.sample(batch_size=32, sequence_len=32, burn_in_len=8)
     """
 
-    def __init__(self, capacity: int = 500_000):
+    def __init__(self, capacity: int = 500_000, obs_channels: int = 4, patch_size: int = 11):
         self.capacity = capacity
-        self._buffer: deque = deque(maxlen=capacity)
+        self.obs_channels = obs_channels
+        self.patch_size = patch_size
+
+        self._size = 0      # 当前有效样本数
+        self._head = 0      # 下一次写入位置（循环）
+        self._arrays_inited = False
+
         self._rng = np.random.default_rng()
 
+    def _init_arrays(self, obs_channels: int, K: int):
+        """第一次 add 时（或手动调用）初始化所有列式数组。"""
+        C = obs_channels
+        cap = self.capacity
+        self.obs_channels = C
+        self.patch_size = K
+
+        self._obs_patches       = np.zeros((cap, C, K, K), dtype=np.uint8)
+        self._next_obs_patches  = np.zeros((cap, C, K, K), dtype=np.uint8)
+        self._obs_scalars       = np.zeros((cap, 8),        dtype=np.float32)
+        self._next_obs_scalars  = np.zeros((cap, 8),        dtype=np.float32)
+        self._actions_expert    = np.zeros(cap,             dtype=np.int64)
+        self._rewards           = np.zeros(cap,             dtype=np.float32)
+        self._dones             = np.zeros(cap,             dtype=bool)
+        self._action_masks      = np.ones((cap, 5),         dtype=bool)
+        self._next_action_masks = np.ones((cap, 5),         dtype=bool)
+        self._margin_excluded   = np.zeros(cap,             dtype=bool)
+        self._margin_weights    = np.ones(cap,              dtype=np.float32)
+
+        self._arrays_inited = True
+
+    def _ensure_init(self, sample: dict):
+        if not self._arrays_inited:
+            p = sample.get("obs_patch")
+            if p is not None:
+                arr = np.asarray(p)
+                C = arr.shape[0] if arr.ndim == 3 else self.obs_channels
+                K = arr.shape[-1] if arr.ndim >= 2 else self.patch_size
+            else:
+                C, K = self.obs_channels, self.patch_size
+            self._init_arrays(C, K)
+
+    def _patch_to_uint8(self, p) -> np.ndarray:
+        """将 patch 转为 uint8（输入可以是 float [0,1] 或 uint8）。"""
+        if p is None:
+            return np.zeros((self.obs_channels, self.patch_size, self.patch_size), dtype=np.uint8)
+        arr = np.asarray(p)
+        if arr.dtype == np.uint8:
+            return arr
+        # float [0,1] → uint8 [0,255]
+        return (arr * 255).clip(0, 255).astype(np.uint8)
+
     def add(self, sample: dict):
-        """添加单条样本。"""
-        self._buffer.append(sample)
+        """添加单条样本（per-agent per-step dict）。"""
+        self._ensure_init(sample)
+        idx = self._head
+
+        self._obs_patches[idx]       = self._patch_to_uint8(sample.get("obs_patch"))
+        self._next_obs_patches[idx]  = self._patch_to_uint8(sample.get("next_obs_patch"))
+
+        sc = sample.get("obs_scalar")
+        self._obs_scalars[idx]       = np.asarray(sc, dtype=np.float32) if sc is not None else 0.0
+        nsc = sample.get("next_obs_scalar")
+        self._next_obs_scalars[idx]  = np.asarray(nsc, dtype=np.float32) if nsc is not None else 0.0
+
+        self._actions_expert[idx]    = int(sample.get("action_expert", 0))
+        self._rewards[idx]           = float(sample.get("reward", 0.0))
+        self._dones[idx]             = bool(sample.get("done", False))
+
+        am = sample.get("action_mask")
+        self._action_masks[idx]      = np.asarray(am, dtype=bool) if am is not None else True
+        nam = sample.get("next_action_mask")
+        self._next_action_masks[idx] = np.asarray(nam, dtype=bool) if nam is not None else True
+
+        self._margin_excluded[idx]   = bool(sample.get("margin_excluded", False))
+        self._margin_weights[idx]    = float(sample.get("margin_weight", 1.0))
+
+        self._head = (self._head + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
 
     def add_batch(self, samples: List[dict]):
         """批量添加样本。"""
         for s in samples:
-            self._buffer.append(s)
+            self.add(s)
 
     def __len__(self) -> int:
-        return len(self._buffer)
+        return self._size
 
     def sample(
         self,
@@ -50,96 +130,74 @@ class ExpertDemoBuffer:
         rng: Optional[np.random.Generator] = None,
     ) -> Dict[str, np.ndarray]:
         """
-        采样一个 batch。
+        采样一个 batch，返回 float32 tensors。
 
-        返回 dict，字段：
-            obs_patches:    (B, seq_len, 4, K, K)
-            obs_scalars:    (B, seq_len, 8)
-            actions_expert: (B, seq_len)
-            rewards:        (B, seq_len)
-            next_obs_patches:   (B, seq_len, 4, K, K)
-            next_obs_scalars:   (B, seq_len, 8)
-            dones:          (B, seq_len)
-            action_masks:   (B, seq_len, 5)
-            margin_excluded:(B, seq_len) bool
-            margin_weights: (B, seq_len)
-
-        注意：hidden_init 需外部维护（buffer 不管理 GRU 隐状态）。
-              训练时用 burn_in_len 步重建隐状态。
+        返回字段：
+            obs_patches:      (B, seq_len, C, K, K) float32 [0,1]
+            obs_scalars:      (B, seq_len, 8)
+            actions_expert:   (B, seq_len) int64
+            rewards:          (B, seq_len)
+            next_obs_patches: (B, seq_len, C, K, K) float32 [0,1]
+            next_obs_scalars: (B, seq_len, 8)
+            dones:            (B, seq_len) bool
+            action_masks:     (B, seq_len, 5) bool
+            next_action_masks:(B, seq_len, 5) bool
+            margin_excluded:  (B, seq_len) bool
+            margin_weights:   (B, seq_len)
         """
+        if not self._arrays_inited:
+            raise ValueError("Buffer empty, cannot sample")
         if rng is None:
             rng = self._rng
 
         total_needed = batch_size * sequence_len
-        if len(self._buffer) < total_needed:
+        if self._size < total_needed:
             raise ValueError(
-                f"Buffer has {len(self._buffer)} samples, "
-                f"need at least {total_needed}"
+                f"Buffer has {self._size} samples, need at least {total_needed}"
             )
 
-        # 随机采样起始索引
-        max_start = len(self._buffer) - sequence_len
-        indices = rng.integers(0, max_start, size=batch_size)
+        C, K = self.obs_channels, self.patch_size
 
-        # 收集 batch
-        K = None
-        for idx in indices:
-            sample = self._buffer[idx]
-            if K is None and "obs_patch" in sample:
-                K = sample["obs_patch"].shape[1]
+        # 有效写入区域：[0, _size)，circular 时需要考虑绕回
+        # 简化：直接从 [0, _size - sequence_len] 采样起始点
+        # （不跨越写入头，避免采到部分覆盖的旧数据）
+        max_start = self._size - sequence_len
+        start_indices = rng.integers(0, max_start, size=batch_size)
 
-        batch = {
-            "obs_patches": np.zeros((batch_size, sequence_len, 4, K or 11, K or 11), dtype=np.float32),
-            "obs_scalars": np.zeros((batch_size, sequence_len, 8), dtype=np.float32),
-            "actions_expert": np.zeros((batch_size, sequence_len), dtype=np.int64),
-            "rewards": np.zeros((batch_size, sequence_len), dtype=np.float32),
-            "next_obs_patches": np.zeros((batch_size, sequence_len, 4, K or 11, K or 11), dtype=np.float32),
-            "next_obs_scalars": np.zeros((batch_size, sequence_len, 8), dtype=np.float32),
-            "dones": np.zeros((batch_size, sequence_len), dtype=bool),
-            "action_masks": np.zeros((batch_size, sequence_len, 5), dtype=bool),
-            "next_action_masks": np.ones((batch_size, sequence_len, 5), dtype=bool),  # s_{t+1} 掩码
-            "margin_excluded": np.zeros((batch_size, sequence_len), dtype=bool),
-            "margin_weights": np.zeros((batch_size, sequence_len), dtype=np.float32),
+        # 利用 numpy fancy indexing 批量取连续段（避免 Python 循环）
+        # idx_mat: (B, seq_len) 每行是一段连续索引
+        idx_mat = (start_indices[:, None] + np.arange(sequence_len)[None, :]) % self.capacity
+
+        # uint8 → float32 归一化（在采样时统一做，不在存储时）
+        obs_p  = self._obs_patches[idx_mat].astype(np.float32) / 255.0      # (B, T, C, K, K)
+        nobs_p = self._next_obs_patches[idx_mat].astype(np.float32) / 255.0
+
+        return {
+            "obs_patches":      obs_p,
+            "obs_scalars":      self._obs_scalars[idx_mat].copy(),
+            "actions_expert":   self._actions_expert[idx_mat].copy(),
+            "rewards":          self._rewards[idx_mat].copy(),
+            "next_obs_patches": nobs_p,
+            "next_obs_scalars": self._next_obs_scalars[idx_mat].copy(),
+            "dones":            self._dones[idx_mat].copy(),
+            "action_masks":     self._action_masks[idx_mat].copy(),
+            "next_action_masks":self._next_action_masks[idx_mat].copy(),
+            "margin_excluded":  self._margin_excluded[idx_mat].copy(),
+            "margin_weights":   self._margin_weights[idx_mat].copy(),
         }
 
-        for b, start_idx in enumerate(indices):
-            for t in range(sequence_len):
-                s = self._buffer[start_idx + t]
-                batch["obs_patches"][b, t] = s.get("obs_patch", np.zeros((4, K or 11, K or 11)))
-                batch["obs_scalars"][b, t] = s.get("obs_scalar", np.zeros(8))
-                batch["actions_expert"][b, t] = s.get("action_expert", 0)
-                batch["rewards"][b, t] = s.get("reward", 0.0)
-                batch["next_obs_patches"][b, t] = s.get("next_obs_patch",
-                    np.zeros((4, K or 11, K or 11)))
-                batch["next_obs_scalars"][b, t] = s.get("next_obs_scalar", np.zeros(8))
-                batch["dones"][b, t] = s.get("done", False)
-                batch["action_masks"][b, t] = s.get("action_mask", np.ones(5, dtype=bool))
-                # next_action_mask 优先从样本读取，回退到下一条样本的 action_mask
-                if "next_action_mask" in s:
-                    batch["next_action_masks"][b, t] = s["next_action_mask"]
-                elif start_idx + t + 1 < len(self._buffer):
-                    batch["next_action_masks"][b, t] = self._buffer[start_idx + t + 1].get(
-                        "action_mask", np.ones(5, dtype=bool)
-                    )
-                # 若无法获取则保持默认全合法（全为 True）
-                batch["margin_excluded"][b, t] = s.get("margin_excluded", False)
-                batch["margin_weights"][b, t] = s.get("margin_weight", 1.0)
-
-        return batch
-
     def get_stats(self) -> dict:
-        """返回 buffer 统计信息。"""
-        if not self._buffer:
+        if self._size == 0:
             return {"size": 0}
-        actions = [s.get("action_expert", 0) for s in self._buffer]
-        wait_ratio = sum(1 for a in actions if a == 0) / max(len(actions), 1)
-        margin_excluded_count = sum(1 for s in self._buffer if s.get("margin_excluded", False))
+        valid = slice(0, self._size)
+        wait_ratio = float((self._actions_expert[valid] == 0).mean())
+        excl_ratio = float(self._margin_excluded[valid].mean())
         return {
-            "size": len(self._buffer),
+            "size": self._size,
             "wait_ratio": wait_ratio,
-            "margin_excluded_ratio": margin_excluded_count / max(len(self._buffer), 1),
+            "margin_excluded_ratio": excl_ratio,
         }
 
     def clear(self):
-        """清空 buffer。"""
-        self._buffer.clear()
+        self._size = 0
+        self._head = 0

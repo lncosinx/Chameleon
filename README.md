@@ -44,15 +44,18 @@ python scripts/env_check.py
 
 对四种地图族批量生成专家轨迹，保存为 `data/expert_<map>.npz`，供阶段二加载。
 
+`--num-workers -1` 自动使用全部 CPU 核心（47 核约 4 ep/s，500 ep ≈ 2 分钟/地图族）。
+四种地图族顺序执行即可；若同时执行请手动拆分核数（如 `--num-workers 10`）避免竞争。
+
 ```bash
-# 四种地图族各自生成（建议开 4 个终端并行执行）
 python scripts/generate_lacam_data.py \
     --config configs/env_random.yaml \
     --num-episodes 500 \
     --num-agents 96 \
     --map-size 64 \
     --backend prioritized \
-    --output-dir data
+    --output-dir data \
+    --num-workers -1
 
 python scripts/generate_lacam_data.py \
     --config configs/env_warehouse.yaml \
@@ -60,7 +63,8 @@ python scripts/generate_lacam_data.py \
     --num-agents 96 \
     --map-size 64 \
     --backend prioritized \
-    --output-dir data
+    --output-dir data \
+    --num-workers -1
 
 python scripts/generate_lacam_data.py \
     --config configs/env_maze.yaml \
@@ -68,7 +72,8 @@ python scripts/generate_lacam_data.py \
     --num-agents 96 \
     --map-size 64 \
     --backend prioritized \
-    --output-dir data
+    --output-dir data \
+    --num-workers -1
 
 python scripts/generate_lacam_data.py \
     --config configs/env_room.yaml \
@@ -76,7 +81,8 @@ python scripts/generate_lacam_data.py \
     --num-agents 96 \
     --map-size 64 \
     --backend prioritized \
-    --output-dir data
+    --output-dir data \
+    --num-workers -1
 ```
 
 完成后 `data/` 目录应包含四个 npz 文件（每个约 500–800 MB 压缩后）：

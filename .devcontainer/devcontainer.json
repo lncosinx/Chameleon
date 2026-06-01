@@ -9,6 +9,10 @@
         "--net=host",
         "--privileged",
         "--shm-size=16g",
+        "--ipc=host",
+        // 用空 tmpfs 覆盖宿主机的 /tmp/nvidia-mps，
+        // 防止容器内 CUDA 作为 MPS client 连接宿主机 MPS daemon（Error 805 根因）
+        "--tmpfs=/tmp/nvidia-mps:exec,mode=777",
         "--device=/dev/bus/usb",
         "-v",
         "/tmp/.X11-unix:/tmp/.X11-unix"
@@ -18,7 +22,15 @@
         "DISPLAY": "${localEnv:DISPLAY}",
         "NVIDIA_VISIBLE_DEVICES": "all",
         "NVIDIA_DRIVER_CAPABILITIES": "all",
-        "QT_X11_NO_MITSHM": "1"
+        // 对齐宿主机实际驱动支持的 CUDA 版本（驱动 580 → CUDA 13.0），
+        // 消除与 PyTorch cu130 的版本不匹配
+        "CUDA_VERSION": "13.0.0",
+        "QT_X11_NO_MITSHM": "1",
+        // 宿主机运行了 MPS daemon，容器内 CUDA 会把 /tmp/nvidia-mps/control socket
+        // 误识别为可连接的 MPS server，引发 Error 805。
+        // 将 pipe 目录重定向到不存在的路径，让容器内 CUDA 忽略宿主机 MPS，
+        // 直接走正常 CUDA context 模式。（--tmpfs 覆盖方案在此 devcontainer 下无效）
+        "CUDA_MPS_PIPE_DIRECTORY": "/tmp/cuda-mps-disabled"
     },
     // 进容器后自动执行的命令（可选）
     // 推荐给容器装的 VS Code 插件
@@ -28,7 +40,8 @@
                 "ms-python.debugpy",
                 "ms-python.vscode-python-envs",
                 "ms-python.python",
-                "rust-lang.rust-analyzer"
+                "rust-lang.rust-analyzer",
+                "Anthropic.claude-code"
             ]
         }
     }

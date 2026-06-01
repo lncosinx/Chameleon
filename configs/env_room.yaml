@@ -21,5 +21,14 @@ room:
   wall_components_max: 12
 
 collision_system: soft
-on_target: restart
+on_target: finish
 # observation_type 不设（Pogema 2.x 默认返回 (3,K,K) 局部观测数组）
+
+# 奖励参数（RewardBuilder.from_config 读取）
+reward:
+  lambda_f:       1.0
+  shaping_clip:   5.0
+  goal_reward:    1.0
+  step_cost:      0.001
+  collision_cost: 0.1
+  gamma:          0.99

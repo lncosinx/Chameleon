@@ -10,5 +10,17 @@ obstacle_density: 0.3  # 随机地图障碍密度，传给 GridConfig density �
 
 # Pogema 环境参数
 collision_system: soft        # soft: 允许碰撞但给惩罚
-on_target: restart            # 到达目标后重新分配新 goal
+on_target: finish             # 到达目标即停（标准 MAPF；与 LaCAM 固定目标路径对齐）
 # observation_type 不设（Pogema 2.x 默认返回 (3,K,K) 局部观测数组）
+
+# 奖励参数（RewardBuilder.from_config 读取）
+# lambda_f=1.0: PBRS 主信号比例（原 0.1 太弱，shaping 淹没在负惩罚里）
+# shaping_clip=5.0: 截断多体绕路和 goal-restart 引起的极端 shaping（原最大-9.1→现-5）
+# wait_cost 已移除：等待是拥挤 MAPF 的合理策略，不应额外惩罚
+reward:
+  lambda_f:       1.0
+  shaping_clip:   5.0
+  goal_reward:    1.0
+  step_cost:      0.001
+  collision_cost: 0.1
+  gamma:          0.99
