@@ -12,11 +12,14 @@ gamma: 0.99
 n_step: 5
 
 # DQfD 损失权重
+# lambda_margin 需要远小于 1.0：随机初始化时 L_margin 约是 L_TD 的 100 倍，
+# 等权重会让 Q 值被 margin 目标主导而非 TD，导致专家退火后崩溃。
+# 推荐范围：0.1–0.5；配合 lambda_l2 加强来限制 Q 量级（见下方注释）。
 lambda_td: 1.0
 lambda_nstep: 1.0
-lambda_margin: 1.0
-lambda_l2: 0.00001
-margin: 0.5
+lambda_margin: 0.5    # 从 1.0 降至 0.5；初始化时 L_margin/L_TD ≈ 100x，等权重会让 margin 主导
+lambda_l2: 0.0001     # 从 1e-5 提至 1e-4（DQfD 原论文值），限制 Q 量级防止爆炸
+margin: 0.5           # 间隔值 m；对 Q_max≈5~10 时意味着 5-10% 区分间隔，合理
 
 # 数值安全
 mellowmax_alpha: 1.0   # 先取 1.0，按 Q_max/Q_mean 在 {0.5,1,2} 中调

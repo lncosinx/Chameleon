@@ -1,21 +1,31 @@
 # 网络架构配置 — BiIntent-GAT-DRQN
 # 对应设计文档 §2
 
+# --- 观测编码 ---
 obs_radius: 5
-patch_channels: 4      # Pogema 原生 3 通道 + 追加足迹通道 1
-cnn_channels: [32, 64, 64]
-scalar_feat_dim: 8     # 目标相对方向(2)+上一步动作 one-hot(5)+到达标志(1)
-intent_dim: 64
-comm_dim: 64
-comm_radius: 4         # r_c < obs_radius(=5)，且仅与视野内邻居通信
-comm_topk_cap: 6       # 仅算力上限（非零邻居超额时封顶 GAT 计算量）；
-                        # 邻居选择用软稀疏(entmax)+迟滞(τ_out<τ_in)，不用 hard top-k
-entmax_alpha: 1.5      # 软稀疏度：1=softmax, 2=sparsemax, 默认 1.5
-tau_in: 0.05           # 迟滞进入阈值
-tau_out: 0.02          # 迟滞退出阈值 (τ_out < τ_in)
-stickiness_bonus: 0.1  # 已活跃邻居的 logit 加分
-ema_decay: 0.0         # 跨步通信特征 EMA 平滑（0=不平滑）
-gru_hidden_dim: 256
-dueling_hidden_dim: 256
-num_actions: 5
-num_attention_heads: 4
+patch_channels: 4      # Pogema 原生 3 通道 + 追加足迹通道 1（INVARIANT 5）
+cnn_channels: [32, 64, 64]  # CNN 三层通道数（设计文档 §2.3）
+d_patch: 256           # PatchEncoder 输出维度（CNN → flatten → Linear → d_patch）
+                       # 128 时 1024→128 压缩 8x，空间细节损失过多；256 为 4x，更适合 MAPF 空间推理
+scalar_feat_dim: 8     # 目标相对方向(2) + 上一步动作 one-hot(5) + 到达标志(1)（INVARIANT 6）
+d_scalar: 32           # ScalarEncoder 输出维度（MLP → d_scalar）
+
+# --- 通信（INVARIANT 10）---
+intent_dim: 64         # 意图向量维度（fused → intent_proj → intent_dim）
+comm_dim: 64           # 多头注意力内部维度（Q/K/V proj 宽度）
+comm_radius: 4         # r_c < obs_radius(=5)，FOV 内邻居（INVARIANT 10）
+comm_topk_cap: 6       # 算力上限：非零邻居超过此数时封顶（非邻居选择机制）
+                       # 邻居选择用软稀疏(entmax)+迟滞，不用 hard top-k
+entmax_alpha: 1.5      # 软稀疏度：1=softmax，2=sparsemax，1.5 产生稀疏但连续分布
+tau_in: 0.05           # 迟滞进入阈值（非活跃邻居进入需 weight ≥ tau_in）
+tau_out: 0.02          # 迟滞退出阈值（tau_out < tau_in，活跃邻居踢出需 weight < tau_out）
+stickiness_bonus: 0.1  # 已活跃邻居在注意力 logit 上的加分（增强时间稳定性）
+ema_decay: 0.0         # 跨步通信特征 EMA 平滑系数（0=不平滑）
+num_attention_heads: 4 # 多头注意力头数
+
+# --- GRU 记忆 ---
+gru_hidden_dim: 256    # DRQN 隐状态维度（INVARIANT 13 burn-in 依赖此值）
+
+# --- Dueling Q 头 ---
+dueling_hidden_dim: 256  # Value/Advantage 流的隐层宽度
+num_actions: 5           # wait/up/down/left/right（INVARIANT 1）

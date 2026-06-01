@@ -160,7 +160,8 @@ class PogemaWrapper:
         self.map_size: int = self._raw_cfg.get("map_size", 64)
         self.num_agents: int = self._raw_cfg.get("num_agents", 8)
         self.obs_radius: int = self._raw_cfg.get("obs_radius", 5)
-        self.max_episode_steps: int = self._raw_cfg.get("max_episode_steps", 256)
+        self.max_episode_steps: int = self._raw_cfg.get("max_episode_steps", 512)
+        self.obstacle_density: float = self._raw_cfg.get("obstacle_density", 0.3)
         self.collision_system: str = self._raw_cfg.get("collision_system", "soft")
         self.on_target: str = self._raw_cfg.get("on_target", "restart")
 
@@ -329,6 +330,9 @@ class PogemaWrapper:
         if map_str is not None:
             gc_kwargs["map"] = map_str
             gc_kwargs["map_name"] = f"{self.map_type}-seed-{self._seed}"
+        else:
+            # random 地图：传入 obstacle_density（Pogema GridConfig 对应参数名 density）
+            gc_kwargs["density"] = self.obstacle_density
 
         gc = GridConfig(**gc_kwargs)
         return pogema_v0(grid_config=gc)

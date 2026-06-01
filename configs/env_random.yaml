@@ -2,13 +2,13 @@
 # 对齐 pogema-benchmark/raw_data_LMAPF/01-random/01-random.yaml
 # 使用 pogema 原生 generator 生成
 map_type: random
-map_size: 64           # 目标 64×64，开发阶段可降为 20×20
-num_agents: 8           # 开发起步 8，逐步放大到 64→96
-obs_radius: 5           # ⟹ patch 边长 K = 11
-max_episode_steps: 256
-obstacle_density: 0.3
+map_size: 64           # 目标 64×64；开发调试可在命令行用 --map-size 16 覆盖
+num_agents: 8          # 开发默认；目标 96（见设计文档 §0）；命令行 --num-agents 覆盖
+obs_radius: 5          # ⟹ patch 边长 K = 11
+max_episode_steps: 512 # 设计文档 §0 目标值；开发阶段可在命令行降为 256
+obstacle_density: 0.3  # 随机地图障碍密度，传给 GridConfig density 参数
 
-# Pogema 环境参数（对齐 benchmark）
+# Pogema 环境参数
 collision_system: soft        # soft: 允许碰撞但给惩罚
-on_target: restart            # 到达目标后重新分配
-# observation_type 不设（Pogema 2.x 默认即返回 (3,K,K) 局部观测数组）
+on_target: restart            # 到达目标后重新分配新 goal
+# observation_type 不设（Pogema 2.x 默认返回 (3,K,K) 局部观测数组）

@@ -50,15 +50,19 @@ def main():
     net = BiIntentGATDRQN(
         patch_channels=net_cfg.get("patch_channels", 4),
         cnn_channels=net_cfg.get("cnn_channels", [32, 64, 64]),
+        d_patch=net_cfg.get("d_patch", 128),
         scalar_feat_dim=net_cfg.get("scalar_feat_dim", 8),
+        d_scalar=net_cfg.get("d_scalar", 32),
         intent_dim=net_cfg.get("intent_dim", 64),
         comm_dim=net_cfg.get("comm_dim", 64),
         comm_radius=net_cfg.get("comm_radius", 4),
-        comm_topk_cap=net_cfg.get("comm_topk_cap", 6),   # B8: 修正参数名
+        comm_topk_cap=net_cfg.get("comm_topk_cap", 6),
         num_attention_heads=net_cfg.get("num_attention_heads", 4),
         entmax_alpha=net_cfg.get("entmax_alpha", 1.5),
         tau_in=net_cfg.get("tau_in", 0.05),
         tau_out=net_cfg.get("tau_out", 0.02),
+        stickiness_bonus=net_cfg.get("stickiness_bonus", 0.1),
+        ema_decay=net_cfg.get("ema_decay", 0.0),
         gru_hidden_dim=net_cfg.get("gru_hidden_dim", 256),
         dueling_hidden_dim=net_cfg.get("dueling_hidden_dim", 256),
     )
