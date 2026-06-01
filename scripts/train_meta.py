@@ -48,8 +48,13 @@ def main():
         intent_dim=net_cfg.get("intent_dim", 64),
         comm_dim=net_cfg.get("comm_dim", 64),
         comm_radius=net_cfg.get("comm_radius", 4),
-        comm_topk=net_cfg.get("comm_topk", 6),
+        comm_topk_cap=net_cfg.get("comm_topk_cap", 6),   # B8: 修正参数名
+        num_attention_heads=net_cfg.get("num_attention_heads", 4),
+        entmax_alpha=net_cfg.get("entmax_alpha", 1.5),
+        tau_in=net_cfg.get("tau_in", 0.05),
+        tau_out=net_cfg.get("tau_out", 0.02),
         gru_hidden_dim=net_cfg.get("gru_hidden_dim", 256),
+        dueling_hidden_dim=net_cfg.get("dueling_hidden_dim", 256),
     )
 
     # 简化训练：用 dummy buffer 验证流程
@@ -69,7 +74,6 @@ def main():
 
     # 生成一些专家数据
     wrapper = PogemaWrapper("configs/env_random.yaml")
-    wrapper._raw_cfg.update(size=16, num_agents=4)
     wrapper.map_size = 16
     wrapper.num_agents = 4
 

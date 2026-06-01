@@ -115,6 +115,17 @@ class BiIntentGATDRQN(nn.Module):
         self.num_actions = num_actions
         self.gru_hidden_dim = gru_hidden_dim
 
+    def reset_comm_state(self):
+        """
+        重置通信模块的跨时间步迟滞状态。
+        应在每个 episode 开始时调用一次，而非在每次 forward 时调用。
+
+        B7 修复：原先在 forward() 内调用 reset_state()，导致推断时每步都清空
+        迟滞状态（_active_mask/_prev_edge_set），EdgeFlipRate 防闪烁机制失效。
+        现改为由调用方在 episode 边界显式调用本方法。
+        """
+        self.communication.reset_state()
+
     def forward(
         self,
         patches: torch.Tensor,       # (B, T, N, 4, K, K)
@@ -123,6 +134,7 @@ class BiIntentGATDRQN(nn.Module):
         hidden_init: Optional[torch.Tensor] = None,  # (1, B*N, gru_hidden_dim)
         burn_in_len: int = 0,
         action_masks: Optional[torch.Tensor] = None,  # (B, T, N, 5) bool
+        reset_comm: bool = False,    # 是否在本次 forward 前重置通信状态（训练序列开始时设 True）
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         Args:
@@ -133,6 +145,9 @@ class BiIntentGATDRQN(nn.Module):
             hidden_init: 初始隐状态。
             burn_in_len: R2D2 burn-in 步数。
             action_masks: 合法动作掩码，True=合法。非法位填 -inf。
+            reset_comm: True = 在本次 forward 前先重置通信迟滞状态（用于训练序列
+                        起始或 episode 开始的单步推断）。推断时逐步调用不应设 True，
+                        否则迟滞状态每步清空，防闪烁失效（B7）。
 
         Returns:
             q_values:   (B, T, N, 5) 动作价值。
@@ -142,23 +157,21 @@ class BiIntentGATDRQN(nn.Module):
         B, T, N = patches.shape[:3]
         device = patches.device
 
+        # 仅在显式要求时重置通信状态（训练 batch 起始或 episode 起始）
+        if reset_comm:
+            self.communication.reset_state()
+
         # ---- 1. 编码 ----
-        # patches: (B, T, N, 4, K, K) → (B*T*N, d_patch)
         patches_flat = patches.reshape(B * T * N, *patches.shape[-3:])
         patch_feat = self.patch_encoder(patches_flat)       # (B*T*N, d_patch)
         patch_feat = patch_feat.reshape(B, T, N, -1)
 
-        # scalars: (B, T, N, 8) → (B, T, N, d_scalar)
-        scalar_feat = self.scalar_encoder(scalars)
+        scalar_feat = self.scalar_encoder(scalars)          # (B, T, N, d_scalar)
 
-        # fused: (B, T, N, d_patch + d_scalar)
-        fused = torch.cat([patch_feat, scalar_feat], dim=-1)
+        fused = torch.cat([patch_feat, scalar_feat], dim=-1)  # (B, T, N, fused_dim)
 
-        # ---- 2. 通信（逐时间步，带迟滞状态） ----
+        # ---- 2. 通信（逐时间步，迟滞状态跨步持续） ----
         intent = self.intent_proj(fused)  # (B, T, N, intent_dim)
-
-        # 重置通信模块的跨时间步状态
-        self.communication.reset_state(batch_size=B)
 
         comm_list = []
         edge_flip_rates = []

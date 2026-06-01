@@ -15,7 +15,7 @@ import numpy as np
 from typing import List, Tuple, Dict, Optional
 
 from envs.observation_builder import ObservationBuilder
-from envs.action_mask import build_action_mask
+from envs.action_mask import build_action_mask_batch
 from envs.reward_builder import RewardBuilder
 from lacam.trajectory_converter import (
     path_to_actions,
@@ -60,48 +60,13 @@ def build_dataset_from_lacam(
         }
         return [], [hard_case]
 
-    N = result.num_agents
-    paths = result.paths
-    expert_samples = []
-
-    # 为每体构建 per-step 样本
-    for i in range(N):
-        path = paths[i]
-        if len(path) < 2:
-            continue
-        actions = path_to_actions(path)
-        T = len(actions)
-
-        # 用 wrapper 重置环境到该地图的起始状态
-        # 注意：这里假设 wrapper 已经 reset 到对应地图
-
-        for t in range(T):
-            sample = _build_single_sample(
-                agent_idx=i,
-                step=t,
-                path=path,
-                actions=actions,
-                wrapper=wrapper,
-                obs_builder=obs_builder,
-                reward_builder=reward_builder,
-                obstacles=obstacles,
-                map_type=result.map_type,
-                task_id=f"{result.map_type}_{hash(str(result.starts))}",
-            )
-            if sample is not None:
-                expert_samples.append(sample)
-
-    # 可解释性过滤
-    expert_samples = mark_ambiguous_samples(expert_samples)
-
-    # wait 权重
-    for s in expert_samples:
-        # per-episode wait ratio 无法单样本计算，用全局默认
-        s["margin_weight"] = 1.0
-        if s["action_expert"] == 0:
-            s["margin_weight"] = 0.5  # wait 默认降权
-
-    return expert_samples, []
+    # B2: _build_single_sample 未实现，此入口不可用。
+    # 请使用 build_dataset_from_rollout(wrapper, obs_builder, reward_builder,
+    #     obstacles, result.paths, map_type, task_id) 代替。
+    raise NotImplementedError(
+        "build_dataset_from_lacam() is not fully implemented (B2). "
+        "Use build_dataset_from_rollout() to generate expert samples."
+    )
 
 
 def _build_single_sample(
@@ -119,22 +84,21 @@ def _build_single_sample(
     """
     为单个 agent 的单个时间步构建一条训练样本。
 
-    Returns:
-        sample dict or None if reconstruction fails.
+    NOTE: 此函数**未完整实现**（B2）。
+    离线重建观测需要在正确时刻 step 环境并调用 obs_builder，
+    无法仅凭路径在单函数内无状态地完成。
+
+    正确的数据生成入口是 `build_dataset_from_rollout`，
+    它通过顺序执行 env.step + obs_builder.build 来重建每步观测。
+
+    `build_dataset_from_lacam` 中对本函数的调用已被保留作为 API 占位，
+    但 `build_dataset_from_lacam` 的返回值将始终为空列表，
+    应使用 `build_dataset_from_rollout` 替代。
     """
-    # 专家动作
-    action_expert = actions[step]
-    pos_curr = path[step]
-    pos_next = path[step + 1]
-    goal = wrapper.get_targets_xy()[agent_idx]
-
-    # 构建观测（需要重建该时刻的环境状态）
-    # 这里采用简化的离线重建：假设 wrapper 已按路径重放到当前步
-    # 实际使用时由 generate_lacam_data.py 逐步 move 并记录观测
-
-    # 占位：实际观测由外部逐步执行后传入
-    # 这里返回需要填写的模板
-    return None  # 由 generate_lacam_data.py 在主循环中填充
+    raise NotImplementedError(
+        "_build_single_sample is not implemented. "
+        "Use build_dataset_from_rollout() instead."
+    )
 
 
 def build_dataset_from_rollout(
@@ -190,9 +154,10 @@ def build_dataset_from_rollout(
         # 观测（使用 prev_actions = 上一步专家动作）
         patches, scalars = _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder)
 
-        # 掩码
+        # 掩码（向量化版本）
         agents_xy = wrapper.get_agents_xy()
-        mask = build_action_mask(agents_xy, obstacles)
+        agents_arr = np.array(agents_xy, dtype=np.int32)[np.newaxis]  # (1, N, 2)
+        mask = build_action_mask_batch(agents_arr, obstacles)[0]       # (N, 5) bool
 
         # Reward（使用上一步动作和上一步状态）
         targets_xy = wrapper.get_targets_xy()
@@ -221,6 +186,7 @@ def build_dataset_from_rollout(
                 "obs_patch": patches[i].copy(),       # (4, K, K)
                 "obs_scalar": scalars[i].copy(),       # (8,)
                 "obs_hash": obs_hash,
+                "_agent_idx": i,                        # 用于 next_obs 填充，稍后清理
                 "hidden_init": None,                    # 由 buffer 管理
                 "action_expert": expert_actions[i],
                 "reward": rewards[i],
@@ -240,11 +206,21 @@ def build_dataset_from_rollout(
         prev_agents = agents_xy
         prev_goals = targets_xy
 
-    # 填充 next_obs（相邻样本的 obs）
-    for idx in range(len(samples) - 1):
-        if samples[idx]["task_id"] == samples[idx + 1]["task_id"]:
-            samples[idx]["next_obs_patch"] = samples[idx + 1]["obs_patch"]
-            samples[idx]["next_obs_scalar"] = samples[idx + 1]["obs_scalar"]
+    # 填充 next_obs / next_action_mask：
+    # 样本按 [a0t0, a1t0, …, aN-1t0, a0t1, …] 交错存储，
+    # 必须按 agent 索引（_agent_idx）分组，避免跨体赋值错误（B3 修复）。
+    for i in range(N):
+        agent_indices = [idx for idx, s in enumerate(samples) if s.get("_agent_idx") == i]
+        for k in range(len(agent_indices) - 1):
+            cur = agent_indices[k]
+            nxt = agent_indices[k + 1]
+            samples[cur]["next_obs_patch"]    = samples[nxt]["obs_patch"]
+            samples[cur]["next_obs_scalar"]   = samples[nxt]["obs_scalar"]
+            samples[cur]["next_action_mask"]  = samples[nxt]["action_mask"]  # I2 修复
+
+    # 清理辅助字段
+    for s in samples:
+        s.pop("_agent_idx", None)
 
     # 可解释性过滤
     samples = mark_ambiguous_samples(samples)

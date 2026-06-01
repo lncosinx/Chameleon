@@ -294,10 +294,8 @@ class _PrioritizedSolver:
         path.append((sr, sc))
         path.reverse()
 
-        # 在目标位置等待
-        max_extra = 100
-        while len(path) < len(path) + max_extra:
-            path.append(path[-1])
+        # 在目标位置等待（固定步数）
+        path.extend([path[-1]] * 100)
 
         return path
 

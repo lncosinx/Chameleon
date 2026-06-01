@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 from typing import List, Dict, Tuple, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 class HardCaseManager:
@@ -29,7 +29,7 @@ class HardCaseManager:
 
     def __init__(self, max_cases: int = 10000):
         self.max_cases = max_cases
-        self._cases: List[dict] = []
+        self._cases: deque = deque(maxlen=max_cases)  # O(1) FIFO，替代 list.pop(0)
         self._type_counts: Dict[str, int] = defaultdict(int)
         self._reason_counts: Dict[str, int] = defaultdict(int)
 
@@ -54,10 +54,7 @@ class HardCaseManager:
             "added_at_step": len(self._cases),
         }
 
-        if len(self._cases) >= self.max_cases:
-            # FIFO 淘汰
-            self._cases.pop(0)
-
+        # deque(maxlen) 自动 FIFO 淘汰最旧元素，O(1)
         self._cases.append(case)
         self._type_counts[map_type] += 1
         self._reason_counts[reason] += 1
@@ -85,7 +82,6 @@ class HardCaseManager:
 
         weights = np.ones(len(self._cases), dtype=np.float32)
 
-        # 按 reason 加权
         reason_multipliers = {
             "lacam_failure": 3.0,
             "deadlock": 3.0,
@@ -97,10 +93,10 @@ class HardCaseManager:
             "no_progress_long": 2.0,
             "unknown": 1.5,
         }
-        for i, case in enumerate(self._cases):
+        cases_list = list(self._cases)  # deque → list for indexing
+        for i, case in enumerate(cases_list):
             weights[i] *= reason_multipliers.get(case["reason"], 1.0)
 
-        # 归一化
         weights /= weights.sum()
         return weights
 
@@ -112,13 +108,13 @@ class HardCaseManager:
             rng = np.random.default_rng()
         if not self._cases:
             return []
+        cases_list = list(self._cases)
         weights = self.get_sampling_weights()
-        indices = rng.choice(len(self._cases), size=min(n, len(self._cases)),
+        indices = rng.choice(len(cases_list), size=min(n, len(cases_list)),
                              p=weights, replace=False)
-        return [self._cases[i] for i in indices]
+        return [cases_list[i] for i in indices]
 
     def get_stats(self) -> dict:
-        """返回统计信息。"""
         return {
             "total_cases": len(self._cases),
             "by_type": dict(self._type_counts),

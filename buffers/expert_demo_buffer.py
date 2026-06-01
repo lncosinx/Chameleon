@@ -97,6 +97,7 @@ class ExpertDemoBuffer:
             "next_obs_scalars": np.zeros((batch_size, sequence_len, 8), dtype=np.float32),
             "dones": np.zeros((batch_size, sequence_len), dtype=bool),
             "action_masks": np.zeros((batch_size, sequence_len, 5), dtype=bool),
+            "next_action_masks": np.ones((batch_size, sequence_len, 5), dtype=bool),  # s_{t+1} 掩码
             "margin_excluded": np.zeros((batch_size, sequence_len), dtype=bool),
             "margin_weights": np.zeros((batch_size, sequence_len), dtype=np.float32),
         }
@@ -113,6 +114,14 @@ class ExpertDemoBuffer:
                 batch["next_obs_scalars"][b, t] = s.get("next_obs_scalar", np.zeros(8))
                 batch["dones"][b, t] = s.get("done", False)
                 batch["action_masks"][b, t] = s.get("action_mask", np.ones(5, dtype=bool))
+                # next_action_mask 优先从样本读取，回退到下一条样本的 action_mask
+                if "next_action_mask" in s:
+                    batch["next_action_masks"][b, t] = s["next_action_mask"]
+                elif start_idx + t + 1 < len(self._buffer):
+                    batch["next_action_masks"][b, t] = self._buffer[start_idx + t + 1].get(
+                        "action_mask", np.ones(5, dtype=bool)
+                    )
+                # 若无法获取则保持默认全合法（全为 True）
                 batch["margin_excluded"][b, t] = s.get("margin_excluded", False)
                 batch["margin_weights"][b, t] = s.get("margin_weight", 1.0)
 

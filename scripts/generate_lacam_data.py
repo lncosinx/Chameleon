@@ -46,8 +46,6 @@ def generate_data(
     os.makedirs(output_dir, exist_ok=True)
 
     wrapper = PogemaWrapper(config_path)
-    wrapper._raw_cfg["size"] = map_size
-    wrapper._raw_cfg["num_agents"] = num_agents
     wrapper.map_size = map_size
     wrapper.num_agents = num_agents
 

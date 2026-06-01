@@ -36,59 +36,77 @@ def one_step_td_loss(
 
 
 def n_step_td_loss(
-    q_values: torch.Tensor,        # (B, N, num_actions) — 时刻 t 的 Q(s_t,·)
-    actions: torch.Tensor,         # (B, N) — 时刻 t 的动作
-    rewards_seq: torch.Tensor,     # (B, N, n) — r_t, r_{t+1}, ..., r_{t+n-1}
-    dones_seq: torch.Tensor,       # (B, N, n) — done flags
-    v_target_n: torch.Tensor,      # (B, N) — V_target(s_{t+n})
+    q_values: torch.Tensor,        # (B, num_actions) — 时刻 t 的 Q(s_t,·)
+    actions: torch.Tensor,         # (B,) — 时刻 t 的动作
+    rewards_seq: torch.Tensor,     # (B, n) — r_t, r_{t+1}, ..., r_{t+n-1}
+    dones_seq: torch.Tensor,       # (B, n) — done flags
+    v_target_n: torch.Tensor,      # (B,) — V_target(s_{t+n})
     gamma: float = 0.99,
     n_step: int = 5,
 ) -> torch.Tensor:
     """
     n-step TD loss。
 
-    y_n = r_t + γ·r_{t+1} + ... + γ^{n-1}·r_{t+n-1} + γ^n·V_target(s_{t+n})
+    y_n = r_t + γ·(1-d_t)·r_{t+1} + γ²·(1-d_t)·(1-d_{t+1})·r_{t+2} + ...
+          + γ^n · (1-d_{t+n-1}) · ... · (1-d_t) · V_target(s_{t+n})
+
+    done 掩码语义：done[l]=1 表示在收集 r[l] 后 episode 结束，
+    因此 r[l] 本身仍被计入，但 r[l+1:] 以及 V_target 的 bootstrap 归零。
 
     Args:
-        q_values: Q(s_t, a)。(B, N, num_actions)
-        actions: 时刻 t 的动作。
-        rewards_seq: n 步奖励序列。
-        dones_seq: n 步 done 序列。
-        v_target_n: V(s_{t+n})。
-        gamma: 折扣因子。
-        n_step: n 步数。
+        q_values:   Q(s_t, ·)，shape (B, num_actions)。
+        actions:    时刻 t 的动作，shape (B,)。
+        rewards_seq: n 步奖励序列，shape (B, n)。
+        dones_seq:  n 步 done 序列，shape (B, n)。
+        v_target_n: V(s_{t+n})，shape (B,)。
+        gamma:      折扣因子。
+        n_step:     n 步数（与 rewards_seq.shape[1] 一致）。
 
     Returns:
         loss: scalar
     """
-    B, N, n = rewards_seq.shape
+    # 兼容旧调用格式 (B, N, n) → 展平成 (B*N, n)
+    if rewards_seq.dim() == 3:
+        B_orig, N_orig, n = rewards_seq.shape
+        rewards_seq = rewards_seq.reshape(B_orig * N_orig, n)
+        dones_seq   = dones_seq.reshape(B_orig * N_orig, n)
+        v_target_n  = v_target_n.reshape(B_orig * N_orig)
+        if q_values.dim() == 3:
+            q_values = q_values.reshape(B_orig * N_orig, -1)
+        if actions.dim() == 2:
+            actions = actions.reshape(B_orig * N_orig)
+
+    B, n = rewards_seq.shape
     device = rewards_seq.device
 
-    # 计算 n-step return
     discounts = gamma ** torch.arange(n, device=device, dtype=torch.float32)  # (n,)
-    discount_factor = gamma ** n
 
-    # 累积折扣奖励
-    done_mask = (~dones_seq.bool()).float() if dones_seq.dtype == torch.bool else (1.0 - dones_seq)
+    # 将 done 转为 float (1=done, 0=not done)
+    if dones_seq.dtype == torch.bool:
+        dones_f = dones_seq.float()
+    else:
+        dones_f = dones_seq.float()
 
-    # 累计：对每一步 l，如果之前某步 done，则该步及之后 = 0
-    cum_done = torch.cumprod(done_mask, dim=-1)  # (B, N, n)
-    # 第 0 步的 done mask 不在此序列内
-    # 简化：假设 dones_seq 已正确截断
-    discounted_rewards = rewards_seq * (discounts.view(1, 1, n))  # (B, N, n)
-    # 将 n-step done 隔离
-    discounted_rewards = discounted_rewards * cum_done
+    # not_done[l] = 1 − done[l]
+    not_done = 1.0 - dones_f  # (B, n)
 
-    return_sum = discounted_rewards.sum(dim=-1)  # (B, N)
+    # survival[l]: 从步 0 到步 l-1 都没有 done（即 r[l] 是否应该 bootstrap）
+    # r[0] 始终纳入；r[l](l>=1) 纳入当且仅当 done[0..l-1] 全为 False
+    # = cumprod(not_done, shift by 1)，第 0 位恒为 1
+    # 实现：survival[:, 0] = 1；survival[:, l] = prod(not_done[:, 0:l])
+    survival = torch.ones(B, n, device=device)
+    if n > 1:
+        survival[:, 1:] = torch.cumprod(not_done[:, :-1], dim=1)
 
-    # V_target 项
-    # 如果序列中任何步 done，V_target 项归零
-    any_done = 1.0 - done_mask.prod(dim=-1)  # (B, N) — 有一个 done 则归零
-    v_term = discount_factor * v_target_n * (1.0 - any_done)  # (B, N)
+    discounted_rewards = rewards_seq * discounts.unsqueeze(0) * survival  # (B, n)
+    return_sum = discounted_rewards.sum(dim=-1)  # (B,)
 
-    td_target_n = return_sum + v_term  # (B, N)
+    # V_target 的 bootstrap：当且仅当全程未 done 时纳入
+    bootstrap_mask = survival[:, -1] * not_done[:, -1]          # (B,) — 最后一步也未 done
+    v_term = (gamma ** n) * v_target_n * bootstrap_mask
+
+    td_target_n = (return_sum + v_term).detach()
 
     q_sa = q_values.gather(dim=-1, index=actions.unsqueeze(-1)).squeeze(-1)
-
-    loss = F.mse_loss(q_sa, td_target_n.detach())
+    loss = F.mse_loss(q_sa, td_target_n)
     return loss

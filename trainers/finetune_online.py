@@ -101,72 +101,125 @@ class FinetuneOnlineTrainer:
         """添加同步段采样数据。"""
         self.buffer.add_batch(samples, policy_version)
 
-    def train_on_segment(self, batch_size: int = 32) -> Dict[str, float]:
+    def train_on_segment(
+        self, batch_size: int = 32,
+        sequence_len: int = None,
+        burn_in_len: int = 8,
+    ) -> Dict[str, float]:
         """
-        在最新 segment 数据上训练。
+        在最新 segment 数据上以序列模式训练（DRQN + R2D2 burn-in）。
+
+        Args:
+            batch_size:   序列条数（B）。
+            sequence_len: 每条序列长度，默认 = rollout_segment_len。
+            burn_in_len:  R2D2 burn-in 步数（INVARIANT 13）。
 
         Returns:
             metrics dict
         """
         self.net.train()
+        if sequence_len is None:
+            sequence_len = self.rollout_segment_len
 
-        # 获取符合 lag 约束的样本
+        # 获取符合 lag 约束的样本（单步样本列表）
         valid_samples = self.buffer.get_trainable_samples()
-        if len(valid_samples) < batch_size:
+        total_needed = batch_size * sequence_len
+        if len(valid_samples) < total_needed:
             return {"loss_total": 0.0, "error": "not enough samples"}
 
-        # 随机采样 batch
-        indices = np.random.choice(len(valid_samples), batch_size, replace=False)
-        batch_samples = [valid_samples[i] for i in indices]
+        # 随机采样起始索引，组装序列 batch
+        max_start = len(valid_samples) - sequence_len
+        start_indices = np.random.randint(0, max_start + 1, size=batch_size)
 
-        # 转为 tensors（简化：使用 collator）
-        from buffers.batch_collator import collate_samples_to_tensors
-        batch = collate_samples_to_tensors(batch_samples, sequence_len=1, device=self.device)
+        K = valid_samples[0].get("obs_patch", np.zeros((4, 11, 11))).shape[-1]
+        obs_patches_np = np.zeros((batch_size, sequence_len, 4, K, K), dtype=np.float32)
+        obs_scalars_np = np.zeros((batch_size, sequence_len, 8), dtype=np.float32)
+        actions_np     = np.zeros((batch_size, sequence_len), dtype=np.int64)
+        rewards_np     = np.zeros((batch_size, sequence_len), dtype=np.float32)
+        dones_np       = np.zeros((batch_size, sequence_len), dtype=bool)
+        masks_np       = np.ones((batch_size, sequence_len, 5), dtype=bool)
+        next_masks_np  = np.ones((batch_size, sequence_len, 5), dtype=bool)
+        expert_np      = np.zeros((batch_size, sequence_len), dtype=np.int64)
+        excl_np        = np.zeros((batch_size, sequence_len), dtype=bool)
+        wt_np          = np.ones((batch_size, sequence_len), dtype=np.float32)
 
-        # 前向（在线网络 + target 网络）
-        # 简化单步训练模式
-        obs_patches = batch["obs_patches"].squeeze(1)  # (B, 4, K, K)
-        obs_scalars = batch["obs_scalars"].squeeze(1)
-        actions = batch["actions"].squeeze(1)
-        rewards = batch["rewards"].squeeze(1)
-        dones = batch["dones"].squeeze(1)
-        masks = batch["action_masks"].squeeze(1)
-        expert_acts = batch["expert_actions"].squeeze(1)
+        for b, si in enumerate(start_indices):
+            for t in range(sequence_len):
+                s = valid_samples[si + t]
+                obs_patches_np[b, t] = s.get("obs_patch", np.zeros((4, K, K)))
+                obs_scalars_np[b, t] = s.get("obs_scalar", np.zeros(8))
+                actions_np[b, t]     = s.get("action_expert", 0)
+                rewards_np[b, t]     = s.get("reward", 0.0)
+                dones_np[b, t]       = s.get("done", False)
+                masks_np[b, t]       = s.get("action_mask", np.ones(5, dtype=bool))
+                next_masks_np[b, t]  = s.get("next_action_mask",
+                    valid_samples[si + t + 1].get("action_mask", np.ones(5, dtype=bool))
+                    if si + t + 1 < len(valid_samples) else np.ones(5, dtype=bool))
+                expert_np[b, t]      = s.get("action_expert", 0)
+                excl_np[b, t]        = s.get("margin_excluded", True)  # 自游走默认 True
+                wt_np[b, t]          = s.get("margin_weight", 0.0)
 
-        # 添加 agent 和 time 维度
-        B = obs_patches.shape[0]
-        positions = torch.zeros(B, 1, 1, 2, device=self.device)
-        hidden = self.net.init_hidden(B, 1, self.device)
+        def _t(x, dtype=None):
+            t = torch.from_numpy(np.asarray(x))
+            return t.to(dtype).to(self.device) if dtype else t.to(self.device)
 
+        obs_patches  = _t(obs_patches_np)                     # (B, T, 4, K, K)
+        obs_scalars  = _t(obs_scalars_np)                     # (B, T, 8)
+        actions      = _t(actions_np, dtype=torch.long)       # (B, T)
+        rewards      = _t(rewards_np)                         # (B, T)
+        dones        = _t(dones_np, dtype=torch.bool)         # (B, T)
+        masks        = _t(masks_np, dtype=torch.bool)         # (B, T, 5)  — s_t 掩码（margin）
+        next_masks   = _t(next_masks_np, dtype=torch.bool)    # (B, T, 5)  — s_{t+1} 掩码（TD）
+        expert_acts  = _t(expert_np, dtype=torch.long)
+        excl         = _t(excl_np, dtype=torch.bool)
+        weights      = _t(wt_np)
+
+        B, T = obs_patches.shape[:2]
+        positions = torch.zeros(B, T, 1, 2, device=self.device)
+        hidden    = self.net.init_hidden(B, 1, self.device)
+        h_target  = self.target_net.init_hidden(B, 1, self.device)
+
+        # 在线网络前向（带 burn-in，INVARIANT 13）
         q_online, _, _ = self.net(
-            obs_patches.unsqueeze(1).unsqueeze(2),  # (B, 1, 1, 4, K, K)
-            obs_scalars.unsqueeze(1).unsqueeze(2),   # (B, 1, 1, 8)
+            obs_patches.unsqueeze(2),   # (B, T, 1, 4, K, K)
+            obs_scalars.unsqueeze(2),   # (B, T, 1, 8)
             positions,
             hidden,
-        )
+            burn_in_len=burn_in_len,
+            action_masks=masks.unsqueeze(2),
+        )  # (B, T, 1, 5)
 
         with torch.no_grad():
-            q_target, _, _ = self.target_net(
-                obs_patches.unsqueeze(1).unsqueeze(2),
-                obs_scalars.unsqueeze(1).unsqueeze(2),
+            q_target_out, _, _ = self.target_net(
+                obs_patches.unsqueeze(2),
+                obs_scalars.unsqueeze(2),
                 positions,
-                hidden,
-            )
+                h_target,
+                burn_in_len=burn_in_len,
+            )  # (B, T, 1, 5)
 
-        # 展平
-        q_online_flat = q_online.reshape(B, 5)
-        q_target_flat = q_target.reshape(B, 5)
+        q_online_flat  = q_online.reshape(B * T, 5)
+        q_target_flat  = q_target_out.reshape(B * T, 5)
+        act_flat       = actions.reshape(B * T)
+        rew_flat       = rewards.reshape(B * T)
+        done_flat      = dones.reshape(B * T)
+        nmask_flat     = next_masks.reshape(B * T, 5)
+        exp_flat       = expert_acts.reshape(B * T)
+        excl_flat      = excl.reshape(B * T)
+        wt_flat        = weights.reshape(B * T)
 
         lam_margin = self.lambda_margin()
 
         total_loss, loss_info = dqfd_total_loss(
             q_values=q_online_flat,
             target_q_next=q_target_flat,
-            actions=actions.long(),
-            rewards=rewards,
-            dones=dones,
-            action_masks_next=masks,
-            expert_actions=expert_acts.long(),
+            actions=act_flat,
+            rewards=rew_flat,
+            dones=done_flat,
+            action_masks_next=nmask_flat,
+            expert_actions=exp_flat,
+            margin_excluded=excl_flat,
+            margin_weights=wt_flat,
             gamma=self.gamma,
             mellowmax_alpha=self.mellowmax_alpha,
             margin=self.margin,

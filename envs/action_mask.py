@@ -142,8 +142,9 @@ def build_action_mask_batch(
 
     mask = in_bounds & is_free
 
-    # assert: wait 恒合法（每个 batch 每个 agent）
-    # wait 的目标格 = 自身位置，在 bounds 内且应为 free
+    # wait (action 0) 恒合法（INVARIANT 7）：强制覆写，与单体版本行为一致
+    mask[:, :, 0] = True
+
     return mask
 
 

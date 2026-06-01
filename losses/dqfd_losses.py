@@ -122,9 +122,14 @@ def dqfd_total_loss(
     info["loss_td"] = loss_td.item()
 
     # ---- n-step TD ----
-    if rewards_seq is not None and v_target_n is not None:
+    if rewards_seq is not None and dones_seq is not None and v_target_n is not None:
+        # 对齐 q_values / actions 与 rewards_seq 的 leading dim
+        # （调用方可能已提前裁剪为 B*(T-n)，此时需要同步裁剪 q/a）
+        n_seq = rewards_seq.shape[0] if rewards_seq.dim() == 2 else rewards_seq.shape[0] * rewards_seq.shape[1]
+        q_n = q_values[:n_seq] if q_values.shape[0] > n_seq else q_values
+        a_n = actions[:n_seq] if actions.shape[0] > n_seq else actions
         loss_n = n_step_td_loss(
-            q_values, actions, rewards_seq, dones_seq,
+            q_n, a_n, rewards_seq, dones_seq,
             v_target_n, gamma, n_step,
         )
         info["loss_nstep"] = loss_n.item()

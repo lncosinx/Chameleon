@@ -205,11 +205,13 @@ class BiIntentAttention(nn.Module):
         is_candidate = (dist <= self.comm_radius) & (dist > 1e-6)  # (B, N, N)
 
         # ---- Step 2: 计算注意力 logits（用于邻居选择的预备分数）----
-        Q_raw = self.q_proj(intents)  # (B, N, D_comm)
-        K_raw = self.k_proj(intents)  # (B, N, D_comm)
+        Q_raw = self.q_proj(intents)  # (B, N, comm_dim)
+        K_raw = self.k_proj(intents)  # (B, N, comm_dim)
 
-        # 注意力分数：Q·K^T / √d，仅候选邻居非零
-        scale = D ** -0.5
+        # 注意力分数：Q·K^T / √comm_dim
+        # 注意：scale 基于 Q/K 的维度 comm_dim，而非输入的 intent_dim（B6 修复）
+        comm_dim = Q_raw.shape[-1]
+        scale = comm_dim ** -0.5
         attn_logits = torch.bmm(Q_raw, K_raw.transpose(1, 2)) * scale  # (B, N, N)
 
         # 非候选邻居 → -inf（entmax 中权重 → 0）
@@ -225,6 +227,10 @@ class BiIntentAttention(nn.Module):
         # attn_logits 中有 -inf（非候选），entmax 会自动将其压为 0
         attn_weights = entmax(attn_logits, alpha=self.entmax_alpha, dim=-1)  # (B, N, N)
 
+        # 无候选邻居的行：entmax 数值 fallback 会返回均匀分布，强制归零
+        has_any_cand = is_candidate.any(dim=-1, keepdim=True).float()  # (B, N, 1)
+        attn_weights = attn_weights * has_any_cand
+
         # ---- Step 5: 迟滞阈值过滤 ----
         # τ_in: 之前不活跃的邻居，权重 < τ_in → 置 0
         # τ_out: 之前活跃的邻居，权重 < τ_out → 置 0
@@ -238,7 +244,10 @@ class BiIntentAttention(nn.Module):
             attn_weights = attn_weights / sum_w
 
         # 更新活跃集（用于下一步迟滞）
-        self._active_mask = (attn_weights > self.tau_in).detach()
+        # 凡是通过了迟滞阈值过滤后权重 > 0 的边，均视为活跃（B5 修复）
+        # 用 tau_in 而非 > 0 会让 tau_out <= w < tau_in 的边在下一步被当成"非活跃"
+        # 从而失去迟滞保护，退化为每步都重新用 tau_in 判断，与设计矛盾
+        self._active_mask = (attn_weights > 0).detach()
 
         # ---- Step 6: 算力上限封顶（comm_topk_cap）----
         # 如果非零邻居仍超过 cap，保留权重最高的 k 个
@@ -260,12 +269,12 @@ class BiIntentAttention(nn.Module):
             attn_weights = torch.where(need_mask, attn_weights / sum_w, attn_weights)
 
         # ---- Step 7: EdgeFlipRate 监控 ----
+        # 公式（设计文档§5.7）：|E^t △ E^{t+1}| / |E^t ∪ E^{t+1}|
         current_edge_set = (attn_weights > 0).detach()  # (B, N, N)
         if self._prev_edge_set is not None and self._prev_edge_set.shape == current_edge_set.shape:
-            # EdgeFlipRate = 翻转的边数 / 总边数
             flips = (current_edge_set != self._prev_edge_set).float().sum()
-            total = current_edge_set.numel()
-            edge_flip_rate = (flips / max(total, 1)).item()
+            union = (current_edge_set | self._prev_edge_set).float().sum().clamp(min=1)
+            edge_flip_rate = (flips / union).item()
         else:
             edge_flip_rate = 0.0
         self._prev_edge_set = current_edge_set
@@ -286,9 +295,11 @@ class BiIntentAttention(nn.Module):
 
         comm_features = self.out_proj(attended)
 
-        # ---- Step 9: 无邻居的 agent：通信特征 → 0 ----
-        has_neighbor = is_candidate.any(dim=-1).float().unsqueeze(-1)  # (B, N, 1)
-        comm_features = comm_features * has_neighbor
+        # ---- Step 9: 无活跃邻居的 agent：通信特征 → 0 ----
+        # 用实际活跃权重（迟滞过滤后 > 0）而非原始候选集判断，
+        # 避免候选存在但权重全被过滤时 out_proj bias 泄漏（设计文档§2.5）
+        has_active = (attn_weights > 0).any(dim=-1).float().unsqueeze(-1)  # (B, N, 1)
+        comm_features = comm_features * has_active
 
         # ---- Step 10: 跨步 EMA 平滑（可选） ----
         if self.ema_decay > 0 and self._ema_c is not None:

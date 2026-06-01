@@ -11,8 +11,9 @@ from typing import Dict, List, Tuple, Optional
 
 from envs.pogema_env_wrapper import PogemaWrapper
 from envs.observation_builder import ObservationBuilder, build_observations
+from envs.action_mask import build_action_mask_batch, apply_mask_to_q
 from models.biintent_drqn import BiIntentGATDRQN
-from utils.metrics import compute_episode_metrics
+from utils.metrics import compute_episode_metrics, aggregate_episode_metrics
 
 
 def evaluate(
@@ -62,6 +63,9 @@ def evaluate(
         prev_actions = np.zeros(num_agents, dtype=np.int64)
         hidden = net.init_hidden(1, num_agents, device)
 
+        # 每个 episode 开始时重置通信迟滞状态（B7 修复）
+        net.reset_comm_state()
+
         positions_history = []
         actions_history = []
 
@@ -74,10 +78,19 @@ def evaluate(
                 wrapper, obs_list, prev_actions, obs_builder
             )
 
+            # 构建动作掩码（向量化版本，避免 per-agent 循环）
+            obstacles = wrapper.global_grid
+            if obstacles is not None:
+                agents_arr = np.array(agents_xy, dtype=np.int32)[np.newaxis]  # (1, N, 2)
+                mask_np = build_action_mask_batch(agents_arr, obstacles)[0]   # (N, 5) bool
+            else:
+                mask_np = np.ones((num_agents, 5), dtype=bool)
+
             # 转 tensor
-            patches_t = torch.from_numpy(patches).unsqueeze(0).to(device)  # (1, N, 4, K, K)
-            scalars_t = torch.from_numpy(scalars).unsqueeze(0).to(device)  # (1, N, 8)
-            positions_t = torch.tensor(agents_xy, device=device).unsqueeze(0)  # (1, N, 2)
+            patches_t   = torch.from_numpy(patches).unsqueeze(0).to(device)    # (1, N, 4, K, K)
+            scalars_t   = torch.from_numpy(scalars).unsqueeze(0).to(device)    # (1, N, 8)
+            positions_t = torch.tensor(agents_xy, dtype=torch.float32, device=device).unsqueeze(0)  # (1, N, 2)
+            masks_t     = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, N, 5)
 
             with torch.no_grad():
                 q_values, hidden, _ = net(
@@ -85,12 +98,16 @@ def evaluate(
                     scalars_t.unsqueeze(1),    # (1, 1, N, 8)
                     positions_t.unsqueeze(1),  # (1, 1, N, 2)
                     hidden,
+                    action_masks=masks_t,      # B9: 应用动作掩码
                 )
                 q_values = q_values.squeeze(0).squeeze(0)  # (N, 5)
 
-            # ε-greedy
+            # ε-greedy（greedy：argmax；探索：从合法动作集中随机采样）
             if np.random.random() < epsilon:
-                actions = [np.random.randint(0, 5) for _ in range(num_agents)]
+                actions = [
+                    int(np.random.choice(np.where(mask_np[i])[0]))
+                    for i in range(num_agents)
+                ]
             else:
                 actions = q_values.argmax(dim=-1).cpu().numpy().tolist()
 
@@ -106,13 +123,4 @@ def evaluate(
         )
         all_metrics.append(metrics)
 
-    # 汇总
-    summary = {}
-    for key in all_metrics[0]:
-        values = [m[key] for m in all_metrics]
-        summary[key + "_mean"] = float(np.mean(values))
-        if key in ("SR", "Deadlock"):
-            summary[key] = float(np.mean(values))
-    summary["num_episodes"] = num_episodes
-
-    return summary
+    return aggregate_episode_metrics(all_metrics)
