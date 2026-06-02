@@ -112,20 +112,34 @@ data/expert_room.npz
 在四种地图族上元预训练，输出 `checkpoints/meta_init.pt`。
 
 ```bash
+# 双 GPU task-parallel（推荐，2×RTX 5090）
 python scripts/train_meta.py \
     --config configs/train_reptile_dqfd.yaml \
     --network-config configs/network_biintent_drqn.yaml \
     --meta-iters 20000 \
+    --gpus 0,1 \
     --data-dir data \
-    --device cuda:0 \
+    --seed 42
+
+# 单 GPU（调试 / 单卡机器）
+python scripts/train_meta.py \
+    --config configs/train_reptile_dqfd.yaml \
+    --network-config configs/network_biintent_drqn.yaml \
+    --meta-iters 20000 \
+    --gpus 0 \
+    --data-dir data \
     --seed 42
 ```
 
 > **说明**
-> - 超参（`inner_steps`、`inner_lr`、`meta_lr`、`burn_in_len`、`expert_ratio_*` 等）均在 `configs/train_reptile_dqfd.yaml` 中调整。
-> - 双 GPU task-parallel（见设计文档 §4.4）尚未实现，当前为单 GPU 串行。目标硬件上建议同时跑两个不同 `--seed` 实例，手动平均 checkpoint。
+> - 超参均在 `configs/train_reptile_dqfd.yaml` 中调整；关键项：
+>   - `meta_lr_start` / `meta_lr_end`：outer update 学习率线性衰减（默认 0.01 → 0.001）
+>   - `tasks_per_gpu`：每卡串行任务数（默认 2，双卡合计 4 tasks/meta-iter）
+>   - `inner_steps`、`inner_lr`、`burn_in_len`、`expert_ratio_*` 等
+> - 双 GPU 模式下两卡各串行跑 `tasks_per_gpu` 个 inner loop，meta-iter 末平均增量做一次 outer update（详见设计文档 §4.4）。
+> - 性能诊断：将 `debug: true` 写入 yaml，每 `profile_interval` 个 iter 自动打印 `presample` / `inner_loop_wall` / `outer_update` / `sync_meta` 各段耗时。
 > - 训练中途可用 `--meta-iters` 缩短进行快速验证，checkpoint 保存在 `checkpoints/meta_init.pt`。
-> - 监控指标：`inner_loss_mean` 应持续下降；`expert_ratio` 按课程从 0.9 线性降至 0.5。
+> - 监控指标：`inner_loss_mean` 应持续下降；`expert_ratio` 按课程从 0.9 线性降至 0.5；`meta_lr` 随 iter 线性递减。
 
 ---
 
@@ -206,7 +220,7 @@ python scripts/evaluate_policy.py \
 # 快速端到端验证（不需要 GPU，< 3 分钟）
 python scripts/train_meta.py \
     --meta-iters 5 \
-    --device cpu \
+    --gpus cpu \
     --seed 42
 
 python scripts/finetune_target_map.py \

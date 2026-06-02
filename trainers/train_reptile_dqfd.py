@@ -24,6 +24,7 @@ from losses.dqfd_losses import dqfd_total_loss
 from losses.q_target import masked_mellowmax
 from trainers.scheduler import MapScheduler, expert_ratio
 from utils.checkpoint import save_checkpoint, load_checkpoint
+from utils.profiler import Profiler
 
 
 class ReptileDQfDTrainer:
@@ -48,7 +49,10 @@ class ReptileDQfDTrainer:
 
         # 超参
         self.inner_lr = config.get("inner_lr", 3e-4)
-        self.meta_lr = config.get("meta_lr", 0.05)
+        # meta_lr 线性衰减：兼容旧版单值写法（若只有 meta_lr 则 start=end=该值）
+        _legacy_lr = config.get("meta_lr", None)
+        self.meta_lr_start = config.get("meta_lr_start", _legacy_lr if _legacy_lr is not None else 0.01)
+        self.meta_lr_end   = config.get("meta_lr_end",   _legacy_lr if _legacy_lr is not None else 0.001)
         self.inner_steps = config.get("inner_steps", 5)
         self.batch_size = config.get("batch_size", 32)
         self.sequence_len = config.get("sequence_len", 32)
@@ -73,6 +77,15 @@ class ReptileDQfDTrainer:
         # 统计
         self.meta_iter = 0
         self.total_meta_iters = config.get("meta_iterations", 20000)
+
+        # 性能诊断
+        self.profiler          = Profiler() if config.get("debug", False) else None
+        self._profile_interval = config.get("profile_interval", 200)
+
+    def _current_meta_lr(self) -> float:
+        """线性衰减 meta_lr：meta_lr_start → meta_lr_end。"""
+        t = self.meta_iter / max(1, self.total_meta_iters - 1)
+        return self.meta_lr_start + (self.meta_lr_end - self.meta_lr_start) * t
 
     def run_inner_loop(
         self,
@@ -134,7 +147,7 @@ class ReptileDQfDTrainer:
                 with ctx:
                     try:
                         expert_batch = expert_buffer.sample(
-                            batch_size=max(1, n_expert // self.sequence_len),
+                            batch_size=max(1, n_expert),
                             sequence_len=self.sequence_len,
                             burn_in_len=self.burn_in_len,
                             rng=rng,
@@ -190,22 +203,32 @@ class ReptileDQfDTrainer:
             self.expert_ratio_decay_iters,
         )
 
-        result = self.run_inner_loop(
-            expert_buffer=expert_buffer,
-            selfplay_buffer=selfplay_buffer,
-            theta_meta_cpu=theta_meta,
-            exp_ratio_val=exp_ratio_val,
-            buffer_lock=None,
-            seed=seed or (100000 + self.meta_iter),
-        )
+        _seg = self.profiler.segment if self.profiler else lambda _: nullcontext()
+
+        with _seg("inner_loop"):
+            result = self.run_inner_loop(
+                expert_buffer=expert_buffer,
+                selfplay_buffer=selfplay_buffer,
+                theta_meta_cpu=theta_meta,
+                exp_ratio_val=exp_ratio_val,
+                buffer_lock=None,
+                seed=seed or (100000 + self.meta_iter),
+            )
 
         # Outer update: θ = θ_meta + ε·(θ_inner - θ_meta)
-        with torch.no_grad():
-            for name, param in self.net.named_parameters():
-                delta = result["theta_inner"][name].to(self.device) - theta_meta[name].to(self.device)
-                param.copy_(theta_meta[name].to(self.device) + self.meta_lr * delta)
+        cur_meta_lr = self._current_meta_lr()
+        with _seg("outer_update"):
+            with torch.no_grad():
+                for name, param in self.net.named_parameters():
+                    delta = result["theta_inner"][name].to(self.device) - theta_meta[name].to(self.device)
+                    param.copy_(theta_meta[name].to(self.device) + cur_meta_lr * delta)
 
         self.meta_iter += 1
+        if self.profiler and self.meta_iter % self._profile_interval == 0:
+            import pprint
+            print(f"\n[Profiler] meta_iter={self.meta_iter}")
+            pprint.pprint(self.profiler.report())
+            print()
         return {
             "meta_iter":       self.meta_iter,
             "map_type":        map_type,
@@ -466,7 +489,10 @@ class DualGPUReptileTrainer:
         }
 
         # 超参
-        self.meta_lr   = cfg.get("meta_lr",   0.05)
+        _legacy_lr = cfg.get("meta_lr", None)
+        self.meta_lr_start = cfg.get("meta_lr_start", _legacy_lr if _legacy_lr is not None else 0.01)
+        self.meta_lr_end   = cfg.get("meta_lr_end",   _legacy_lr if _legacy_lr is not None else 0.001)
+        self.tasks_per_gpu = cfg.get("parallel", {}).get("tasks_per_gpu", cfg.get("tasks_per_gpu", 1))
         self.meta_iter = 0
         self.total_meta_iters = cfg.get("meta_iterations", 20000)
         self.expert_ratio_start       = cfg.get("expert_ratio_start",       0.9)
@@ -475,8 +501,17 @@ class DualGPUReptileTrainer:
 
         self.scheduler = MapScheduler(cfg.get("map_schedule", None))
 
-        # 共享 buffer 访问锁（两线程同时采样时使用）
+        # selfplay buffer 并发访问锁：多个 _run_gpu 线程共享同一 buffer，需要序列化采样
         self._buffer_lock = threading.Lock()
+
+        # 性能诊断
+        self.profiler          = Profiler() if cfg.get("debug", False) else None
+        self._profile_interval = cfg.get("profile_interval", 200)
+
+    def _current_meta_lr(self) -> float:
+        """线性衰减 meta_lr：meta_lr_start → meta_lr_end。"""
+        t = self.meta_iter / max(1, self.total_meta_iters - 1)
+        return self.meta_lr_start + (self.meta_lr_end - self.meta_lr_start) * t
 
     @property
     def net(self) -> BiIntentGATDRQN:
@@ -500,6 +535,9 @@ class DualGPUReptileTrainer:
         5. 将新 θ_meta 同步回两卡
         """
         theta_meta = self._meta_state   # 当前 θ_meta（CPU tensors）
+        n_gpus     = len(self.devices)
+        tpg        = self.tasks_per_gpu   # 每卡串行任务数
+        n_tasks    = n_gpus * tpg         # 本次 meta-iter 总 task 数
 
         exp_ratio_val = expert_ratio(
             self.meta_iter, self.total_meta_iters,
@@ -507,90 +545,108 @@ class DualGPUReptileTrainer:
             self.expert_ratio_decay_iters,
         )
 
-        # 采样两个不同的地图类型（尽量不同，增加 meta-gradient 多样性）
+        # 采样 n_tasks 个地图类型（相邻偏移保证多样性）
         map_types = [
-            str(self.scheduler.sample(self.meta_iter,     self.total_meta_iters)),
-            str(self.scheduler.sample(self.meta_iter + 1, self.total_meta_iters)),
+            str(self.scheduler.sample(self.meta_iter + i, self.total_meta_iters))
+            for i in range(n_tasks)
         ]
 
+        _seg = self.profiler.segment if self.profiler else lambda _: nullcontext()
+
         # ---- 预采样：主线程顺序采样，消除跨线程 buffer 锁竞争 ----
-        # 每张 GPU 用不同 seed 保证任务多样性；线程只做 GPU compute（CUDA 调用释放 GIL）
-        ref = self.sub_trainers[0]   # 取超参（两个 sub_trainer 超参相同）
-        n_expert_seqs = max(1, max(1, int(ref.batch_size * exp_ratio_val)) // ref.sequence_len)
-        all_pre_batches: List[List[Optional[dict]]] = []
-        for idx in range(len(self.devices)):
-            task_seed = (seed or self.meta_iter * 1000) + idx * 99991
-            rng = np.random.default_rng(task_seed)
-            batches: List[Optional[dict]] = []
-            for _ in range(ref.inner_steps):
-                try:
-                    b = expert_buffer.sample(
-                        batch_size=n_expert_seqs,
-                        sequence_len=ref.sequence_len,
-                        burn_in_len=ref.burn_in_len,
-                        rng=rng,
-                    )
-                    batches.append(b)
-                except (ValueError, IndexError):
-                    batches.append(None)
-            all_pre_batches.append(batches)
+        # 布局：all_pre_batches[gpu_idx][task_offset][inner_step]
+        ref = self.sub_trainers[0]
+        n_expert_seqs = max(1, int(ref.batch_size * exp_ratio_val))
+        all_pre_batches: List[List[List[Optional[dict]]]] = []
+        with _seg("presample"):
+            for gpu_idx in range(n_gpus):
+                gpu_batches: List[List[Optional[dict]]] = []
+                for task_offset in range(tpg):
+                    task_idx  = gpu_idx * tpg + task_offset
+                    task_seed = (seed or self.meta_iter * 1000) + task_idx * 99991
+                    rng       = np.random.default_rng(task_seed)
+                    batches: List[Optional[dict]] = []
+                    for _ in range(ref.inner_steps):
+                        try:
+                            b = expert_buffer.sample(
+                                batch_size=n_expert_seqs,
+                                sequence_len=ref.sequence_len,
+                                burn_in_len=ref.burn_in_len,
+                                rng=rng,
+                            )
+                            batches.append(b)
+                        except (ValueError, IndexError):
+                            batches.append(None)
+                    gpu_batches.append(batches)
+                all_pre_batches.append(gpu_batches)
 
-        # ---- 并行 inner loop（线程仅做 GPU compute）----
-        results: Dict[int, Optional[Dict]] = {0: None, 1: None}
-        errors:  Dict[int, Optional[Exception]] = {0: None, 1: None}
+        # ---- 并行 inner loop（每线程在各自 GPU 上串行跑 tasks_per_gpu 个任务）----
+        results: Dict[int, List[Optional[Dict]]] = {i: [] for i in range(n_gpus)}
+        errors:  Dict[int, Optional[Exception]]  = {i: None for i in range(n_gpus)}
 
-        def _run_task(idx: int):
+        def _run_gpu(gpu_idx: int):
             try:
-                task_seed = (seed or self.meta_iter * 1000) + idx * 99991
-                results[idx] = self.sub_trainers[idx].run_inner_loop(
-                    expert_buffer   = expert_buffer,
-                    selfplay_buffer = selfplay_buffer,
-                    theta_meta_cpu  = theta_meta,
-                    exp_ratio_val   = exp_ratio_val,
-                    buffer_lock     = None,             # 已预采样，无需锁
-                    seed            = task_seed,
-                    pre_batches     = all_pre_batches[idx],
-                )
+                gpu_results: List[Optional[Dict]] = []
+                for task_offset in range(tpg):
+                    task_idx  = gpu_idx * tpg + task_offset
+                    task_seed = (seed or self.meta_iter * 1000) + task_idx * 99991
+                    r = self.sub_trainers[gpu_idx].run_inner_loop(
+                        expert_buffer   = expert_buffer,
+                        selfplay_buffer = selfplay_buffer,
+                        theta_meta_cpu  = theta_meta,
+                        exp_ratio_val   = exp_ratio_val,
+                        buffer_lock     = self._buffer_lock,  # selfplay 采样序列化
+                        seed            = task_seed,
+                        pre_batches     = all_pre_batches[gpu_idx][task_offset],
+                    )
+                    gpu_results.append(r)
+                results[gpu_idx] = gpu_results
             except Exception as exc:
-                errors[idx] = exc
+                errors[gpu_idx] = exc
 
-        threads = [threading.Thread(target=_run_task, args=(i,),
-                                    name=f"inner-gpu{i}")
-                   for i in range(len(self.devices))]
-        for t in threads: t.start()
-        for t in threads: t.join()
+        with _seg("inner_loop_wall"):
+            threads = [threading.Thread(target=_run_gpu, args=(i,), name=f"inner-gpu{i}")
+                       for i in range(n_gpus)]
+            for t in threads: t.start()
+            for t in threads: t.join()
 
-        # 错误处理：任一线程崩溃则上报
         for idx, exc in errors.items():
             if exc is not None:
                 raise RuntimeError(f"GPU {idx} inner loop failed") from exc
 
-        # 过滤掉无法采样 batch 的任务（buffer 太小时）
-        valid = [r for r in results.values() if r is not None]
+        # 展平所有任务结果，过滤采样失败项
+        valid = [r for gpu_res in results.values() for r in gpu_res if r is not None]
         if not valid:
             self.meta_iter += 1
             return {"meta_iter": self.meta_iter, "inner_loss_mean": 0.0,
-                    "map_types": map_types, "expert_ratio": exp_ratio_val, "num_gpus": 0}
+                    "map_types": map_types, "expert_ratio": exp_ratio_val, "num_tasks": 0}
 
-        # ---- Outer update（在 CPU 上完成，节省 GPU 显存）----
-        # θ_new = θ_meta + ε · (1/|B|) · Σ_j (θ_inner_j − θ_meta)
-        new_meta_state: Dict[str, torch.Tensor] = {}
-        with torch.no_grad():
-            for name in theta_meta:
-                deltas = [r["theta_inner"][name] - theta_meta[name]
-                          for r in valid if name in r["theta_inner"]]
-                avg_delta = torch.stack(deltas).mean(dim=0)
-                new_meta_state[name] = theta_meta[name] + self.meta_lr * avg_delta
-
-        self._meta_state = new_meta_state
+        # ---- Outer update（CPU，节省显存；使用线性衰减 meta_lr）----
+        cur_meta_lr = self._current_meta_lr()
+        with _seg("outer_update"):
+            new_meta_state: Dict[str, torch.Tensor] = {}
+            with torch.no_grad():
+                for name in theta_meta:
+                    deltas = [r["theta_inner"][name] - theta_meta[name]
+                              for r in valid if name in r["theta_inner"]]
+                    avg_delta = torch.stack(deltas).mean(dim=0)
+                    new_meta_state[name] = theta_meta[name] + cur_meta_lr * avg_delta
+            self._meta_state = new_meta_state
 
         # 同步新 θ_meta 到所有 sub-trainer（各自 GPU）
-        for trainer in self.sub_trainers:
-            trainer.net.load_state_dict(
-                {k: v.to(trainer.device) for k, v in new_meta_state.items()}
-            )
+        with _seg("sync_meta"):
+            for trainer in self.sub_trainers:
+                trainer.net.load_state_dict(
+                    {k: v.to(trainer.device) for k, v in new_meta_state.items()}
+                )
 
         self.meta_iter += 1
+        if self.profiler and self.meta_iter % self._profile_interval == 0:
+            import pprint
+            print(f"\n[Profiler] meta_iter={self.meta_iter}")
+            pprint.pprint(self.profiler.report())
+            print()
+
         loss_vals = [r["loss_mean"] for r in valid if r["loss_mean"] > 0]
 
         return {
@@ -598,7 +654,8 @@ class DualGPUReptileTrainer:
             "map_types":       map_types,
             "expert_ratio":    exp_ratio_val,
             "inner_loss_mean": float(np.mean(loss_vals)) if loss_vals else 0.0,
-            "num_gpus":        len(valid),
+            "num_tasks":       len(valid),
+            "meta_lr":         cur_meta_lr,
         }
 
     def state_dict(self) -> dict:

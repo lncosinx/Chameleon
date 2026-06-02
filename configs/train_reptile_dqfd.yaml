@@ -4,7 +4,8 @@
 meta_iterations: 20000
 inner_steps: 5
 inner_lr: 0.0003
-meta_lr: 0.05
+meta_lr_start: 0.01        # outer update 学习率：线性衰减起点
+meta_lr_end: 0.001         # outer update 学习率：线性衰减终点
 batch_size: 32
 sequence_len: 32
 burn_in_len: 8         # R2D2 式隐状态重建步数
@@ -47,9 +48,14 @@ map_schedule:
     maze: 0.30
     room: 0.20
 
+# 调试与性能诊断
+debug: true              # true 时启用 Profiler，每 profile_interval 个 meta-iter 打印耗时报告
+profile_interval: 1     # profiler 报告频率（debug=true 时生效）
+
 # 并行（目标硬件 2×RTX 5090 + 47 核 CPU）
 parallel:
-  task_parallel_gpus: [0, 1]   # 双卡 task-并行 Reptile：两卡各跑一个 task 的 inner loop
+  task_parallel_gpus: [0, 1]   # 双卡 task-并行 Reptile
+  tasks_per_gpu: 2             # 每卡串行跑 N 个 inner loop；总 task 数 = len(gpus)*tasks_per_gpu
   num_env_workers: 40          # CPU 多进程 env/观测构建（spawn，不碰 CUDA）
   num_lacam_workers: 4         # C++ 绑定，按需生成/介入
   start_method: spawn

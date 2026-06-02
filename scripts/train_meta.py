@@ -179,12 +179,13 @@ def main():
             # 兼容单/双 GPU 返回的 map_type vs map_types
             mt = metrics.get("map_types", [metrics.get("map_type", "?")])
             mt_str = "+".join(mt) if isinstance(mt, list) else str(mt)
-            ngpu = metrics.get("num_gpus", 1)
+            n_tasks = metrics.get("num_tasks", metrics.get("num_gpus", 1))
+            meta_lr = metrics.get("meta_lr", cfg.get("meta_lr_start", 0.0))
             print(f"  iter {i+1:>6}/{args.meta_iters}: "
                   f"loss={metrics['inner_loss_mean']:.4f}  "
                   f"map={mt_str:<20}  "
                   f"er={metrics['expert_ratio']:.2f}  "
-                  f"gpus={ngpu}")
+                  f"tasks={n_tasks}  meta_lr={meta_lr:.5f}")
 
     # ---- 保存 checkpoint ----
     os.makedirs("checkpoints", exist_ok=True)
