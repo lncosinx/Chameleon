@@ -1,104 +1,34 @@
 """
 LaCAM 数据集构建器。
 
-将 LaCAM 专家轨迹转换为 DQfD 训练样本：
-- 成功样本 → 专家 demo buffer
+将 LaCAM 专家轨迹转换为 DQfD 训练样本（**per-timestep × N-agent** 格式）：
+- 成功样本 → 专家 demo buffer（按 episode 存储，每步含全部 N 体）
 - 失败样本 → hard case 池（不进入专家 margin loss）
 
-每条样本包含：
-    obs, hidden_init, action_expert, reward, next_obs, done,
-    action_mask, map_type, task_id, margin_excluded
+**为何 per-timestep：** 通信模块需要同一时刻多个共存 agent 的观测+坐标才能
+计算邻居注意力并回传梯度。若按单体存储，通信候选集恒空、参数永不更新。
+详见 buffers/expert_demo_buffer.py 顶部说明。
+
+build_dataset_from_rollout 返回一个 episode 的列式数组 dict（形状 (T,N,...)），
+可直接 `ExpertDemoBuffer.add_episode(ep)`。
 """
 from __future__ import annotations
 
 import numpy as np
 from typing import List, Tuple, Dict, Optional
+from collections import defaultdict
 
 from envs.observation_builder import ObservationBuilder
 from envs.action_mask import build_action_mask_batch
 from envs.reward_builder import RewardBuilder
 from lacam.trajectory_converter import (
-    path_to_actions,
     compute_observation_hash,
-    mark_ambiguous_samples,
     compute_wait_ratio,
     get_wait_margin_weight,
+    DELTA_TO_ACTION,
 )
 from lacam.lacam_runner import LaCAMResult
-
-
-def build_dataset_from_lacam(
-    result: LaCAMResult,
-    wrapper,  # PogemaWrapper
-    obs_builder: ObservationBuilder,
-    reward_builder: RewardBuilder,
-    obstacles: np.ndarray,
-    sequence_len: int = 32,
-) -> Tuple[List[dict], List[dict]]:
-    """
-    从一次 LaCAM 求解结果构建训练样本。
-
-    Args:
-        result: LaCAM 求解结果（含 paths）。
-        wrapper: PogemaWrapper（用于获取观测）。
-        obs_builder: ObservationBuilder 实例。
-        reward_builder: RewardBuilder 实例。
-        obstacles: 全局障碍物栅格。
-        sequence_len: 序列长度（影响 hidden_init 存储）。
-
-    Returns:
-        expert_samples: list of sample dicts（成功路径）。
-        hard_cases: list of hard case dicts（失败）。
-    """
-    if not result.success:
-        hard_case = {
-            "map_type": result.map_type,
-            "starts": result.starts,
-            "goals": result.goals,
-            "error": result.error,
-            "runtime": result.runtime,
-        }
-        return [], [hard_case]
-
-    # B2: _build_single_sample 未实现，此入口不可用。
-    # 请使用 build_dataset_from_rollout(wrapper, obs_builder, reward_builder,
-    #     obstacles, result.paths, map_type, task_id) 代替。
-    raise NotImplementedError(
-        "build_dataset_from_lacam() is not fully implemented (B2). "
-        "Use build_dataset_from_rollout() to generate expert samples."
-    )
-
-
-def _build_single_sample(
-    agent_idx: int,
-    step: int,
-    path: List[Tuple[int, int]],
-    actions: List[int],
-    wrapper,
-    obs_builder: ObservationBuilder,
-    reward_builder: RewardBuilder,
-    obstacles: np.ndarray,
-    map_type: str,
-    task_id: str,
-) -> Optional[dict]:
-    """
-    为单个 agent 的单个时间步构建一条训练样本。
-
-    NOTE: 此函数**未完整实现**（B2）。
-    离线重建观测需要在正确时刻 step 环境并调用 obs_builder，
-    无法仅凭路径在单函数内无状态地完成。
-
-    正确的数据生成入口是 `build_dataset_from_rollout`，
-    它通过顺序执行 env.step + obs_builder.build 来重建每步观测。
-
-    `build_dataset_from_lacam` 中对本函数的调用已被保留作为 API 占位，
-    但 `build_dataset_from_lacam` 的返回值将始终为空列表，
-    应使用 `build_dataset_from_rollout` 替代。
-    """
-    raise NotImplementedError(
-        "_build_single_sample is not implemented. "
-        "Use build_dataset_from_rollout() instead."
-    )
+from buffers.expert_demo_buffer import FINISHED_AGENT_SENTINEL
 
 
 def build_dataset_from_rollout(
@@ -110,147 +40,180 @@ def build_dataset_from_rollout(
     map_type: str,
     task_id: str,
     sequence_len: int = 32,
-) -> List[dict]:
+) -> Optional[Dict[str, np.ndarray]]:
     """
-    通过实际 rollout 重放专家路径来构建训练样本。
+    通过实际 rollout 重放专家路径，构建一个 episode 的 per-timestep 训练数据。
 
-    对每个时间步：
-    1. 获取当前局部观测（通过 obs_builder）
-    2. 从 expert_paths 中读取该步的专家动作
-    3. 执行专家动作，获取 next_obs / reward / done
-    4. 构建 action_mask
-    5. 记录样本
+    对每个时间步 t：
+      1. 在 step 前获取全部 N 体的局部观测（obs_builder，s_t）
+      2. 从 expert_paths 读取每体该步专家动作
+      3. 执行专家动作，得到 s_{t+1}、reward、done
+      4. 记录 (T, N, ...) 列式数组
 
-    这是主要的样本生成路径（generate_lacam_data.py 使用）。
+    返回（可直接喂 ExpertDemoBuffer.add_episode）：
+        dict，键见下方 `ep`；若无有效步则返回 None。
+        - positions: 已对 finished agent 置远哨兵（通信距离过滤自然排除）
+        - valid:     finished agent 置 False（loss 中按 0 权重屏蔽）
     """
     N = wrapper.num_agents
     max_steps = min(max(len(p) for p in expert_paths) - 1, wrapper.max_episode_steps)
+    if max_steps <= 0:
+        return None
 
     obs_builder.reset()
     # 必须用与调用方相同的 seed 重置，保证地图与 LaCAM 解算时一致。
-    # 不传 seed 会生成新随机地图，导致 agent 在错误地图上执行原路径（到不了目标）。
     obs_list, _ = wrapper.reset(seed=wrapper._seed)
 
     prev_actions = np.zeros(N, dtype=np.int64)
-    prev_dones = [False] * N
-    prev_agents = wrapper.get_agents_xy()
     prev_goals = wrapper.get_targets_xy()
 
-    # 提取专家动作
-    expert_actions_per_step = []
+    # 预提取每步专家动作 (T, N)
+    expert_actions_per_step = np.zeros((max_steps, N), dtype=np.int64)
     for t in range(max_steps):
-        step_actions = []
         for i in range(N):
             if t < len(expert_paths[i]) - 1:
                 dr = expert_paths[i][t + 1][0] - expert_paths[i][t][0]
                 dc = expert_paths[i][t + 1][1] - expert_paths[i][t][1]
-                from lacam.trajectory_converter import DELTA_TO_ACTION
-                step_actions.append(DELTA_TO_ACTION.get((dr, dc), 0))
+                expert_actions_per_step[t, i] = DELTA_TO_ACTION.get((dr, dc), 0)
             else:
-                step_actions.append(0)  # wait at goal
-        expert_actions_per_step.append(step_actions)
+                expert_actions_per_step[t, i] = 0  # wait at goal
 
-    samples = []
+    K = obs_builder.K
+
+    # per-step 存储（长度 max_steps；next_* 通过移位获得）
+    S_patch  = np.zeros((max_steps, N, 4, K, K), dtype=np.float32)
+    S_scalar = np.zeros((max_steps, N, 8),        dtype=np.float32)
+    S_pos    = np.full((max_steps, N, 2), FINISHED_AGENT_SENTINEL, dtype=np.float32)
+    S_action = np.zeros((max_steps, N),           dtype=np.int64)
+    S_reward = np.zeros((max_steps, N),           dtype=np.float32)
+    S_done   = np.zeros((max_steps, N),           dtype=bool)
+    S_valid  = np.zeros((max_steps, N),           dtype=bool)
+    S_mask   = np.ones((max_steps, N, 5),         dtype=bool)
+    S_hash   = np.zeros((max_steps, N),           dtype=np.int64)
+
     # ever_done：累计完成掩码，单调递增（一旦 True 永远 True）。
-    # 防止 Pogema finish 模式下 terminated 在到达步后重置为 False，
-    # 导致已完成 agent 被再次采样。
     ever_done = [False] * N
 
     for t in range(max_steps):
-        # 在本步开始时保存累计完成状态，用于决定是否跳过采样
         prev_ever_done = list(ever_done)
 
         # ---- 观测（step 前的状态 s_t）----
         agents_xy = wrapper.get_agents_xy()
         patches, scalars = _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder)
+        S_patch[t]  = patches
+        S_scalar[t] = scalars
 
-        # ---- 动作掩码（step 前）----
+        # ---- 动作掩码（step 前；wait 恒合法，保证 mellowmax 有限）----
         agents_arr = np.array(agents_xy, dtype=np.int32)[np.newaxis]
         mask = build_action_mask_batch(agents_arr, obstacles)[0]  # (N, 5) bool
+        S_mask[t] = mask
+
+        # ---- 坐标（finished agent 置远哨兵，使通信不选其为邻居）----
+        pos = np.array(agents_xy, dtype=np.float32)  # (N, 2)
         for i in range(N):
             if prev_ever_done[i]:
-                mask[i] = False  # 已完成体全置非法，推理时 Q 值全 -inf
+                pos[i] = FINISHED_AGENT_SENTINEL
+        S_pos[t] = pos
+
+        # ---- valid：step 前未完成的 agent 参与 loss ----
+        for i in range(N):
+            S_valid[t, i] = not prev_ever_done[i]
 
         expert_actions = expert_actions_per_step[t]
+        S_action[t] = expert_actions
+
+        # ---- obs hash（用于歧义检测；仅对 valid 体有意义）----
+        for i in range(N):
+            if not prev_ever_done[i]:
+                S_hash[t, i] = compute_observation_hash(patches[i], scalars[i])
 
         # ---- 执行专家动作，获得 s_{t+1} ----
-        obs_list, _, dones, _ = wrapper.step(expert_actions)
+        obs_list, _, dones, _ = wrapper.step(expert_actions.tolist())
 
-        # ---- 在 step 之后计算奖励（正确的 RL 时序：R(s_t, a_t, s_{t+1})）----
-        # 奖励在 step 之后计算，curr_pos = s_{t+1}，才能正确捕获到达稀疏奖励（+1.0）。
+        # ---- step 之后计算奖励（正确时序 R(s_t, a_t, s_{t+1})）----
         agents_xy_next = wrapper.get_agents_xy()
         targets_xy_next = wrapper.get_targets_xy()
         rewards, _ = reward_builder.compute(
             obstacles=obstacles,
-            prev_agents_xy=agents_xy,           # s_t（step 前）
-            agents_xy=agents_xy_next,           # s_{t+1}（step 后）
+            prev_agents_xy=agents_xy,
+            agents_xy=agents_xy_next,
             targets_xy=targets_xy_next,
-            prev_targets_xy=wrapper.get_targets_xy() if t == 0 else prev_goals,
+            prev_targets_xy=prev_goals if t > 0 else wrapper.get_targets_xy(),
             prev_actions=prev_actions,
             prev_dones=prev_ever_done,
         )
+        S_reward[t] = np.asarray(rewards, dtype=np.float32)
 
         # ---- 更新累计完成状态 ----
         step_dones = dones if isinstance(dones, list) else [bool(dones)] * N
         for i in range(N):
             if step_dones[i]:
                 ever_done[i] = True
+        S_done[t] = np.array(ever_done, dtype=bool)
 
-        # ---- 收集样本（仅限本步之前未完成的 agent）----
+        prev_actions = expert_actions.copy()
+        prev_goals = targets_xy_next
+
+    # 整段无任何 valid 步（极端：所有 agent 起点即终点）→ 丢弃
+    if not S_valid.any():
+        return None
+
+    # ---- 构造 next_* （移位一帧；末帧填零/哨兵）----
+    next_patch  = np.zeros_like(S_patch)
+    next_scalar = np.zeros_like(S_scalar)
+    next_pos    = np.full_like(S_pos, FINISHED_AGENT_SENTINEL)
+    next_mask   = np.ones_like(S_mask)
+    if max_steps > 1:
+        next_patch[:-1]  = S_patch[1:]
+        next_scalar[:-1] = S_scalar[1:]
+        next_pos[:-1]    = S_pos[1:]
+        next_mask[:-1]   = S_mask[1:]
+    # 末帧 next 保持零/哨兵/全合法（done 处 TD bootstrap 已被 done 掩码归零）
+
+    # ---- margin_excluded：同一 obs_hash 下专家动作不唯一 → 剔除（INVARIANT 11）----
+    margin_excluded = np.zeros((max_steps, N), dtype=bool)
+    hash_to_actions: Dict[int, set] = defaultdict(set)
+    for t in range(max_steps):
         for i in range(N):
-            if prev_ever_done[i]:
-                continue
+            if S_valid[t, i]:
+                hash_to_actions[int(S_hash[t, i])].add(int(S_action[t, i]))
+    for t in range(max_steps):
+        for i in range(N):
+            if S_valid[t, i] and len(hash_to_actions[int(S_hash[t, i])]) > 1:
+                margin_excluded[t, i] = True
 
-            obs_hash = compute_observation_hash(patches[i], scalars[i])
-            sample = {
-                "obs_patch":       patches[i].copy(),
-                "obs_scalar":      scalars[i].copy(),
-                "obs_hash":        obs_hash,
-                "_agent_idx":      i,
-                "hidden_init":     None,
-                "action_expert":   expert_actions[i],
-                "reward":          rewards[i],
-                "next_obs_patch":  None,
-                "next_obs_scalar": None,
-                "done":            ever_done[i],
-                "action_mask":     mask[i].copy(),
-                "map_type":        map_type,
-                "task_id":         task_id,
-                "margin_excluded": False,
-                "margin_weight":   0.5 if expert_actions[i] == 0 else 1.0,
-            }
-            samples.append(sample)
-
-        prev_actions = np.array(expert_actions, dtype=np.int64)
-        prev_agents  = agents_xy_next
-        prev_goals   = targets_xy_next
-
-    # 填充 next_obs / next_action_mask：
-    # 样本按 [a0t0, a1t0, …, aN-1t0, a0t1, …] 交错存储，
-    # 必须按 agent 索引（_agent_idx）分组，避免跨体赋值错误（B3 修复）。
+    # ---- margin_weights：每体按 wait 比例降权（INVARIANT 11 §3.3.6）----
+    margin_weights = np.ones((max_steps, N), dtype=np.float32)
     for i in range(N):
-        agent_indices = [idx for idx, s in enumerate(samples) if s.get("_agent_idx") == i]
-        for k in range(len(agent_indices) - 1):
-            cur = agent_indices[k]
-            nxt = agent_indices[k + 1]
-            samples[cur]["next_obs_patch"]    = samples[nxt]["obs_patch"]
-            samples[cur]["next_obs_scalar"]   = samples[nxt]["obs_scalar"]
-            samples[cur]["next_action_mask"]  = samples[nxt]["action_mask"]  # I2 修复
-        # terminal step：next_obs 填零（done=True 时 TD target = reward，next_obs 乘以 0 不影响结果）
-        if agent_indices:
-            last = agent_indices[-1]
-            samples[last]["next_obs_patch"]  = np.zeros_like(samples[last]["obs_patch"])
-            samples[last]["next_obs_scalar"] = np.zeros_like(samples[last]["obs_scalar"])
-            samples[last]["next_action_mask"] = np.ones(5, dtype=bool)
+        valid_mask_i = S_valid[:, i]
+        if not valid_mask_i.any():
+            continue
+        agent_actions = S_action[valid_mask_i, i].tolist()
+        wait_ratio = compute_wait_ratio(agent_actions)
+        weight = get_wait_margin_weight(wait_ratio)
+        # 仅对 wait 动作降权，move 动作保持 1.0
+        wait_steps = (S_action[:, i] == 0)
+        margin_weights[wait_steps, i] = weight
 
-    # 清理辅助字段
-    for s in samples:
-        s.pop("_agent_idx", None)
-
-    # 可解释性过滤
-    samples = mark_ambiguous_samples(samples)
-
-    return samples
+    ep = {
+        "obs_patches":       S_patch,
+        "obs_scalars":       S_scalar,
+        "positions":         S_pos,
+        "next_obs_patches":  next_patch,
+        "next_obs_scalars":  next_scalar,
+        "next_positions":    next_pos,
+        "actions_expert":    S_action,
+        "rewards":           S_reward,
+        "dones":             S_done,
+        "valid":             S_valid,
+        "action_masks":      S_mask,
+        "next_action_masks": next_mask,
+        "margin_excluded":   margin_excluded,
+        "margin_weights":    margin_weights,
+        "map_type":          map_type,
+        "task_id":           task_id,
+    }
+    return ep
 
 
 def _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder):

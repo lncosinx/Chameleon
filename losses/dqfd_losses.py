@@ -96,6 +96,8 @@ def dqfd_total_loss(
     # margin
     margin_excluded: torch.Tensor = None,  # (B, N) bool
     margin_weights: torch.Tensor = None,   # (B, N) float
+    # validity / sample weighting (finished agents → 0，不计入 TD)
+    sample_weights: torch.Tensor = None,   # (B*N,) 或与 q_values 前缀对齐的 0/1 权重
     # hyperparameters
     gamma: float = 0.99,
     n_step: int = 5,
@@ -118,7 +120,8 @@ def dqfd_total_loss(
 
     # ---- 1-step TD ----
     v_target = masked_mellowmax(target_q_next, action_masks_next, alpha=mellowmax_alpha)
-    loss_td = one_step_td_loss(q_values, actions, rewards, dones, v_target, gamma)
+    loss_td = one_step_td_loss(q_values, actions, rewards, dones, v_target, gamma,
+                               weights=sample_weights)
     info["loss_td"] = loss_td.item()
 
     # ---- n-step TD ----

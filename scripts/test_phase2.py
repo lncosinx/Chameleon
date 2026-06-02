@@ -106,42 +106,53 @@ def test_margin_exclusion():
     print(f"  Unique obs 43: margin_excluded=False ✓")
 
 
+def _make_synthetic_episode(T: int, N: int, K: int = 11, ep_seed: int = 0) -> dict:
+    """构造一个 per-timestep × N-agent 的合成 episode（用于 buffer 测试）。"""
+    rng = np.random.default_rng(ep_seed)
+    return {
+        "obs_patches":       rng.random((T, N, 4, K, K), dtype=np.float32),
+        "next_obs_patches":  rng.random((T, N, 4, K, K), dtype=np.float32),
+        "obs_scalars":       rng.random((T, N, 8), dtype=np.float32),
+        "next_obs_scalars":  rng.random((T, N, 8), dtype=np.float32),
+        "positions":         rng.integers(0, 16, (T, N, 2)).astype(np.float32),
+        "next_positions":    rng.integers(0, 16, (T, N, 2)).astype(np.float32),
+        "actions_expert":    rng.integers(0, 5, (T, N)).astype(np.int64),
+        "rewards":           rng.random((T, N), dtype=np.float32),
+        "dones":             np.zeros((T, N), dtype=bool),
+        "valid":             np.ones((T, N), dtype=bool),
+        "action_masks":      np.ones((T, N, 5), dtype=bool),
+        "next_action_masks": np.ones((T, N, 5), dtype=bool),
+        "margin_excluded":   np.zeros((T, N), dtype=bool),
+        "margin_weights":    np.ones((T, N), dtype=np.float32),
+    }
+
+
 def test_expert_buffer():
-    """T2.3: 专家 buffer 采样。"""
+    """T2.3: 专家 buffer 采样（per-timestep × N-agent）。"""
     print("\n--- T2.3: Expert buffer ---")
 
-    K = 11
+    K, N = 11, 3
     buf = ExpertDemoBuffer(capacity=1000)
 
-    # 构造足够的样本
-    for i in range(200):
-        sample = {
-            "obs_patch": np.random.randn(4, K, K).astype(np.float32),
-            "obs_scalar": np.random.randn(8).astype(np.float32),
-            "action_expert": i % 5,
-            "reward": float(i % 3),
-            "next_obs_patch": np.random.randn(4, K, K).astype(np.float32),
-            "next_obs_scalar": np.random.randn(8).astype(np.float32),
-            "done": i % 10 == 0,
-            "action_mask": np.ones(5, dtype=bool),
-            "margin_excluded": i % 20 == 0,
-            "margin_weight": 0.5 if i % 5 == 0 else 1.0,
-        }
-        buf.add(sample)
+    # 加入 5 个 episode，每个 50 步
+    for e in range(5):
+        buf.add_episode(_make_synthetic_episode(T=50, N=N, K=K, ep_seed=e))
 
-    assert len(buf) == 200
-    print(f"  Buffer size: {len(buf)} ✓")
+    assert len(buf) == 250, f"expected 250 timesteps, got {len(buf)}"
+    print(f"  Buffer size: {len(buf)} timesteps, {buf.num_episodes} episodes ✓")
 
-    # 采样
+    # 采样：返回 (B, T, N, ...) 含通信所需 positions
     batch = buf.sample(batch_size=4, sequence_len=32, burn_in_len=8)
-    assert batch["obs_patches"].shape == (4, 32, 4, K, K)
-    assert batch["obs_scalars"].shape == (4, 32, 8)
-    assert batch["actions_expert"].shape == (4, 32)
-    assert batch["rewards"].shape == (4, 32)
+    assert batch["obs_patches"].shape == (4, 32, N, 4, K, K)
+    assert batch["obs_scalars"].shape == (4, 32, N, 8)
+    assert batch["positions"].shape == (4, 32, N, 2)
+    assert batch["actions_expert"].shape == (4, 32, N)
+    assert batch["valid"].shape == (4, 32, N)
     print(f"  Batch shapes: patches={batch['obs_patches'].shape}, "
-          f"scalars={batch['obs_scalars'].shape}, "
-          f"actions={batch['actions_expert'].shape} ✓")
+          f"positions={batch['positions'].shape}, "
+          f"valid={batch['valid'].shape} ✓")
 
+    # 序列段不跨 episode：每条序列的所有步应来自同一 episode（合成数据 50≥32 必成立）
     stats = buf.get_stats()
     print(f"  Buffer stats: {stats} ✓")
 
@@ -193,7 +204,7 @@ def test_end_to_end():
     assert result.success, "LaCAM should succeed on simple 2-agent random map"
 
     wrapper.reset(seed=42)
-    samples = build_dataset_from_rollout(
+    ep = build_dataset_from_rollout(
         wrapper=wrapper,
         obs_builder=obs_builder,
         reward_builder=reward_builder,
@@ -203,28 +214,38 @@ def test_end_to_end():
         task_id="e2e_test",
     )
 
-    assert len(samples) > 0, "Should have samples"
-    print(f"  Generated {len(samples)} samples")
+    assert ep is not None, "Should produce an episode dict"
+    T = ep["actions_expert"].shape[0]
+    N = ep["actions_expert"].shape[1]
+    assert N == 2, f"expected N=2 agents, got {N}"
+    print(f"  Generated episode: T={T} timesteps × N={N} agents")
 
-    buf = ExpertDemoBuffer(capacity=len(samples) + 1)
-    buf.add_batch(samples)
+    # 验证 episode 含必需字段且形状一致
+    required_fields = ["obs_patches", "obs_scalars", "positions", "next_positions",
+                       "actions_expert", "rewards", "dones", "valid",
+                       "action_masks", "next_action_masks", "margin_excluded",
+                       "margin_weights"]
+    for f in required_fields:
+        assert f in ep, f"Episode missing field '{f}'"
+        assert ep[f].shape[:2] == (T, N), f"{f} shape {ep[f].shape} != (T,N,...)"
+    print(f"  All episode fields present with (T,N,...) shape ✓")
 
-    # 如果有足够样本，采样
-    if len(buf) >= 32:
+    # positions 对 finished agent 应置远哨兵（保证通信距离过滤）
+    from buffers.expert_demo_buffer import FINISHED_AGENT_SENTINEL
+    finished = ~ep["valid"]
+    if finished.any():
+        assert np.allclose(ep["positions"][finished], FINISHED_AGENT_SENTINEL), \
+            "finished agents must have sentinel positions"
+        print(f"  Finished agents parked at sentinel ✓")
+
+    buf = ExpertDemoBuffer(capacity=T + 1)
+    buf.add_episode(ep)
+    if len(buf) >= 16:
         batch = buf.sample(batch_size=2, sequence_len=16)
-        assert batch["obs_patches"].shape[1] == 16
-        print(f"  Buffer sample: batch_size=2, seq_len=16 ✓")
+        assert batch["obs_patches"].shape == (2, 16, N, 4, 11, 11)
+        print(f"  Buffer sample: {batch['obs_patches'].shape} ✓")
 
-    # 验证所有样本有必需的字段
-    required_fields = ["obs_patch", "obs_scalar", "action_expert",
-                       "reward", "action_mask", "margin_excluded"]
-    for s in samples:
-        for f in required_fields:
-            assert f in s, f"Sample missing field '{f}'"
-    print(f"  All samples have required fields ✓")
-
-    # 验证 mask 为 bool
-    assert samples[0]["action_mask"].dtype == bool
+    assert ep["action_masks"].dtype == bool
     print(f"  Action mask dtype = bool ✓")
 
 

@@ -3,7 +3,8 @@
 # 需经 pogema-toolbox MazeGenerator.generate_maze 生成
 map_type: maze
 map_size: 64           # 目标 64×64
-num_agents: 8          # 开发默认；目标 64（maze 密集度高，建议比 random 少）；命令行覆盖
+num_agents: 8          # 开发默认；目标 96。⚠️ 四个地图族必须用相同 num_agents 生成
+                       # （专家 buffer 要求 N 一致，add_episode 拒绝混入不同 N）；命令行 --num-agents 覆盖
 obs_radius: 5
 max_episode_steps: 512 # 设计文档 §0 目标值；maze 路径长，不能低于 256
 

@@ -7,24 +7,31 @@ burn_in_len: 8              # R2D2 burn-in 步数（INVARIANT 13，与阶段二�
 gamma: 0.99                 # 折扣因子
 mellowmax_alpha: 1.0        # mellowmax 温度（INVARIANT 12；调参 {0.5,1,2}，勿用 0.1）
 margin: 0.5                 # 专家大间隔 m（与 train_reptile_dqfd.yaml 保持一致）
+lr: 3.0e-5                  # Adam 学习率（微调用小 lr；原硬编码，现进 config）
+grad_clip: 10.0             # 梯度范数裁剪
+target_sync_interval: 100   # 每 N 个 segment 同步一次 target（标准 DQN，INVARIANT 8）
 
 # --- on-policy 约束 ---
-max_policy_version_lag: 1   # 同步段内权重冻结，lag > 1 的样本丢弃（INVARIANT 9）
-sync_after_each_segment: true
-reuse_epochs_per_segment: 1 # 近 on-policy：每段数据基本只用 1 次
+max_policy_version_lag: 1   # 丢弃 train_step − sample_version > 1 的 segment（INVARIANT 9）
+reuse_epochs_per_segment: 1 # 近 on-policy：每段做几次梯度更新（默认 1）
+buffer_capacity_segments: 128  # recent buffer 最多保留的 segment 数
 
 # --- LaCAM 实时专家介入退火（§3.7）---
+# ★ 单位为「训练 segment 数」（train_step 每段 +1），不是优化步！
+#   取值应 ≈ --num-segments 的 ~80%，退火才能在训练过程中真正走完。
+#   旧值 200000 会让退火几乎不发生（num-segments ≤ 5000 时 progress < 0.025）。
 expert_prob_start: 0.5      # 初始介入概率
 expert_prob_end: 0.02       # 末期介入概率（接近纯自主 RL）
-expert_decay_steps: 200000  # 衰减步数
+expert_decay_steps: 4000    # 退火 segment 数（配 --num-segments 5000）
 
 # --- 损失权重退火（§3.8）---
+# 与 expert_decay_steps 共用同一进度（train_step / expert_decay_steps）
 lambda_margin_start: 1.0    # 初期 margin loss 权重
 lambda_margin_end: 0.0      # 末期归零，退化为纯近 on-policy Q 学习
 
 # --- 硬件分工（阶段三无 task 并行，见设计文档 §4.5）---
-# 以下参数为占位符，待多进程 env-worker（T5.2）实现后生效
-num_parallel_envs: 64
-learner_gpu: 0               # GPU0 = learner（训练）
-actor_gpu: 1                 # GPU1 = batched 推理 actor
-num_env_workers: 40          # 并行 env（同步段采样，lag≤1）
+# ⚠️ 以下为占位符，多进程 env-worker（T5.2）尚未实现，当前代码不读取这些键。
+num_parallel_envs: 64        # [未实现] 并行 env 数
+learner_gpu: 0               # [未实现] GPU0 = learner（训练）
+actor_gpu: 1                 # [未实现] GPU1 = batched 推理 actor
+num_env_workers: 40          # [未实现] 并行 env（同步段采样，lag≤1）

@@ -50,37 +50,37 @@ python scripts/env_check.py
 ```bash
 python scripts/generate_lacam_data.py \
     --config configs/env_random.yaml \
-    --num-episodes 500 \
+    --num-episodes 3000 \
     --num-agents 96 \
     --map-size 64 \
-    --backend prioritized \
+    --backend lacam \
     --output-dir data \
     --num-workers -1
 
 python scripts/generate_lacam_data.py \
     --config configs/env_warehouse.yaml \
-    --num-episodes 500 \
+    --num-episodes 3000 \
     --num-agents 96 \
     --map-size 64 \
-    --backend prioritized \
+    --backend lacam \
     --output-dir data \
     --num-workers -1
 
 python scripts/generate_lacam_data.py \
     --config configs/env_maze.yaml \
-    --num-episodes 500 \
+    --num-episodes 3000 \
     --num-agents 96 \
     --map-size 64 \
-    --backend prioritized \
+    --backend lacam \
     --output-dir data \
     --num-workers -1
 
 python scripts/generate_lacam_data.py \
     --config configs/env_room.yaml \
-    --num-episodes 500 \
+    --num-episodes 3000 \
     --num-agents 96 \
     --map-size 64 \
-    --backend prioritized \
+    --backend lacam \
     --output-dir data \
     --num-workers -1
 ```
@@ -93,16 +93,18 @@ data/expert_maze.npz
 data/expert_room.npz
 ```
 
-> **回合数说明（为什么是 500 而不是更多）**
->
-> 目标规模（96 agents，64×64）下每个 episode 约产生 19,000 个单体样本。
-> 500 × 0.65（成功率） × 19,000 ≈ **620 万**有效样本/地图族，buffer 设为 200 万上限后保留最多样的 200 万条。
-> 阶段二训练共消耗约 7200 万专家样本（20000 iters × 5 steps × batch × 0.7 ratio），依赖 replay buffer 对同一样本重用约 10 次，这是 off-policy 方法的标准设计。
-> - 500 episode 足够满足数据多样性要求，超过 1000 收益递减。
-> - `--backend prioritized`（非真 LaCAM）在大地图/多 agent 上成功率约 60–70%，不建议依赖更多 episode 来弥补质量问题；应尽快切换到 `--backend lacam`（需构建 C++ 绑定）。
+> **专家后端（重要）**
+> - **默认 `--backend lacam`（真 LaCAM，C++ 绑定 `lacam/_lacam.so` 已构建）**，也可用 `--backend auto`（有绑定则用 LaCAM，否则回退）。
+> - **不要用 `--backend prioritized` 产正式数据**：纯 Python fallback 实测 **SoC 约翻倍、专家轨迹带碰撞**（同实例对比：prioritized SoC=1128/碰撞=6，LaCAM SoC=615/碰撞=0，且 LaCAM 快约 180×）。模仿带碰撞的专家会给学生封一个低上限。
+> - 生成完看 `data/lacam_stats_<map>.yaml` 的 `quality:` 段确认质量：`vertex_collision_rate_mean` 应 ≈0，`wait_ratio_mean` 不宜过高。
+
+> **数据量与多样性**
+> - 存储为 **per-timestep × N 体**：每 episode 的"样本数"= makespan 时间步（每步含 N 体）。`total_samples` 现在统计时间步，非单体样本。
+> - 阶段二是 off-policy replay，对同一数据有复用；**meta_iterations=20000 配 500 episode/族 复用率偏高（数百×）**，有过拟合风险。建议任选其一：把每族 episode 提到 2000–5000（生成很便宜），或下调 meta_iterations。生成更多更优先（多样性收益大）。
+> - 四个地图族**必须用相同 `--num-agents` 生成**（专家 buffer 要求 N 一致）。
 
 > **其他说明**
-> - 阶段二 `train_meta.py` 会自动从 `--data-dir` 加载这四个 npz 文件；若文件不存在则退为小规模在线生成（仅供调试）。
+> - 阶段二 `train_meta.py` 从 `--data-dir` 加载这四个 npz；**缺文件会直接报错**（不再内联生成），需先跑本阶段。旧版 per-agent 格式的 npz 也会被拒绝并提示重新生成。
 > - 小规模调试可使用 `--num-agents 8 --map-size 16 --num-episodes 50`（几分钟完成）。
 
 ---

@@ -20,42 +20,12 @@ from utils.checkpoint import save_checkpoint
 from scripts.generate_lacam_data import generate_data, load_buffer_from_disk
 
 
-def _copy_columnar_buffer(src: ExpertDemoBuffer, dst: ExpertDemoBuffer, n: int):
-    """将 src 的前 n 条数据批量写入 dst（列式 buffer 直接数组拷贝）。"""
-    if n == 0 or not src._arrays_inited:
-        return
-    if not dst._arrays_inited:
-        dst._init_arrays(src.obs_channels, src.patch_size)
-    n = min(n, src._size, dst.capacity)
-    head = dst._head
-    cap = dst.capacity
-    if head + n <= cap:
-        dst._obs_patches[head:head+n]       = src._obs_patches[:n]
-        dst._next_obs_patches[head:head+n]  = src._next_obs_patches[:n]
-        dst._obs_scalars[head:head+n]       = src._obs_scalars[:n]
-        dst._next_obs_scalars[head:head+n]  = src._next_obs_scalars[:n]
-        dst._actions_expert[head:head+n]    = src._actions_expert[:n]
-        dst._rewards[head:head+n]           = src._rewards[:n]
-        dst._dones[head:head+n]             = src._dones[:n]
-        dst._action_masks[head:head+n]      = src._action_masks[:n]
-        dst._next_action_masks[head:head+n] = src._next_action_masks[:n]
-        dst._margin_excluded[head:head+n]   = src._margin_excluded[:n]
-        dst._margin_weights[head:head+n]    = src._margin_weights[:n]
-    else:
-        first = cap - head
-        second = n - first
-        for sa, da in [
-            ("_obs_patches", "_obs_patches"), ("_next_obs_patches", "_next_obs_patches"),
-            ("_obs_scalars", "_obs_scalars"), ("_next_obs_scalars", "_next_obs_scalars"),
-            ("_actions_expert", "_actions_expert"), ("_rewards", "_rewards"),
-            ("_dones", "_dones"), ("_action_masks", "_action_masks"),
-            ("_next_action_masks", "_next_action_masks"),
-            ("_margin_excluded", "_margin_excluded"), ("_margin_weights", "_margin_weights"),
-        ]:
-            getattr(dst, da)[head:cap]   = getattr(src, sa)[:first]
-            getattr(dst, da)[0:second]   = getattr(src, sa)[first:n]
-    dst._head = (head + n) % cap
-    dst._size = min(dst._size + n, cap)
+def _peek_npz_timesteps(npz_path: str) -> int:
+    """读取 npz 的 episode_ids 长度（时间步数），用于精确分配 buffer 容量。"""
+    data = np.load(npz_path, allow_pickle=False)
+    if "episode_ids" not in data.files:
+        return -1   # 旧格式标记
+    return int(len(data["episode_ids"]))
 
 
 def _build_network(net_cfg: dict) -> BiIntentGATDRQN:
@@ -121,40 +91,47 @@ def main():
 
     print(f"Device: {device_str}")
 
-    # ---- 加载专家数据 ----
-    # 每种地图族各取 1M 条（共 4M），保证四种地图平衡分布。
-    # 使用新的列式 buffer 直接写入，不再经过 per-map 中间 buffer。
+    # ---- 加载专家数据（per-timestep × N-agent 格式）----
+    # 单一混合 buffer，四种地图随机混采。容量按时间步计，先 peek 各 npz 长度精确分配。
+    # 注意：所有地图必须用相同 num_agents 生成（buffer 要求 N 一致）。
+    from scripts.generate_lacam_data import load_buffer_from_disk
     map_types = ["random", "warehouse", "maze", "room"]
-    total_cap = cfg.get("expert_buffer_capacity", 4_000_000)
-    per_map_cap = total_cap // len(map_types)   # 每种地图各 1M
-    expert_buf = ExpertDemoBuffer(capacity=total_cap)
 
     print(f"\nLoading expert data from '{args.data_dir}' ...")
+    present = []
+    total_steps = 0
     for map_type in map_types:
         npz = os.path.join(args.data_dir, f"expert_{map_type}.npz")
-        if os.path.exists(npz):
-            # 直接批量加载到 expert_buf，限制每种地图最多 per_map_cap 条
-            tmp = ExpertDemoBuffer(capacity=per_map_cap)
-            from scripts.generate_lacam_data import load_buffer_from_disk
-            load_buffer_from_disk(npz, tmp)
-            # 将 tmp 的列式数据批量拷贝到 expert_buf
-            n = len(tmp)
-            if n > 0:
-                _copy_columnar_buffer(tmp, expert_buf, n)
-        else:
-            print(f"  [fallback] {npz} not found, generating inline ...")
-            import yaml as _yaml
-            cfg_env = f"configs/env_{map_type}.yaml"
-            gen_buf, _, _ = generate_data(
-                config_path=cfg_env,
-                num_episodes=20, num_agents=4, map_size=16,
-                output_dir=args.data_dir, save_to_disk=False,
+        if not os.path.exists(npz):
+            print(f"  [skip] {npz} not found — train on remaining maps. "
+                  f"Generate it with: python scripts/generate_lacam_data.py "
+                  f"--config configs/env_{map_type}.yaml --num-workers 47")
+            continue
+        n = _peek_npz_timesteps(npz)
+        if n < 0:
+            raise ValueError(
+                f"{npz} is OLD per-agent format (no positions/episode_ids). "
+                f"Communication-aware training requires regenerated data. "
+                f"Run: python scripts/generate_lacam_data.py "
+                f"--config configs/env_{map_type}.yaml --num-workers 47"
             )
-            n = len(gen_buf)
-            if n > 0:
-                _copy_columnar_buffer(gen_buf, expert_buf, n)
+        present.append(npz)
+        total_steps += n
 
-    print(f"Expert buffer: {len(expert_buf):,} samples")
+    if not present:
+        raise FileNotFoundError(
+            f"No expert data found in '{args.data_dir}'. Generate it first "
+            f"(see scripts/generate_lacam_data.py)."
+        )
+
+    # 容量上限（时间步），可由 config 收紧以控显存/内存；默认装下全部
+    cap = min(total_steps, cfg.get("expert_buffer_capacity_steps", total_steps))
+    expert_buf = ExpertDemoBuffer(capacity=max(cap, 1))
+    for npz in present:
+        load_buffer_from_disk(npz, expert_buf)
+
+    print(f"Expert buffer: {len(expert_buf):,} timesteps × {expert_buf.num_agents} agents "
+          f"({expert_buf.num_episodes} episodes)")
 
     sp_buf = SelfPlayBuffer(capacity=500_000)
 

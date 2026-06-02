@@ -22,9 +22,151 @@ from copy import deepcopy
 from models.biintent_drqn import BiIntentGATDRQN
 from losses.dqfd_losses import dqfd_total_loss
 from losses.q_target import masked_mellowmax
+from losses.td_losses import n_step_td_loss
 from trainers.scheduler import MapScheduler, expert_ratio
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.profiler import Profiler
+
+
+def dqfd_sequence_loss(
+    net: "BiIntentGATDRQN",
+    target_net: "BiIntentGATDRQN",
+    *,
+    obs_patches: torch.Tensor,        # (B, T, N, 4, K, K)
+    obs_scalars: torch.Tensor,        # (B, T, N, 8)
+    positions: torch.Tensor,          # (B, T, N, 2)  真实坐标（finished→远哨兵）
+    next_obs_patches: torch.Tensor,
+    next_obs_scalars: torch.Tensor,
+    next_positions: torch.Tensor,
+    actions: torch.Tensor,            # (B, T, N) long
+    rewards: torch.Tensor,            # (B, T, N)
+    dones: torch.Tensor,              # (B, T, N) bool
+    valid: torch.Tensor,              # (B, T, N) bool —— finished agent=False，零权屏蔽
+    action_masks: torch.Tensor,       # (B, T, N, 5) bool —— s_t 掩码
+    next_action_masks: torch.Tensor,  # (B, T, N, 5) bool —— s_{t+1} 掩码
+    margin_excluded: torch.Tensor = None,  # (B, T, N) bool
+    margin_weights: torch.Tensor = None,   # (B, T, N) float
+    expert_actions: torch.Tensor = None,   # (B, T, N) long，默认=actions
+    gamma: float = 0.99,
+    n_step: int = 5,
+    mellowmax_alpha: float = 1.0,
+    margin: float = 0.5,
+    lambda_td: float = 1.0,
+    lambda_nstep: float = 1.0,
+    lambda_margin: float = 1.0,
+    lambda_l2: float = 1e-5,
+    burn_in_len: int = 8,
+    parameters: list = None,
+):
+    """
+    共享的多体序列 DQfD 损失（阶段二 inner loop 与阶段三微调复用）。
+
+    关键点（详见 buffers/expert_demo_buffer.py、CLAUDE.md INVARIANT 8/13）：
+    - 前向传入真实多体坐标，通信邻居在 FOV 内生效 → 通信参数获得梯度；
+    - 训练时不传 action_masks（避免 Q(s,a_expert)=-inf）；reset_comm=True 序列起始重置迟滞；
+    - target 用 next_obs + next_positions；
+    - (B,T,N) 折叠为有效序列批 (B*N, T)，GRU/TD/n-step 对每体独立；
+    - finished agent 由 valid→sample_weights/margin 屏蔽（零贡献）。
+
+    Returns: (total_loss, loss_info)
+    """
+    device = obs_patches.device
+    B, T, N = obs_patches.shape[:3]
+    if expert_actions is None:
+        expert_actions = actions
+
+    net.train()
+    hidden = net.init_hidden(B, N, device)
+    q_online, _, _ = net(
+        obs_patches, obs_scalars, positions, hidden,
+        burn_in_len=burn_in_len, action_masks=None, reset_comm=True,
+    )  # (B, T, N, 5)
+
+    with torch.no_grad():
+        next_hidden = target_net.init_hidden(B, N, device)
+        q_target, _, _ = target_net(
+            next_obs_patches, next_obs_scalars, next_positions, next_hidden,
+            burn_in_len=burn_in_len, reset_comm=True,
+        )  # (B, T, N, 5)
+
+    # 折叠 (B,T,N,*) → (B*N, T, *)
+    def _bn_t(x):
+        x = x.transpose(1, 2).contiguous()
+        return x.reshape(B * N, T, *x.shape[3:])
+
+    q_bn      = _bn_t(q_online)
+    qt_bn     = _bn_t(q_target)
+    act_bn    = _bn_t(actions)
+    rew_bn    = _bn_t(rewards)
+    done_bn   = _bn_t(dones)
+    valid_bn  = _bn_t(valid)
+    mask_bn   = _bn_t(action_masks)
+    nmask_bn  = _bn_t(next_action_masks)
+    expert_bn = _bn_t(expert_actions)
+    mexcl_bn  = _bn_t(margin_excluded) if margin_excluded is not None else None
+    mwt_bn    = _bn_t(margin_weights)  if margin_weights  is not None else None
+
+    BN = B * N
+    q_online_flat   = q_bn.reshape(BN * T, 5)
+    q_target_flat   = qt_bn.reshape(BN * T, 5)
+    actions_flat    = act_bn.reshape(BN * T)
+    rewards_flat    = rew_bn.reshape(BN * T)
+    dones_flat      = done_bn.reshape(BN * T)
+    valid_flat      = valid_bn.reshape(BN * T).float()
+    next_masks_flat = nmask_bn.reshape(BN * T, 5)
+    expert_flat     = expert_bn.reshape(BN * T)
+
+    margin_excl_flat = mexcl_bn.reshape(BN * T) if mexcl_bn is not None else None
+    valid_bool_flat  = valid_bn.reshape(BN * T).bool()
+    if margin_excl_flat is not None:
+        margin_excl_flat = margin_excl_flat | (~valid_bool_flat)
+    else:
+        margin_excl_flat = ~valid_bool_flat
+    margin_w_flat = (mwt_bn.reshape(BN * T) if mwt_bn is not None
+                     else torch.ones(BN * T, device=device))
+    margin_w_flat = margin_w_flat * valid_flat
+
+    total_loss, loss_info = dqfd_total_loss(
+        q_values=q_online_flat,
+        target_q_next=q_target_flat,
+        actions=actions_flat,
+        rewards=rewards_flat,
+        dones=dones_flat,
+        action_masks_next=next_masks_flat,
+        expert_actions=expert_flat,
+        rewards_seq=None, dones_seq=None, v_target_n=None,
+        margin_excluded=margin_excl_flat,
+        margin_weights=margin_w_flat,
+        sample_weights=valid_flat,
+        gamma=gamma, n_step=n_step, mellowmax_alpha=mellowmax_alpha, margin=margin,
+        lambda_td=lambda_td, lambda_nstep=0.0,   # n-step 单独计算
+        lambda_margin=lambda_margin, lambda_l2=lambda_l2,
+        parameters=parameters,
+    )
+
+    # n-step TD（滑动窗口，仅前 T-n 步）
+    n = n_step
+    if T > n and lambda_nstep > 0:
+        rewards_seq = torch.stack([rew_bn[:, i:T - n + i] for i in range(n)], dim=-1)
+        dones_seq   = torch.stack([done_bn[:, i:T - n + i].float() for i in range(n)], dim=-1)
+        # qt_bn[k]=Q_target(s_{k+1}); bootstrap 状态 s_n..s_{T-1} ↔ qt_bn[:, n-1:T-1]
+        v_target_n = masked_mellowmax(
+            qt_bn[:, n - 1:T - 1], mask_bn[:, n:], alpha=mellowmax_alpha,
+        )
+        q_nstep = q_bn[:, :T - n, :].reshape(BN * (T - n), 5)
+        a_nstep = act_bn[:, :T - n].reshape(BN * (T - n))
+        rs_flat = rewards_seq.reshape(BN * (T - n), n)
+        ds_flat = dones_seq.reshape(BN * (T - n), n)
+        vt_flat = v_target_n.reshape(BN * (T - n))
+        w_nstep = valid_bn[:, :T - n].reshape(BN * (T - n)).float()
+        loss_n = n_step_td_loss(q_nstep, a_nstep, rs_flat, ds_flat, vt_flat,
+                                gamma=gamma, n_step=n, weights=w_nstep)
+        total_loss = total_loss + lambda_nstep * loss_n
+        loss_info["loss_nstep"] = loss_n.item()
+    else:
+        loss_info["loss_nstep"] = 0.0
+
+    return total_loss, loss_info
 
 
 class ReptileDQfDTrainer:
@@ -65,6 +207,7 @@ class ReptileDQfDTrainer:
         self.lambda_nstep = config.get("lambda_nstep", 1.0)
         self.lambda_margin = config.get("lambda_margin", 1.0)
         self.lambda_l2 = config.get("lambda_l2", 1e-5)
+        self.grad_clip = config.get("grad_clip", 10.0)
 
         # 课程参数
         self.expert_ratio_start = config.get("expert_ratio_start", 0.9)
@@ -255,20 +398,22 @@ class ReptileDQfDTrainer:
                 t = t.to(dtype)
             return t.to(self.device)
 
-        obs_patches      = _to_tensor(batch["obs_patches"])       # (B, T, 4, K, K)
-        obs_scalars      = _to_tensor(batch["obs_scalars"])        # (B, T, 8)
-        next_obs_patches = _to_tensor(batch["next_obs_patches"])   # (B, T, 4, K, K)
-        next_obs_scalars = _to_tensor(batch["next_obs_scalars"])   # (B, T, 8)
-        actions          = _to_tensor(batch["actions_expert"], dtype=torch.long)
-        rewards          = _to_tensor(batch["rewards"])            # (B, T)
+        obs_patches      = _to_tensor(batch["obs_patches"])       # (B, T, N, 4, K, K)
+        obs_scalars      = _to_tensor(batch["obs_scalars"])        # (B, T, N, 8)
+        positions        = _to_tensor(batch["positions"])          # (B, T, N, 2)
+        next_obs_patches = _to_tensor(batch["next_obs_patches"])   # (B, T, N, 4, K, K)
+        next_obs_scalars = _to_tensor(batch["next_obs_scalars"])   # (B, T, N, 8)
+        next_positions   = _to_tensor(batch["next_positions"])     # (B, T, N, 2)
+        actions          = _to_tensor(batch["actions_expert"], dtype=torch.long)   # (B, T, N)
+        rewards          = _to_tensor(batch["rewards"])            # (B, T, N)
         dones            = _to_tensor(batch["dones"], dtype=torch.bool)
+        valid            = _to_tensor(batch["valid"], dtype=torch.bool)             # (B, T, N)
         action_masks     = _to_tensor(batch["action_masks"], dtype=torch.bool)      # s_t 掩码
-        # s_{t+1} 掩码用于 mellowmax target；若 buffer 未提供则回退到 action_masks（I2 修复）
         if "next_action_masks" in batch:
             next_action_masks = _to_tensor(batch["next_action_masks"], dtype=torch.bool)
         else:
             next_action_masks = action_masks
-        expert_actions   = _to_tensor(batch["actions_expert"], dtype=torch.long)
+        expert_actions   = actions
         margin_excluded  = batch.get("margin_excluded")
         if margin_excluded is not None:
             margin_excluded = _to_tensor(margin_excluded, dtype=torch.bool)
@@ -276,106 +421,21 @@ class ReptileDQfDTrainer:
         if margin_weights is not None:
             margin_weights = _to_tensor(margin_weights)
 
-        B, T = obs_patches.shape[:2]
-        # 每个 batch 样本是单体序列（per-agent），N=1；通信在多体前向时生效
-        positions      = torch.zeros(B, T, 1, 2, device=self.device)
-        next_positions = torch.zeros(B, T, 1, 2, device=self.device)
-
-        # ---- 在线网络：Q(s, ·) ——训练时不传 action_masks ----
-        # 专家数据中约 3% 的样本存在动作掩码与专家动作不一致（多体碰撞时序差异）。
-        # 若传入 action_masks，专家动作对应的 Q 值被置为 -inf，TD loss = inf。
-        # 掩码只在推理/评估和 mellowmax target 中生效，训练时保持 Q 值有限。
-        hidden = self.net.init_hidden(B, 1, self.device)
-        q_online, _, _ = self.net(
-            obs_patches.unsqueeze(2),      # (B, T, 1, 4, K, K)
-            obs_scalars.unsqueeze(2),      # (B, T, 1, 8)
-            positions,
-            hidden,
-            burn_in_len=self.burn_in_len,
-            action_masks=None,             # 训练时不掩码，确保 Q(s,a_expert) 有限
-        )  # (B, T, 1, 5)
-
-        # ---- target 网络：Q(s', ·) ——必须用 next_obs ----
-        with torch.no_grad():
-            next_hidden = target_net.init_hidden(B, 1, self.device)
-            q_target, _, _ = target_net(
-                next_obs_patches.unsqueeze(2),
-                next_obs_scalars.unsqueeze(2),
-                next_positions,
-                next_hidden,
-                burn_in_len=self.burn_in_len,
-            )  # (B, T, 1, 5)
-
-        # 展平 (B, T, 1, 5) → (B*T, 5)
-        q_online_flat     = q_online.reshape(B * T, 5)
-        q_target_flat     = q_target.reshape(B * T, 5)
-        actions_flat      = actions.reshape(B * T)
-        rewards_flat      = rewards.reshape(B * T)
-        dones_flat        = dones.reshape(B * T)
-        masks_flat        = action_masks.reshape(B * T, 5)       # s_t 掩码（margin loss 用）
-        next_masks_flat   = next_action_masks.reshape(B * T, 5)  # s_{t+1} 掩码（mellowmax 用）
-        expert_flat       = expert_actions.reshape(B * T)
-        margin_excl_flat  = margin_excluded.reshape(B * T) if margin_excluded is not None else None
-        margin_w_flat     = margin_weights.reshape(B * T) if margin_weights is not None else None
-
-        # ---- DQfD 1-step TD + Margin 损失 ----
-        # n-step 损失单独计算（其样本数 B*(T-n) ≠ B*T，不能合并进 dqfd_total_loss）
-        total_loss, loss_info = dqfd_total_loss(
-            q_values=q_online_flat,
-            target_q_next=q_target_flat,
-            actions=actions_flat,
-            rewards=rewards_flat,
-            dones=dones_flat,
-            action_masks_next=next_masks_flat,  # I2 修复：使用 s_{t+1} 掩码
-            expert_actions=expert_flat,
-            rewards_seq=None,       # n-step 在下方单独计算
-            dones_seq=None,
-            v_target_n=None,
-            margin_excluded=margin_excl_flat,
-            margin_weights=margin_w_flat,
-            gamma=self.gamma,
-            n_step=self.n_step,
-            mellowmax_alpha=self.mellowmax_alpha,
-            margin=self.margin,
-            lambda_td=self.lambda_td,
-            lambda_nstep=0.0,       # 由下方单独项负责
-            lambda_margin=self.lambda_margin,
-            lambda_l2=self.lambda_l2,
-            parameters=list(self.net.parameters()),
+        # ---- 多体序列 DQfD 损失（共享 helper：前向+折叠+1step+nstep+margin）----
+        total_loss, loss_info = dqfd_sequence_loss(
+            self.net, target_net,
+            obs_patches=obs_patches, obs_scalars=obs_scalars, positions=positions,
+            next_obs_patches=next_obs_patches, next_obs_scalars=next_obs_scalars,
+            next_positions=next_positions,
+            actions=actions, rewards=rewards, dones=dones, valid=valid,
+            action_masks=action_masks, next_action_masks=next_action_masks,
+            margin_excluded=margin_excluded, margin_weights=margin_weights,
+            expert_actions=expert_actions,
+            gamma=self.gamma, n_step=self.n_step, mellowmax_alpha=self.mellowmax_alpha,
+            margin=self.margin, lambda_td=self.lambda_td, lambda_nstep=self.lambda_nstep,
+            lambda_margin=self.lambda_margin, lambda_l2=self.lambda_l2,
+            burn_in_len=self.burn_in_len, parameters=list(self.net.parameters()),
         )
-
-        # ---- n-step TD 损失（滑动窗口，仅前 T-n 步可计算）----
-        n = self.n_step
-        if T > n and self.lambda_nstep > 0:
-            # 滑动窗口：rewards_seq (B, T-n, n)
-            rewards_seq = torch.stack(
-                [rewards[:, i:T - n + i] for i in range(n)], dim=-1
-            )  # (B, T-n, n)
-            dones_seq = torch.stack(
-                [dones[:, i:T - n + i].float() for i in range(n)], dim=-1
-            )  # (B, T-n, n)
-            # V_target(s_{t+n})：使用 t+n 时刻的 next 掩码（action_masks[:, n:]）
-            v_target_n = masked_mellowmax(
-                q_target.reshape(B, T, 5)[:, n:],     # (B, T-n, 5)
-                action_masks[:, n:],                   # (B, T-n, 5)
-                alpha=self.mellowmax_alpha,
-            )  # (B, T-n)
-
-            # 正确展平：(B, T-n, 5) → (B*(T-n), 5)，按 batch-major 顺序
-            # 不能直接取 q_online_flat[:B*(T-n)]（包含 batch0 所有 T 步而非各 batch 前 T-n 步）
-            q_nstep  = q_online.reshape(B, T, 5)[:, :T - n, :].reshape(B * (T - n), 5)
-            a_nstep  = actions.reshape(B, T)[:, :T - n].reshape(B * (T - n))
-            rs_flat  = rewards_seq.reshape(B * (T - n), n)
-            ds_flat  = dones_seq.reshape(B * (T - n), n)
-            vt_flat  = v_target_n.reshape(B * (T - n))
-
-            from losses.td_losses import n_step_td_loss
-            loss_n = n_step_td_loss(q_nstep, a_nstep, rs_flat, ds_flat, vt_flat,
-                                    gamma=self.gamma, n_step=n)
-            total_loss = total_loss + self.lambda_nstep * loss_n
-            loss_info["loss_nstep"] = loss_n.item()
-        else:
-            loss_info["loss_nstep"] = 0.0
 
         # ---- 自游走 batch 补充 TD（课程式混合，无 margin）----
         if aux_batch is not None:
@@ -421,7 +481,7 @@ class ReptileDQfDTrainer:
 
         optimizer.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.grad_clip)
         optimizer.step()
 
         return total_loss, loss_info

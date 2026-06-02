@@ -18,147 +18,190 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 磁盘 I/O
 # ---------------------------------------------------------------------------
 
+# per-timestep × N-agent 列式存储的全部键（不含 episode_ids）
+_STORAGE_KEYS = [
+    "obs_patches", "next_obs_patches", "obs_scalars", "next_obs_scalars",
+    "positions", "next_positions", "actions_expert", "rewards",
+    "dones", "valid", "action_masks", "next_action_masks",
+    "margin_excluded", "margin_weights",
+]
+
+
+def _episode_to_storage(ep: dict, ep_id: int) -> dict:
+    """将 build_dataset_from_rollout 的 episode dict 转为压缩存储数组 + episode_ids。"""
+    T = ep["actions_expert"].shape[0]
+    return {
+        "obs_patches":       (np.asarray(ep["obs_patches"]) * 255).clip(0, 255).astype(np.uint8),
+        "next_obs_patches":  (np.asarray(ep["next_obs_patches"]) * 255).clip(0, 255).astype(np.uint8),
+        "obs_scalars":       np.asarray(ep["obs_scalars"]).astype(np.float16),
+        "next_obs_scalars":  np.asarray(ep["next_obs_scalars"]).astype(np.float16),
+        "positions":         np.asarray(ep["positions"]).astype(np.float16),
+        "next_positions":    np.asarray(ep["next_positions"]).astype(np.float16),
+        "actions_expert":    np.asarray(ep["actions_expert"]).astype(np.int8),
+        "rewards":           np.asarray(ep["rewards"]).astype(np.float16),
+        "dones":             np.asarray(ep["dones"]).astype(bool),
+        "valid":             np.asarray(ep["valid"]).astype(bool),
+        "action_masks":      np.asarray(ep["action_masks"]).astype(bool),
+        "next_action_masks": np.asarray(ep["next_action_masks"]).astype(bool),
+        "margin_excluded":   np.asarray(ep["margin_excluded"]).astype(bool),
+        "margin_weights":    np.asarray(ep["margin_weights"]).astype(np.float16),
+        "episode_ids":       np.full(T, ep_id, dtype=np.int32),
+    }
+
+
 def save_buffer_to_disk(buffer, path: str):
-    """将 ExpertDemoBuffer（列式存储）保存为压缩 npz。"""
+    """将 ExpertDemoBuffer（per-timestep 列式存储）保存为压缩 npz。"""
     if not getattr(buffer, "_arrays_inited", False) or len(buffer) == 0:
         return
-    N = buffer._size
+    n = buffer._size
     arrays = {
-        "obs_patches":       buffer._obs_patches[:N],
-        "next_obs_patches":  buffer._next_obs_patches[:N],
-        "obs_scalars":       buffer._obs_scalars[:N].astype(np.float16),
-        "next_obs_scalars":  buffer._next_obs_scalars[:N].astype(np.float16),
-        "actions":           buffer._actions_expert[:N].astype(np.int8),
-        "rewards":           buffer._rewards[:N].astype(np.float16),
-        "dones":             buffer._dones[:N],
-        "action_masks":      buffer._action_masks[:N],
-        "next_action_masks": buffer._next_action_masks[:N],
-        "margin_excluded":   buffer._margin_excluded[:N],
-        "margin_weights":    buffer._margin_weights[:N].astype(np.float16),
+        "obs_patches":       buffer._obs_patches[:n],
+        "next_obs_patches":  buffer._next_obs_patches[:n],
+        "obs_scalars":       buffer._obs_scalars[:n].astype(np.float16),
+        "next_obs_scalars":  buffer._next_obs_scalars[:n].astype(np.float16),
+        "positions":         buffer._positions[:n].astype(np.float16),
+        "next_positions":    buffer._next_positions[:n].astype(np.float16),
+        "actions_expert":    buffer._actions_expert[:n].astype(np.int8),
+        "rewards":           buffer._rewards[:n].astype(np.float16),
+        "dones":             buffer._dones[:n],
+        "valid":             buffer._valid[:n],
+        "action_masks":      buffer._action_masks[:n],
+        "next_action_masks": buffer._next_action_masks[:n],
+        "margin_excluded":   buffer._margin_excluded[:n],
+        "margin_weights":    buffer._margin_weights[:n].astype(np.float16),
+        "episode_ids":       buffer._episode_ids[:n].astype(np.int32),
     }
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     np.savez_compressed(path, **arrays)
-    print(f"  Saved {N:,} samples → {path}  ({os.path.getsize(path)/1e6:.1f} MB)")
+    print(f"  Saved {n:,} timesteps → {path}  ({os.path.getsize(path)/1e6:.1f} MB)")
 
 
 def load_buffer_from_disk(path: str, buffer):
     """
-    从 npz 文件批量加载样本到 ExpertDemoBuffer。
+    从 npz 批量加载 per-timestep 数据到 ExpertDemoBuffer（按 episode 切分）。
 
-    np.load 的 NpzFile 每次 __getitem__ 都会重新解压整个数组，
-    必须先一次性读入所有字段，再做 O(1) 次 numpy 批量写入。
+    检测旧版（per-agent，无 positions/episode_ids）格式并明确报错，要求重新生成。
     """
     if not os.path.exists(path):
         return 0
 
     data = np.load(path, allow_pickle=False)
-    N = len(data["actions"])
 
-    obs_p   = data["obs_patches"]
-    nobs_p  = data["next_obs_patches"]
-    sc      = data["obs_scalars"].astype(np.float32)
-    nsc     = data["next_obs_scalars"].astype(np.float32)
-    acts    = data["actions"].astype(np.int64)
-    rews    = data["rewards"].astype(np.float32)
-    dns     = data["dones"].astype(bool)
-    amask   = data["action_masks"].astype(bool)
-    namask  = data["next_action_masks"].astype(bool)
-    mexcl   = data["margin_excluded"].astype(bool)
-    mwt     = data["margin_weights"].astype(np.float32)
+    # 旧格式拒绝：缺少通信所需的 positions / episode 边界 → 必须重新生成
+    if "positions" not in data.files or "episode_ids" not in data.files:
+        raise ValueError(
+            f"{path} is in the OLD per-agent format (no 'positions'/'episode_ids'). "
+            f"It cannot feed the communication-aware per-timestep buffer. "
+            f"Regenerate with: python scripts/generate_lacam_data.py "
+            f"--config configs/env_<map>.yaml --num-workers 47"
+        )
 
-    C, K = obs_p.shape[1], obs_p.shape[3]
-    if not buffer._arrays_inited:
-        buffer._init_arrays(C, K)
-
-    n    = min(N, buffer.capacity)
-    head = buffer._head
-    cap  = buffer.capacity
-
-    def _write(dst_arr, src_arr):
-        if head + n <= cap:
-            dst_arr[head:head + n] = src_arr[:n]
-        else:
-            first = cap - head
-            dst_arr[head:cap]  = src_arr[:first]
-            dst_arr[0:n-first] = src_arr[first:n]
-
-    _write(buffer._obs_patches,       obs_p)
-    _write(buffer._next_obs_patches,  nobs_p)
-    _write(buffer._obs_scalars,       sc)
-    _write(buffer._next_obs_scalars,  nsc)
-    _write(buffer._actions_expert,    acts)
-    _write(buffer._rewards,           rews)
-    _write(buffer._dones,             dns)
-    _write(buffer._action_masks,      amask)
-    _write(buffer._next_action_masks, namask)
-    _write(buffer._margin_excluded,   mexcl)
-    _write(buffer._margin_weights,    mwt)
-
-    buffer._head = (head + n) % cap
-    buffer._size = min(buffer._size + n, cap)
-
-    print(f"  Loaded {N:,} samples ← {path}")
-    return N
+    arrays = {
+        "obs_patches":       data["obs_patches"],
+        "next_obs_patches":  data["next_obs_patches"],
+        "obs_scalars":       data["obs_scalars"].astype(np.float32),
+        "next_obs_scalars":  data["next_obs_scalars"].astype(np.float32),
+        "positions":         data["positions"].astype(np.float32),
+        "next_positions":    data["next_positions"].astype(np.float32),
+        "actions_expert":    data["actions_expert"].astype(np.int64),
+        "rewards":           data["rewards"].astype(np.float32),
+        "dones":             data["dones"].astype(bool),
+        "valid":             data["valid"].astype(bool),
+        "action_masks":      data["action_masks"].astype(bool),
+        "next_action_masks": data["next_action_masks"].astype(bool),
+        "margin_excluded":   data["margin_excluded"].astype(bool),
+        "margin_weights":    data["margin_weights"].astype(np.float32),
+        "episode_ids":       data["episode_ids"].astype(np.int64),
+    }
+    n_steps = len(arrays["episode_ids"])
+    buffer.load_from_arrays(arrays)
+    print(f"  Loaded {n_steps:,} timesteps ← {path}")
+    return n_steps
 
 
 # ---------------------------------------------------------------------------
-# 样本字典 → numpy 数组（供 worker 使用，避免保留大量 Python 对象）
+# 专家数据质量指标（判断专家是否够好，prioritized vs 真 LaCAM 差异很大）
 # ---------------------------------------------------------------------------
 
-def _samples_to_numpy(samples: list) -> dict | None:
-    """将 build_dataset_from_rollout 返回的样本列表转换为列式 numpy 数组。"""
-    if not samples:
-        return None
+_QUALITY_KEYS = [
+    "makespan", "soc", "wait_ratio", "margin_excluded_ratio",
+    "mean_reward", "vertex_collision_rate",
+]
 
-    p0 = samples[0].get("obs_patch")
-    C, K = (p0.shape[0], p0.shape[-1]) if p0 is not None else (4, 11)
-    N = len(samples)
-    z3 = np.zeros((C, K, K), dtype=np.float32)
-    z8 = np.zeros(8, dtype=np.float32)
-    o5 = np.ones(5, dtype=bool)
 
-    # 预分配
-    obs_p  = np.zeros((N, C, K, K), dtype=np.uint8)
-    nobs_p = np.zeros((N, C, K, K), dtype=np.uint8)
-    sc     = np.zeros((N, 8),       dtype=np.float16)
-    nsc    = np.zeros((N, 8),       dtype=np.float16)
-    acts   = np.zeros(N,            dtype=np.int8)
-    rews   = np.zeros(N,            dtype=np.float16)
-    dns    = np.zeros(N,            dtype=bool)
-    amask  = np.ones((N, 5),        dtype=bool)
-    namask = np.ones((N, 5),        dtype=bool)
-    mexcl  = np.zeros(N,            dtype=bool)
-    mwt    = np.ones(N,             dtype=np.float16)
+def _episode_quality(ep: dict, result) -> dict:
+    """
+    从一个 episode（per-timestep dict）+ LaCAM 结果计算质量指标。
 
-    for i, s in enumerate(samples):
-        p = s.get("obs_patch", z3)
-        obs_p[i] = (np.asarray(p) * 255).clip(0, 255).astype(np.uint8)
-        np_val = s.get("next_obs_patch", z3)
-        nobs_p[i] = (np.asarray(np_val) * 255).clip(0, 255).astype(np.uint8)
-        v = s.get("obs_scalar", z8)
-        sc[i] = np.asarray(v, dtype=np.float16)
-        v = s.get("next_obs_scalar", z8)
-        nsc[i] = np.asarray(v, dtype=np.float16)
-        acts[i]  = int(s.get("action_expert", 0))
-        rews[i]  = float(s.get("reward", 0.0))
-        dns[i]   = bool(s.get("done", False))
-        v = s.get("action_mask", o5)
-        if v is not None:
-            amask[i] = np.asarray(v, dtype=bool)
-        v = s.get("next_action_mask", o5)
-        if v is not None:
-            namask[i] = np.asarray(v, dtype=bool)
-        mexcl[i] = bool(s.get("margin_excluded", False))
-        mwt[i]   = float(s.get("margin_weight", 1.0))
+    - wait_ratio:            valid agent-步中 wait(0) 占比（过高 → 过度等待）
+    - vertex_collision_rate: 执行轨迹中顶点冲突的超额占用 / valid agent-步
+                             （真 LaCAM 应 ≈0；prioritized fallback 通常 >0）
+    - makespan/soc:          来自求解器（路径质量）
+    - margin_excluded_ratio: 歧义样本占比
+    - mean_reward:           valid agent-步平均 PBRS reward
+    """
+    valid = np.asarray(ep["valid"]).astype(bool)        # (T, N)
+    acts  = np.asarray(ep["actions_expert"])             # (T, N)
+    pos   = np.asarray(ep["positions"])                  # (T, N, 2)
+    T, N  = acts.shape
+    nvalid = int(valid.sum())
+
+    wait = float((acts[valid] == 0).mean()) if nvalid else 0.0
+    mexr = float(np.asarray(ep["margin_excluded"])[valid].mean()) if nvalid else 0.0
+    mrew = float(np.asarray(ep["rewards"])[valid].mean()) if nvalid else 0.0
+
+    # 顶点冲突：每步在 valid 体中统计同格超额占用（finished 体已被 valid 掩掉）
+    coll = 0
+    for t in range(T):
+        vt = valid[t]
+        if int(vt.sum()) < 2:
+            continue
+        p = pos[t][vt]
+        _, cnt = np.unique(p, axis=0, return_counts=True)
+        coll += int((cnt[cnt > 1] - 1).sum())
+    coll_rate = coll / max(nvalid, 1)
 
     return {
-        "obs_patches": obs_p, "next_obs_patches": nobs_p,
-        "obs_scalars": sc,    "next_obs_scalars": nsc,
-        "actions": acts,      "rewards": rews,
-        "dones": dns,         "action_masks": amask,
-        "next_action_masks": namask,
-        "margin_excluded": mexcl, "margin_weights": mwt,
+        "makespan":              float(getattr(result, "makespan", 0)),
+        "soc":                   float(getattr(result, "sum_of_costs", 0)),
+        "wait_ratio":            wait,
+        "margin_excluded_ratio": mexr,
+        "mean_reward":           mrew,
+        "vertex_collision_rate": coll_rate,
     }
+
+
+def _new_quality_accumulator() -> dict:
+    """质量指标累加器（按 episode 求和 + 计数）。"""
+    acc = {k: 0.0 for k in _QUALITY_KEYS}
+    acc["_n"] = 0
+    return acc
+
+
+def _accumulate_quality(acc: dict, q: dict):
+    for k in _QUALITY_KEYS:
+        acc[k] += q.get(k, 0.0)
+    acc["_n"] += 1
+
+
+def _finalize_quality(acc: dict) -> dict:
+    """把累加器转为均值（写入 stats）。"""
+    n = max(int(acc.get("_n", 0)), 1)
+    out = {f"{k}_mean": round(acc[k] / n, 4) for k in _QUALITY_KEYS}
+    out["episodes_measured"] = int(acc.get("_n", 0))
+    return out
+
+
+def _merge_quality_accumulators(accs: list) -> dict:
+    """合并多个 worker 的质量累加器。"""
+    total = _new_quality_accumulator()
+    for a in accs:
+        if not a:
+            continue
+        for k in _QUALITY_KEYS:
+            total[k] += a.get(k, 0.0)
+        total["_n"] += int(a.get("_n", 0))
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +239,11 @@ def _worker_generate(args: tuple):
     runner = LaCAMRunner(backend=backend)
     map_type = wrapper.map_type
 
-    # 按 episode 分批积累，每 episode 立刻转 numpy 释放 Python 对象
-    chunk_arrays = []   # list of per-episode numpy dicts
+    # 按 episode 分批积累，每 episode 立刻转存储数组释放 Python 对象
+    chunk_arrays = []   # list of per-episode storage dicts（含 episode_ids）
     success_count = 0
     fail_count = 0
+    quality = _new_quality_accumulator()
 
     for seed in seeds:
         wrapper.reset(seed=seed)
@@ -214,7 +258,7 @@ def _worker_generate(args: tuple):
             fail_count += 1
             continue
 
-        samples = build_dataset_from_rollout(
+        ep = build_dataset_from_rollout(
             wrapper=wrapper,
             obs_builder=obs_builder,
             reward_builder=reward_builder,
@@ -224,48 +268,55 @@ def _worker_generate(args: tuple):
             task_id=f"{map_type}_w{worker_id}_ep{seed}",
         )
 
-        if not samples:
+        if ep is None:
             fail_count += 1
             continue
 
-        ep_arr = _samples_to_numpy(samples)
-        if ep_arr is not None:
-            chunk_arrays.append(ep_arr)
-            success_count += 1
+        _accumulate_quality(quality, _episode_quality(ep, result))
+        # episode_id 在本 worker 内唯一（success_count 递增）
+        chunk_arrays.append(_episode_to_storage(ep, ep_id=success_count))
+        success_count += 1
 
-    total_samples = sum(v["actions"].shape[0] for v in chunk_arrays)
-    if total_samples == 0:
-        return None, success_count, fail_count, 0
+    total_steps = sum(v["episode_ids"].shape[0] for v in chunk_arrays)
+    if total_steps == 0:
+        return None, success_count, fail_count, 0, quality
 
-    # 合并本 worker 所有 episode 的数组
+    # 合并本 worker 所有 episode 的数组（episode_ids 已在本 worker 内唯一）
+    all_keys = _STORAGE_KEYS + ["episode_ids"]
     merged = {
         k: np.concatenate([d[k] for d in chunk_arrays], axis=0)
-        for k in chunk_arrays[0]
+        for k in all_keys
     }
 
     tmp_path = os.path.join(tmp_dir, f".tmp_worker_{worker_id:04d}.npz")
     np.savez_compressed(tmp_path, **merged)
     print(f"  [worker {worker_id:2d}] ok={success_count} fail={fail_count} "
-          f"samples={total_samples}", flush=True)
-    return tmp_path, success_count, fail_count, total_samples
+          f"timesteps={total_steps}", flush=True)
+    return tmp_path, success_count, fail_count, total_steps, quality
 
 
 def _merge_tmp_npz(tmp_paths: list, output_path: str, max_samples: int):
-    """合并多个 worker 的临时 npz 文件，写入最终 npz，并删除临时文件。"""
-    keys = [
-        "obs_patches", "next_obs_patches", "obs_scalars", "next_obs_scalars",
-        "actions", "rewards", "dones", "action_masks", "next_action_masks",
-        "margin_excluded", "margin_weights",
-    ]
+    """
+    合并多个 worker 的临时 npz，写入最终 npz，删除临时文件。
+    各 worker 的 episode_ids 加全局偏移保证唯一；按 max_samples（时间步）截断。
+    """
+    keys = _STORAGE_KEYS + ["episode_ids"]
     parts = {k: [] for k in keys}
 
+    ep_offset = 0
     for p in tmp_paths:
         if p is None or not os.path.exists(p):
             continue
         data = np.load(p, allow_pickle=False)
-        for k in keys:
-            if k in data:
+        if "episode_ids" not in data.files:
+            os.remove(p)
+            continue
+        ids = data["episode_ids"].astype(np.int64) + ep_offset
+        ep_offset = int(ids.max()) + 1 if len(ids) else ep_offset
+        for k in _STORAGE_KEYS:
+            if k in data.files:
                 parts[k].append(data[k])
+        parts["episode_ids"].append(ids)
         os.remove(p)
 
     merged = {}
@@ -273,15 +324,17 @@ def _merge_tmp_npz(tmp_paths: list, output_path: str, max_samples: int):
         if parts[k]:
             merged[k] = np.concatenate(parts[k], axis=0)
 
-    N = len(merged.get("actions", []))
+    # 按时间步截断（保留最后 max_samples 步；episode_ids 仍标记边界，
+    # 被截断的首个 episode 只是行数变少，采样的端点同 episode 检查可正确处理）
+    N = len(merged.get("episode_ids", []))
     if N > max_samples:
         for k in merged:
             merged[k] = merged[k][-max_samples:]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     np.savez_compressed(output_path, **merged)
-    final_n = len(merged.get("actions", []))
-    print(f"  Saved {final_n:,} samples → {output_path}  "
+    final_n = len(merged.get("episode_ids", []))
+    print(f"  Saved {final_n:,} timesteps → {output_path}  "
           f"({os.path.getsize(output_path)/1e6:.1f} MB)")
     return final_n
 
@@ -343,10 +396,16 @@ def generate_data(
         obs_builder    = ObservationBuilder(num_agents=num_agents, obs_radius=5)
         reward_builder = RewardBuilder.from_config(env_cfg.get("reward", {}))
         runner         = LaCAMRunner(backend=backend)
-        expert_buffer  = ExpertDemoBuffer(capacity=max_buffer_samples)
+        # 容量按「时间步」计（每步含 N 体）；单进程按实际 episode 数上界分配，
+        # 避免用 max_buffer_samples（可能很大）预分配巨型数组。
+        cap_steps = min(max_buffer_samples,
+                        num_episodes * wrapper.max_episode_steps)
+        expert_buffer  = ExpertDemoBuffer(capacity=max(cap_steps, 1),
+                                          num_agents=num_agents)
         hard_case_mgr  = HardCaseManager()
 
         success_count = fail_count = total_samples = 0
+        quality = _new_quality_accumulator()
 
         for ep, seed in enumerate(all_seeds):
             wrapper.reset(seed=seed)
@@ -363,15 +422,16 @@ def generate_data(
                                              obstacles=obstacles)
                 continue
 
-            samples = build_dataset_from_rollout(
+            ep_data = build_dataset_from_rollout(
                 wrapper=wrapper, obs_builder=obs_builder,
                 reward_builder=reward_builder, obstacles=obstacles,
                 expert_paths=result.paths, map_type=map_type,
                 task_id=f"{map_type}_ep{ep}",
             )
-            if samples:
-                expert_buffer.add_batch(samples)
-                total_samples += len(samples)
+            if ep_data is not None:
+                _accumulate_quality(quality, _episode_quality(ep_data, result))
+                expert_buffer.add_episode(ep_data)
+                total_samples += int(ep_data["actions_expert"].shape[0])  # 时间步数
                 success_count += 1
             else:
                 fail_count += 1
@@ -383,14 +443,15 @@ def generate_data(
                 elapsed = time.time() - t_start
                 rate = (ep + 1) / max(elapsed, 0.01)
                 print(f"  [{ep+1}/{num_episodes}] ok={success_count} fail={fail_count} "
-                      f"samples={total_samples} rate={rate:.1f} ep/s")
+                      f"timesteps={total_samples} rate={rate:.1f} ep/s")
 
         stats = dict(map_type=map_type, num_episodes=num_episodes,
-                     num_agents=num_agents, map_size=map_size,
+                     num_agents=num_agents, map_size=map_size, backend=backend,
                      success_count=success_count, fail_count=fail_count,
                      total_samples=total_samples, buffer_size=len(expert_buffer),
                      elapsed=time.time()-t_start,
                      npz_path=os.path.join(output_dir, f"expert_{map_type}.npz") if save_to_disk else None,
+                     quality=_finalize_quality(quality),
                      buffer_stats=expert_buffer.get_stats(),
                      hard_case_stats=hard_case_mgr.get_stats())
 
@@ -418,6 +479,7 @@ def generate_data(
         success_count = sum(r[1] for r in results)
         fail_count    = sum(r[2] for r in results)
         total_samples = sum(r[3] for r in results)
+        quality = _merge_quality_accumulators([r[4] for r in results if len(r) > 4])
 
         # 合并临时文件到最终 npz
         npz_path = os.path.join(output_dir, f"expert_{map_type}.npz")
@@ -435,12 +497,13 @@ def generate_data(
         hard_case_mgr = HardCaseManager()
 
         stats = dict(map_type=map_type, num_episodes=num_episodes,
-                     num_agents=num_agents, map_size=map_size,
+                     num_agents=num_agents, map_size=map_size, backend=backend,
                      num_workers=num_workers,
                      success_count=success_count, fail_count=fail_count,
                      total_samples=total_samples, buffer_size=final_n,
                      elapsed=time.time()-t_start,
                      npz_path=npz_path if save_to_disk else None,
+                     quality=_finalize_quality(quality),
                      buffer_stats={}, hard_case_stats={})
 
     elapsed = time.time() - t_start
@@ -476,8 +539,11 @@ def main():
     parser.add_argument("--num-episodes", type=int, default=100)
     parser.add_argument("--num-agents",   type=int, default=8)
     parser.add_argument("--map-size",     type=int, default=16)
-    parser.add_argument("--backend",      type=str, default="prioritized",
-                        choices=["prioritized", "lacam"])
+    parser.add_argument("--backend",      type=str, default="auto",
+                        choices=["auto", "lacam", "prioritized"],
+                        help="auto=有 _lacam.so 则用真 LaCAM，否则回退 prioritized；"
+                             "lacam=强制真 LaCAM；prioritized=纯 Python fallback（质量差，"
+                             "有碰撞/SoC 翻倍，仅无绑定时应急用）")
     parser.add_argument("--output-dir",   type=str, default="data")
     parser.add_argument("--max-buffer-samples", type=int, default=2_000_000)
     parser.add_argument("--num-workers",  type=int, default=-1,

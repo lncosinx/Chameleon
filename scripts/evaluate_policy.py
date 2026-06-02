@@ -42,7 +42,7 @@ def main():
     net = BiIntentGATDRQN(
         patch_channels=net_cfg.get("patch_channels", 4),
         cnn_channels=net_cfg.get("cnn_channels", [32, 64, 64]),
-        d_patch=net_cfg.get("d_patch", 128),
+        d_patch=net_cfg.get("d_patch", 256),  # 与 train_meta 默认一致，防 ckpt 维度不匹配
         scalar_feat_dim=net_cfg.get("scalar_feat_dim", 8),
         d_scalar=net_cfg.get("d_scalar", 32),
         intent_dim=net_cfg.get("intent_dim", 64),

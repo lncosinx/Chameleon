@@ -50,7 +50,7 @@ def main():
     net = BiIntentGATDRQN(
         patch_channels=net_cfg.get("patch_channels", 4),
         cnn_channels=net_cfg.get("cnn_channels", [32, 64, 64]),
-        d_patch=net_cfg.get("d_patch", 128),
+        d_patch=net_cfg.get("d_patch", 256),  # 与 train_meta 默认一致，防 ckpt 维度不匹配
         scalar_feat_dim=net_cfg.get("scalar_feat_dim", 8),
         d_scalar=net_cfg.get("d_scalar", 32),
         intent_dim=net_cfg.get("intent_dim", 64),
@@ -88,6 +88,7 @@ def main():
         obstacles = wrapper.global_grid
 
         # 以当前概率调用 LaCAM 专家
+        segment = None
         if np.random.random() < trainer.expert_prob():
             starts = wrapper.get_agents_xy()
             goals = wrapper.get_targets_xy()
@@ -95,21 +96,19 @@ def main():
                                   map_type=wrapper.map_type, map_size=args.map_size)
             if result.success:
                 wrapper.reset(seed=args.seed * 1000 + seg)
-                samples = build_dataset_from_rollout(
+                segment = build_dataset_from_rollout(
                     wrapper, obs_builder, reward_builder, obstacles,
                     result.paths, wrapper.map_type, f"ft_{seg}",
                 )
-            else:
-                samples = []
         else:
-            # 纯自游走采样（用当前策略 rollout）
-            samples = _rollout_with_policy(
+            # 纯自游走采样（用当前策略 rollout，per-timestep × N-agent segment）
+            segment = _rollout_with_policy(
                 wrapper, obs_builder, reward_builder, net, device,
                 trainer.rollout_segment_len,
             )
 
-        if samples:
-            trainer.add_rollout_samples(samples, trainer.train_step)
+        if segment is not None:
+            trainer.add_rollout_samples(segment, trainer.train_step)
             metrics = trainer.train_on_segment()
 
             if (seg + 1) % 20 == 0:
@@ -123,47 +122,75 @@ def main():
 
 
 def _rollout_with_policy(wrapper, obs_builder, reward_builder, net, device, segment_len):
-    """用当前策略 rollout 一段。"""
+    """
+    用当前策略 rollout 一段，返回 per-timestep × N-agent 的 segment dict
+    （与 build_dataset_from_rollout / ExpertDemoBuffer 同构，供通信训练）。
+
+    自游走样本：actions=策略动作，margin_excluded=True、margin_weight=0（不进 margin）。
+    finished agent：坐标置远哨兵 + valid=False（通信排除 + loss 零权屏蔽）。
+    """
+    from buffers.expert_demo_buffer import FINISHED_AGENT_SENTINEL
+
     N = wrapper.num_agents
-    samples = []
+    K = wrapper.obs_radius * 2 + 1
+
+    obs_builder.reset()
     obs_list, _ = wrapper.reset()
+    obstacles = wrapper.global_grid
     prev_actions = np.zeros(N, dtype=np.int64)
     hidden = net.init_hidden(1, N, device)
+    net.reset_comm_state()   # episode 起始重置通信迟滞
 
-    # episode 开始时重置通信迟滞状态
-    net.reset_comm_state()
+    T = segment_len
+    S_patch  = np.zeros((T, N, 4, K, K), dtype=np.float32)
+    S_scalar = np.zeros((T, N, 8),        dtype=np.float32)
+    S_pos    = np.full((T, N, 2), FINISHED_AGENT_SENTINEL, dtype=np.float32)
+    S_action = np.zeros((T, N),           dtype=np.int64)
+    S_reward = np.zeros((T, N),           dtype=np.float32)
+    S_done   = np.zeros((T, N),           dtype=bool)
+    S_valid  = np.zeros((T, N),           dtype=bool)
+    S_mask   = np.ones((T, N, 5),         dtype=bool)
 
-    prev_agents = wrapper.get_agents_xy()
-    prev_goals  = wrapper.get_targets_xy()
-    obstacles   = wrapper.global_grid
+    ever_done = [False] * N
+    prev_goals = wrapper.get_targets_xy()
 
-    for step in range(segment_len):
+    for t in range(T):
+        prev_ever_done = list(ever_done)
         patches, scalars = build_observations(wrapper, obs_list, prev_actions, obs_builder)
         agents_xy = wrapper.get_agents_xy()
 
-        # 向量化动作掩码（避免 per-agent 循环）
         if obstacles is not None:
-            agents_arr = np.array(agents_xy, dtype=np.int32)[np.newaxis]  # (1, N, 2)
+            agents_arr = np.array(agents_xy, dtype=np.int32)[np.newaxis]
             mask_np = build_action_mask_batch(agents_arr, obstacles)[0]   # (N, 5) bool
         else:
             mask_np = np.ones((N, 5), dtype=bool)
 
-        patches_t  = torch.from_numpy(patches).unsqueeze(0).unsqueeze(1).to(device)
-        scalars_t  = torch.from_numpy(scalars).unsqueeze(0).unsqueeze(1).to(device)
-        positions_t = torch.tensor(agents_xy, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(1)
-        masks_t    = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)  # (1,1,N,5)
+        # 坐标：finished agent 置远哨兵（通信排除），与 train 一致
+        pos = np.array(agents_xy, dtype=np.float32)
+        for i in range(N):
+            if prev_ever_done[i]:
+                pos[i] = FINISHED_AGENT_SENTINEL
 
+        S_patch[t]  = patches
+        S_scalar[t] = scalars
+        S_pos[t]    = pos
+        S_mask[t]   = mask_np
+        for i in range(N):
+            S_valid[t, i] = not prev_ever_done[i]
+
+        # 策略前向（推理时施加掩码选动作；传真实多体坐标，通信生效）
+        patches_t   = torch.from_numpy(patches).unsqueeze(0).unsqueeze(1).to(device)
+        scalars_t   = torch.from_numpy(scalars).unsqueeze(0).unsqueeze(1).to(device)
+        positions_t = torch.from_numpy(pos).unsqueeze(0).unsqueeze(1).to(device)
+        masks_t     = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
         with torch.no_grad():
-            q_values, hidden, _ = net(
-                patches_t, scalars_t, positions_t, hidden,
-                action_masks=masks_t,
-            )
-
-        # q_values: (1, 1, N, 5) → (N, 5)；-inf 掩码已由网络施加
+            q_values, hidden, _ = net(patches_t, scalars_t, positions_t, hidden,
+                                      action_masks=masks_t)
         actions = q_values.squeeze(0).squeeze(0).argmax(dim=-1).cpu().numpy()
+        S_action[t] = actions
+
         obs_list, rewards, dones, _ = wrapper.step(actions.tolist())
 
-        # 计算 PBRS reward（用于近 on-policy 训练）
         curr_agents = wrapper.get_agents_xy()
         curr_goals  = wrapper.get_targets_xy()
         if obstacles is not None:
@@ -174,29 +201,51 @@ def _rollout_with_policy(wrapper, obs_builder, reward_builder, net, device, segm
                 targets_xy=curr_goals,
                 prev_targets_xy=prev_goals,
                 prev_actions=prev_actions,
+                prev_dones=prev_ever_done,
             )
+            S_reward[t] = np.asarray(shaped_rewards, dtype=np.float32)
         else:
-            shaped_rewards = [float(r) for r in rewards]
+            S_reward[t] = np.asarray([float(r) for r in rewards], dtype=np.float32)
 
+        step_dones = dones if isinstance(dones, list) else [bool(dones)] * N
         for i in range(N):
-            samples.append({
-                "obs_patch": patches[i].copy(),
-                "obs_scalar": scalars[i].copy(),
-                "action_expert": int(actions[i]),
-                "reward": shaped_rewards[i],
-                "done": dones[i] if isinstance(dones, list) else bool(dones),
-                "action_mask": mask_np[i].copy(),   # B10: 真实掩码
-                "map_type": wrapper.map_type,
-                "task_id": "rollout",
-                "margin_excluded": True,  # 自游走样本不进 margin loss
-                "margin_weight": 0.0,
-            })
+            if step_dones[i]:
+                ever_done[i] = True
+        S_done[t] = np.array(ever_done, dtype=bool)
 
         prev_actions = actions
-        prev_agents  = curr_agents
         prev_goals   = curr_goals
 
-    return samples
+    if not S_valid.any():
+        return None
+
+    # next_* 移位一帧（末帧零/哨兵/全合法）
+    next_patch  = np.zeros_like(S_patch)
+    next_scalar = np.zeros_like(S_scalar)
+    next_pos    = np.full_like(S_pos, FINISHED_AGENT_SENTINEL)
+    next_mask   = np.ones_like(S_mask)
+    if T > 1:
+        next_patch[:-1]  = S_patch[1:]
+        next_scalar[:-1] = S_scalar[1:]
+        next_pos[:-1]    = S_pos[1:]
+        next_mask[:-1]   = S_mask[1:]
+
+    return {
+        "obs_patches":       S_patch,
+        "obs_scalars":       S_scalar,
+        "positions":         S_pos,
+        "next_obs_patches":  next_patch,
+        "next_obs_scalars":  next_scalar,
+        "next_positions":    next_pos,
+        "actions_expert":    S_action,
+        "rewards":           S_reward,
+        "dones":             S_done,
+        "valid":             S_valid,
+        "action_masks":      S_mask,
+        "next_action_masks": next_mask,
+        "margin_excluded":   np.ones((T, N), dtype=bool),    # 自游走不进 margin
+        "margin_weights":    np.zeros((T, N), dtype=np.float32),
+    }
 
 
 if __name__ == "__main__":

@@ -58,7 +58,7 @@ def test_training_loop():
     net = BiIntentGATDRQN(
         patch_channels=4, cnn_channels=[8, 16, 16],
         d_patch=64, d_scalar=16, intent_dim=32, comm_dim=32,
-        comm_radius=4, comm_topk=3, num_attention_heads=2,
+        comm_radius=4, comm_topk_cap=3, num_attention_heads=2,
         gru_hidden_dim=64, dueling_hidden_dim=64, num_actions=5,
     )
 
@@ -91,11 +91,12 @@ def test_training_loop():
         result = runner.solve(obstacles, starts, goals, map_type="random", map_size=16)
         if result.success:
             wrapper.reset(seed=60000 + ep)
-            samples = build_dataset_from_rollout(
+            ep_data = build_dataset_from_rollout(
                 wrapper, obs_builder, reward_builder, obstacles,
                 result.paths, "random", f"train_{ep}"
             )
-            expert_buf.add_batch(samples)
+            if ep_data is not None:
+                expert_buf.add_episode(ep_data)
 
     print(f"  Expert buffer: {len(expert_buf)} samples")
 

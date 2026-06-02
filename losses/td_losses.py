@@ -10,6 +10,17 @@ import torch
 import torch.nn.functional as F
 
 
+def _weighted_mse(pred: torch.Tensor, target: torch.Tensor,
+                  weights: torch.Tensor = None) -> torch.Tensor:
+    """加权 MSE：weights=None 时退化为普通 mean。weights 为 0/1 时屏蔽无效样本。"""
+    se = (pred - target) ** 2
+    if weights is None:
+        return se.mean()
+    weights = weights.to(se.dtype)
+    denom = weights.sum().clamp(min=1.0)
+    return (se * weights).sum() / denom
+
+
 def one_step_td_loss(
     q_values: torch.Tensor,        # (..., num_actions)
     actions: torch.Tensor,         # (...,) long, 动作索引
@@ -17,9 +28,12 @@ def one_step_td_loss(
     dones: torch.Tensor,           # (...,) bool or float
     v_target: torch.Tensor,        # (...,) V_target(s') = mellowmax target
     gamma: float = 0.99,
+    weights: torch.Tensor = None,  # (...,) 0/1 或权重，None=全部计入
 ) -> torch.Tensor:
     """
     1-step TD loss。支持 (B, num_actions) 或 (B, N, num_actions)。
+
+    weights：per-sample 权重（如 valid 掩码）。0 表示该样本不计入 loss。
 
     Returns:
         loss: scalar
@@ -31,8 +45,7 @@ def one_step_td_loss(
     done_mask = (~dones.bool()).float() if dones.dtype == torch.bool else (1.0 - dones)
     td_target = rewards + gamma * done_mask * v_target  # (...,)
 
-    loss = F.mse_loss(q_sa, td_target.detach())
-    return loss
+    return _weighted_mse(q_sa, td_target.detach(), weights)
 
 
 def n_step_td_loss(
@@ -43,6 +56,7 @@ def n_step_td_loss(
     v_target_n: torch.Tensor,      # (B,) — V_target(s_{t+n})
     gamma: float = 0.99,
     n_step: int = 5,
+    weights: torch.Tensor = None,  # (B,) 0/1 或权重，None=全部计入
 ) -> torch.Tensor:
     """
     n-step TD loss。
@@ -75,6 +89,8 @@ def n_step_td_loss(
             q_values = q_values.reshape(B_orig * N_orig, -1)
         if actions.dim() == 2:
             actions = actions.reshape(B_orig * N_orig)
+        if weights is not None and weights.dim() == 2:
+            weights = weights.reshape(B_orig * N_orig)
 
     B, n = rewards_seq.shape
     device = rewards_seq.device
@@ -108,5 +124,4 @@ def n_step_td_loss(
     td_target_n = (return_sum + v_term).detach()
 
     q_sa = q_values.gather(dim=-1, index=actions.unsqueeze(-1)).squeeze(-1)
-    loss = F.mse_loss(q_sa, td_target_n)
-    return loss
+    return _weighted_mse(q_sa, td_target_n, weights)

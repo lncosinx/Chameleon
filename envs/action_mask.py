@@ -164,9 +164,18 @@ def test_mellowmax_stability(masked_q: np.ndarray, alpha: float = 1.0) -> bool:
         True if no NaN produced.
     """
     safe_q = masked_q / alpha
-    # logsumexp over last dim, excluding -inf
-    v_target = alpha * (
-        np.log(np.sum(np.exp(safe_q), axis=-1) + 1e-12)
-        - np.log(np.sum(np.isfinite(safe_q), axis=-1) + 1e-12)
-    )
+    # 数值稳定的 logsumexp（排除 -inf）
+    finite_mask = np.isfinite(safe_q)
+    valid_counts = finite_mask.sum(axis=-1)
+    # 逐样本 logsumexp
+    results = []
+    for row_q, row_mask in zip(safe_q, finite_mask):
+        vals = row_q[row_mask]
+        if len(vals) == 0:
+            results.append(np.nan)
+            continue
+        m = vals.max()
+        logsumexp_val = m + np.log(np.sum(np.exp(vals - m)))
+        results.append(alpha * (logsumexp_val - np.log(len(vals))))
+    v_target = np.array(results)
     return not np.any(np.isnan(v_target)) and not np.any(np.isinf(v_target))
