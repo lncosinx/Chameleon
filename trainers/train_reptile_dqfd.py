@@ -57,6 +57,7 @@ def dqfd_sequence_loss(
     lambda_l2: float = 1e-5,
     burn_in_len: int = 8,
     parameters: list = None,
+    use_amp: bool = False,
 ):
     """
     共享的多体序列 DQfD 损失（阶段二 inner loop 与阶段三微调复用）。
@@ -67,6 +68,8 @@ def dqfd_sequence_loss(
     - target 用 next_obs + next_positions；
     - (B,T,N) 折叠为有效序列批 (B*N, T)，GRU/TD/n-step 对每体独立；
     - finished agent 由 valid→sample_weights/margin 屏蔽（零贡献）。
+    - use_amp：在 autocast 下跑前向+loss（entmax/mellowmax 内部强制 fp32 保数值稳定）；
+      backward/scaler 由调用方负责。
 
     Returns: (total_loss, loss_info)
     """
@@ -75,7 +78,32 @@ def dqfd_sequence_loss(
     if expert_actions is None:
         expert_actions = actions
 
+    amp_enabled = use_amp and device.type == "cuda"
+    _amp_ctx = torch.autocast(device_type=device.type, enabled=amp_enabled)
+
     net.train()
+    with _amp_ctx:
+        return _dqfd_sequence_loss_inner(
+            net, target_net, device, B, T, N,
+            obs_patches, obs_scalars, positions,
+            next_obs_patches, next_obs_scalars, next_positions,
+            actions, rewards, dones, valid, action_masks, next_action_masks,
+            margin_excluded, margin_weights, expert_actions,
+            gamma, n_step, mellowmax_alpha, margin,
+            lambda_td, lambda_nstep, lambda_margin, lambda_l2, burn_in_len, parameters,
+        )
+
+
+def _dqfd_sequence_loss_inner(
+    net, target_net, device, B, T, N,
+    obs_patches, obs_scalars, positions,
+    next_obs_patches, next_obs_scalars, next_positions,
+    actions, rewards, dones, valid, action_masks, next_action_masks,
+    margin_excluded, margin_weights, expert_actions,
+    gamma, n_step, mellowmax_alpha, margin,
+    lambda_td, lambda_nstep, lambda_margin, lambda_l2, burn_in_len, parameters,
+):
+    """dqfd_sequence_loss 的计算体（已在 autocast 上下文内）。"""
     hidden = net.init_hidden(B, N, device)
     q_online, _, _ = net(
         obs_patches, obs_scalars, positions, hidden,
@@ -208,6 +236,12 @@ class ReptileDQfDTrainer:
         self.lambda_margin = config.get("lambda_margin", 1.0)
         self.lambda_l2 = config.get("lambda_l2", 1e-5)
         self.grad_clip = config.get("grad_clip", 10.0)
+
+        # AMP（§4.2）：autocast 前向/loss + GradScaler。键可在顶层或 parallel 下。
+        _par = config.get("parallel", {}) or {}
+        self.use_amp = bool(config.get("use_amp", _par.get("use_amp", False)))
+        self.use_amp = self.use_amp and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # 课程参数
         self.expert_ratio_start = config.get("expert_ratio_start", 0.9)
@@ -398,10 +432,18 @@ class ReptileDQfDTrainer:
                 t = t.to(dtype)
             return t.to(self.device)
 
-        obs_patches      = _to_tensor(batch["obs_patches"])       # (B, T, N, 4, K, K)
+        def _patch_to_gpu(x):
+            """patch 传 GPU 再转 float（uint8→/255）；省 CPU 转换 + 4× 传输量。"""
+            t = x if isinstance(x, torch.Tensor) else torch.from_numpy(np.asarray(x))
+            t = t.to(self.device, non_blocking=True)
+            if t.dtype == torch.uint8:
+                return t.float().div_(255.0)
+            return t.float()
+
+        obs_patches      = _patch_to_gpu(batch["obs_patches"])     # (B, T, N, 4, K, K) uint8→float/255
         obs_scalars      = _to_tensor(batch["obs_scalars"])        # (B, T, N, 8)
         positions        = _to_tensor(batch["positions"])          # (B, T, N, 2)
-        next_obs_patches = _to_tensor(batch["next_obs_patches"])   # (B, T, N, 4, K, K)
+        next_obs_patches = _patch_to_gpu(batch["next_obs_patches"])# (B, T, N, 4, K, K) uint8→float/255
         next_obs_scalars = _to_tensor(batch["next_obs_scalars"])   # (B, T, N, 8)
         next_positions   = _to_tensor(batch["next_positions"])     # (B, T, N, 2)
         actions          = _to_tensor(batch["actions_expert"], dtype=torch.long)   # (B, T, N)
@@ -435,6 +477,7 @@ class ReptileDQfDTrainer:
             margin=self.margin, lambda_td=self.lambda_td, lambda_nstep=self.lambda_nstep,
             lambda_margin=self.lambda_margin, lambda_l2=self.lambda_l2,
             burn_in_len=self.burn_in_len, parameters=list(self.net.parameters()),
+            use_amp=self.use_amp,
         )
 
         # ---- 自游走 batch 补充 TD（课程式混合，无 margin）----
@@ -460,29 +503,31 @@ class ReptileDQfDTrainer:
                 obs_in = aux_obs.unsqueeze(-4) if aux_obs.dim() == 4 else aux_obs
                 sc_in  = aux_sc.unsqueeze(-3)  if aux_sc.dim()  == 3 else aux_sc
 
-                with torch.no_grad():
-                    q_t_sp, _, _ = target_net(obs_in, sc_in, pos_sp, h_t_sp)
-
-                q_sp, _, _ = self.net(obs_in, sc_in, pos_sp, h_sp)
-
-                # 使用模块级导入（不在此处重复 import，避免遮蔽外层绑定）
-                mask_sp_flat = aux_masks.reshape(-1, 5)
-                v_sp = masked_mellowmax(q_t_sp.reshape(-1, 5), mask_sp_flat,
-                                        alpha=self.mellowmax_alpha)
-                from losses.td_losses import one_step_td_loss as _1step_loss
-                sp_td_loss = _1step_loss(
-                    q_sp.reshape(-1, 5), aux_acts.reshape(-1),
-                    aux_rews.reshape(-1), aux_dones.reshape(-1), v_sp, self.gamma,
-                )
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    with torch.no_grad():
+                        q_t_sp, _, _ = target_net(obs_in, sc_in, pos_sp, h_t_sp)
+                    q_sp, _, _ = self.net(obs_in, sc_in, pos_sp, h_sp)
+                    mask_sp_flat = aux_masks.reshape(-1, 5)
+                    v_sp = masked_mellowmax(q_t_sp.reshape(-1, 5), mask_sp_flat,
+                                            alpha=self.mellowmax_alpha)
+                    from losses.td_losses import one_step_td_loss as _1step_loss
+                    sp_td_loss = _1step_loss(
+                        q_sp.reshape(-1, 5), aux_acts.reshape(-1),
+                        aux_rews.reshape(-1), aux_dones.reshape(-1), v_sp, self.gamma,
+                    )
                 total_loss = total_loss + self.lambda_td * sp_td_loss
                 loss_info["loss_sp_td"] = sp_td_loss.item()
             except Exception:
                 pass  # 自游走 batch 格式不兼容时静默跳过
 
+        # AMP：scaler.scale → backward → unscale → clip → step → update。
+        # use_amp=False 时 GradScaler(enabled=False) 全为 no-op，与原路径等价。
         optimizer.zero_grad()
-        total_loss.backward()
+        self.scaler.scale(total_loss).backward()
+        self.scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.grad_clip)
-        optimizer.step()
+        self.scaler.step(optimizer)
+        self.scaler.update()
 
         return total_loss, loss_info
 
@@ -564,9 +609,70 @@ class DualGPUReptileTrainer:
         # selfplay buffer 并发访问锁：多个 _run_gpu 线程共享同一 buffer，需要序列化采样
         self._buffer_lock = threading.Lock()
 
+        # 异步预取：在当前 meta-iter 的 GPU inner loop 跑的同时，后台线程预采下一轮 batch。
+        # expert_buffer 在阶段二是只读静态的，sample 用独立 rng → 并发采样安全。
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetched = None  # (key, all_pre_batches)
+
         # 性能诊断
         self.profiler          = Profiler() if cfg.get("debug", False) else None
         self._profile_interval = cfg.get("profile_interval", 200)
+
+    # ------------------------------------------------------------------
+    # 预采样 + 异步预取
+    # ------------------------------------------------------------------
+
+    def _presample(self, expert_buffer, meta_iter: int, seed) -> list:
+        """采样某 meta-iter 全部 GPU×task×inner 的 expert batch。布局 [gpu][task][inner]。"""
+        n_gpus = len(self.devices)
+        tpg = self.tasks_per_gpu
+        ref = self.sub_trainers[0]
+        exp_ratio_val = expert_ratio(
+            meta_iter, self.total_meta_iters,
+            self.expert_ratio_start, self.expert_ratio_end,
+            self.expert_ratio_decay_iters,
+        )
+        n_expert_seqs = max(1, int(ref.batch_size * exp_ratio_val))
+        all_pre = []
+        for gpu_idx in range(n_gpus):
+            gpu_b = []
+            for task_offset in range(tpg):
+                task_idx = gpu_idx * tpg + task_offset
+                task_seed = (seed or meta_iter * 1000) + task_idx * 99991
+                rng = np.random.default_rng(task_seed)
+                batches = []
+                for _ in range(ref.inner_steps):
+                    try:
+                        batches.append(expert_buffer.sample(
+                            batch_size=n_expert_seqs,
+                            sequence_len=ref.sequence_len,
+                            burn_in_len=ref.burn_in_len,
+                            rng=rng,
+                        ))
+                    except (ValueError, IndexError):
+                        batches.append(None)
+                gpu_b.append(batches)
+            all_pre.append(gpu_b)
+        return all_pre
+
+    def _get_presample(self, expert_buffer, meta_iter: int, seed) -> list:
+        """取本轮预采样：命中上一轮后台预取则直接用，否则同步采样。"""
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join()
+            self._prefetch_thread = None
+        if self._prefetched is not None and self._prefetched[0] == (meta_iter, seed):
+            batches = self._prefetched[1]
+            self._prefetched = None
+            return batches
+        return self._presample(expert_buffer, meta_iter, seed)
+
+    def _start_prefetch(self, expert_buffer, meta_iter: int, seed):
+        """后台线程预采下一轮（与本轮 GPU inner loop 重叠；CUDA kernel 释放 GIL 时 CPU 采样得以并行）。"""
+        key = (meta_iter, seed)
+        def _work():
+            self._prefetched = (key, self._presample(expert_buffer, meta_iter, seed))
+        self._prefetch_thread = threading.Thread(target=_work, name="prefetch", daemon=True)
+        self._prefetch_thread.start()
 
     def _current_meta_lr(self) -> float:
         """线性衰减 meta_lr：meta_lr_start → meta_lr_end。"""
@@ -613,32 +719,12 @@ class DualGPUReptileTrainer:
 
         _seg = self.profiler.segment if self.profiler else lambda _: nullcontext()
 
-        # ---- 预采样：主线程顺序采样，消除跨线程 buffer 锁竞争 ----
-        # 布局：all_pre_batches[gpu_idx][task_offset][inner_step]
-        ref = self.sub_trainers[0]
-        n_expert_seqs = max(1, int(ref.batch_size * exp_ratio_val))
-        all_pre_batches: List[List[List[Optional[dict]]]] = []
+        # ---- 预采样（异步预取）----
+        # 本轮 batch：命中上一轮后台预取直接用；随后立即启动下一轮预取，与下方
+        # GPU inner loop 重叠（patch 已是 uint8，转换在 GPU；此处只剩 gather，可被隐藏）。
         with _seg("presample"):
-            for gpu_idx in range(n_gpus):
-                gpu_batches: List[List[Optional[dict]]] = []
-                for task_offset in range(tpg):
-                    task_idx  = gpu_idx * tpg + task_offset
-                    task_seed = (seed or self.meta_iter * 1000) + task_idx * 99991
-                    rng       = np.random.default_rng(task_seed)
-                    batches: List[Optional[dict]] = []
-                    for _ in range(ref.inner_steps):
-                        try:
-                            b = expert_buffer.sample(
-                                batch_size=n_expert_seqs,
-                                sequence_len=ref.sequence_len,
-                                burn_in_len=ref.burn_in_len,
-                                rng=rng,
-                            )
-                            batches.append(b)
-                        except (ValueError, IndexError):
-                            batches.append(None)
-                    gpu_batches.append(batches)
-                all_pre_batches.append(gpu_batches)
+            all_pre_batches = self._get_presample(expert_buffer, self.meta_iter, seed)
+        self._start_prefetch(expert_buffer, self.meta_iter + 1, seed)
 
         # ---- 并行 inner loop（每线程在各自 GPU 上串行跑 tasks_per_gpu 个任务）----
         results: Dict[int, List[Optional[Dict]]] = {i: [] for i in range(n_gpus)}

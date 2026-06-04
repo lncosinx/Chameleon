@@ -65,6 +65,7 @@ def main():
         ema_decay=net_cfg.get("ema_decay", 0.0),
         gru_hidden_dim=net_cfg.get("gru_hidden_dim", 256),
         dueling_hidden_dim=net_cfg.get("dueling_hidden_dim", 256),
+        use_torch_compile=bool(cfg.get("use_torch_compile", False)),
     )
 
     trainer = FinetuneOnlineTrainer(net, cfg, device=device)

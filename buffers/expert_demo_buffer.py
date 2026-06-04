@@ -247,11 +247,11 @@ class ExpertDemoBuffer:
         （端点 episode_id 相等 ⟹ 中间全相等，因 episode_id 全局递增且按 episode
         连续写入）。
 
-        返回字段：
-            obs_patches:       (B, T, N, C, K, K) float32 [0,1]
+        返回字段（patches 为 **uint8**，由消费方在 GPU 上 .float()/255，见 trainer）：
+            obs_patches:       (B, T, N, C, K, K) uint8 [0,255]
             obs_scalars:       (B, T, N, 8)
             positions:         (B, T, N, 2)
-            next_obs_patches:  (B, T, N, C, K, K)
+            next_obs_patches:  (B, T, N, C, K, K) uint8 [0,255]
             next_obs_scalars:  (B, T, N, 8)
             next_positions:    (B, T, N, 2)
             actions_expert:    (B, T, N)
@@ -293,8 +293,12 @@ class ExpertDemoBuffer:
         # (B, T) 连续索引（已保证不跨 episode，无需取模，但安全起见取模）
         idx_mat = (start_indices[:, None] + np.arange(sequence_len)[None, :]) % self.capacity
 
-        obs_p  = self._obs_patches[idx_mat].astype(np.float32) / 255.0       # (B,T,N,C,K,K)
-        nobs_p = self._next_obs_patches[idx_mat].astype(np.float32) / 255.0
+        # patches 保留 uint8（不在 CPU 上 astype/255）：
+        # 实测 CPU 端 astype/255 占采样 ~75% 耗时（334/441 ms），且 float32 传输量是 uint8 的 4×。
+        # 改为传 uint8 到 GPU、在 GPU 上 .float()/255（实测整条 patch 管道快 ~5.9×）。
+        # 消费方（trainer）负责 GPU 端归一化（见 _patch_to_gpu）。
+        obs_p  = self._obs_patches[idx_mat]        # (B,T,N,C,K,K) uint8
+        nobs_p = self._next_obs_patches[idx_mat]   # uint8
 
         return {
             "obs_patches":       obs_p,

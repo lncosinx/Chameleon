@@ -28,7 +28,7 @@ def _peek_npz_timesteps(npz_path: str) -> int:
     return int(len(data["episode_ids"]))
 
 
-def _build_network(net_cfg: dict) -> BiIntentGATDRQN:
+def _build_network(net_cfg: dict, use_torch_compile: bool = False) -> BiIntentGATDRQN:
     return BiIntentGATDRQN(
         patch_channels    = net_cfg.get("patch_channels",     4),
         cnn_channels      = net_cfg.get("cnn_channels",       [32, 64, 64]),
@@ -47,6 +47,7 @@ def _build_network(net_cfg: dict) -> BiIntentGATDRQN:
         ema_decay         = net_cfg.get("ema_decay",          0.0),
         gru_hidden_dim    = net_cfg.get("gru_hidden_dim",     256),
         dueling_hidden_dim= net_cfg.get("dueling_hidden_dim", 256),
+        use_torch_compile = use_torch_compile,
     )
 
 
@@ -61,6 +62,10 @@ def main():
                         help="阶段一输出目录（含 expert_*.npz）")
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--log-interval",   type=int, default=20)
+    parser.add_argument("--ckpt-interval",  type=int, default=1000,
+                        help="每 N 个 meta-iter 原子写一次 checkpoints/meta_latest.pt（断点续跑用）")
+    parser.add_argument("--resume",         type=str, default="none",
+                        help="'none'=从头训；'auto'=若有 checkpoints/meta_latest.pt 则续；或指定 ckpt 路径")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -136,7 +141,8 @@ def main():
     sp_buf = SelfPlayBuffer(capacity=500_000)
 
     # ---- 构建训练器 ----
-    net = _build_network(net_cfg)
+    _use_compile = bool(cfg.get("parallel", {}).get("use_torch_compile", False))
+    net = _build_network(net_cfg, use_torch_compile=_use_compile)
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Network: {n_params:,} parameters ({n_params/1e6:.2f}M)")
 
@@ -147,9 +153,29 @@ def main():
         trainer = ReptileDQfDTrainer(net, cfg, device=devices[0])
         print(f"Trainer: ReptileDQfDTrainer     (single device: {devices[0]})")
 
-    # ---- 训练循环 ----
-    print(f"\nStarting training: {args.meta_iters} meta-iterations\n")
-    for i in range(args.meta_iters):
+    # ---- 断点续跑 ----
+    os.makedirs("checkpoints", exist_ok=True)
+    latest_path = "checkpoints/meta_latest.pt"
+    if args.resume and args.resume != "none":
+        resume_path = latest_path if args.resume == "auto" else args.resume
+        if os.path.exists(resume_path):
+            from utils.checkpoint import load_checkpoint
+            trainer.load_state_dict(load_checkpoint(resume_path))
+            print(f"Resumed from {resume_path} at meta_iter={trainer.meta_iter}")
+        elif args.resume == "auto":
+            print(f"No {latest_path}; starting fresh.")
+        else:
+            raise FileNotFoundError(f"--resume {resume_path} not found")
+
+    def _atomic_save(state, path):
+        """先写 .tmp 再 os.replace，避免写一半被杀导致 ckpt 损坏。"""
+        save_checkpoint(state, path + ".tmp", "meta")
+        os.replace(path + ".tmp", path)
+
+    # ---- 训练循环（按 trainer.meta_iter 驱动，支持续跑）----
+    start_iter = trainer.meta_iter
+    print(f"\nStarting training: {start_iter} → {args.meta_iters} meta-iterations\n")
+    for i in range(start_iter, args.meta_iters):
         metrics = trainer.meta_step(expert_buf, sp_buf, env_factory=None)
 
         if (i + 1) % args.log_interval == 0:
@@ -162,11 +188,16 @@ def main():
                   f"loss={metrics['inner_loss_mean']:.4f}  "
                   f"map={mt_str:<20}  "
                   f"er={metrics['expert_ratio']:.2f}  "
-                  f"tasks={n_tasks}  meta_lr={meta_lr:.5f}")
+                  f"tasks={n_tasks}  meta_lr={meta_lr:.5f}", flush=True)
 
-    # ---- 保存 checkpoint ----
-    os.makedirs("checkpoints", exist_ok=True)
+        # 周期性原子存档（断点续跑）
+        if args.ckpt_interval > 0 and (i + 1) % args.ckpt_interval == 0:
+            _atomic_save(trainer.state_dict(), latest_path)
+            print(f"  [ckpt] meta_latest.pt @ iter {i+1}", flush=True)
+
+    # ---- 保存最终 checkpoint ----
     save_checkpoint(trainer.state_dict(), "checkpoints/meta_init.pt", "meta")
+    _atomic_save(trainer.state_dict(), latest_path)
     print("\nCheckpoint saved to checkpoints/meta_init.pt")
 
 

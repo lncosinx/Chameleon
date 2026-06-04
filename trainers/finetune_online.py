@@ -72,6 +72,12 @@ class FinetuneOnlineTrainer:
             self.net.parameters(), lr=config.get("lr", 3.0e-5)
         )
 
+        # AMP（§4.2）
+        _par = config.get("parallel", {}) or {}
+        self.use_amp = bool(config.get("use_amp", _par.get("use_amp", False)))
+        self.use_amp = self.use_amp and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+
         # Buffer
         self.buffer = RecentOnlineBuffer(
             capacity=config.get("buffer_capacity_segments", 128),
@@ -190,11 +196,14 @@ class FinetuneOnlineTrainer:
                 margin=self.margin, lambda_td=1.0, lambda_nstep=0.0,
                 lambda_margin=lam_margin, lambda_l2=1e-5,
                 burn_in_len=burn_in_len, parameters=list(self.net.parameters()),
+                use_amp=self.use_amp,
             )
             self.optimizer.zero_grad()
-            total_loss.backward()
+            self.scaler.scale(total_loss).backward()
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.grad_clip)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             last_info = loss_info
 
         # train_step = 策略版本，每段（每次同步采样）+1

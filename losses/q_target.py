@@ -27,6 +27,10 @@ def masked_mellowmax(
     Returns:
         v_target: (...,) mellowmax 值。
     """
+    # AMP 安全：mellowmax 含 -inf 掩码 + logsumexp，在 fp16 下易出 NaN/精度问题，
+    # 强制 fp32 计算（即使在 autocast 区域内也保持数值稳定）。
+    q_values = q_values.float()
+
     # 非法动作 → -inf，不在 logsumexp 中贡献
     safe_q = q_values / alpha
     safe_q = safe_q.masked_fill(~action_masks, float('-inf'))

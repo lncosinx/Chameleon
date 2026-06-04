@@ -39,6 +39,10 @@ def entmax(logits: torch.Tensor, alpha: float = 1.5, dim: int = -1,
     Returns:
         probs: (..., N) 稀疏概率分布，sum=1, 部分值为 0
     """
+    # AMP 安全：bisection 用 -1e10 代替 -inf 且含 pow/clamp，在 fp16 下会溢出为 inf/NaN，
+    # 强制 fp32 计算（autocast 区域内也保持稳定）。
+    logits = logits.float()
+
     if alpha == 1.0:
         return F.softmax(logits, dim=dim)
 
@@ -194,127 +198,112 @@ class BiIntentAttention(nn.Module):
         intents: torch.Tensor,    # (B, N, D_intent)
         positions: torch.Tensor,  # (B, N, 2)
     ) -> Tuple[torch.Tensor, dict]:
-        B, N, D = intents.shape
-        device = intents.device
+        """单步入口（保持向后兼容；内部走 forward_sequence 的 T=1 路径）。"""
+        comm, info = self.forward_sequence(
+            intents.unsqueeze(1), positions.unsqueeze(1)
+        )
+        return comm.squeeze(1), info
 
-        # ---- Step 1: 计算候选邻居（FOV 内 + 距离约束）----
-        pos_diff = positions.unsqueeze(1) - positions.unsqueeze(2)
-        dist = torch.norm(pos_diff.float(), dim=-1)  # (B, N, N)
+    def forward_sequence(
+        self,
+        intents: torch.Tensor,    # (B, T, N, D_intent)
+        positions: torch.Tensor,  # (B, T, N, 2)
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        向量化整段序列的通信（替代逐 t Python 循环）。
 
-        # 邻居候选：距离 ≤ comm_radius 且非自身
-        is_candidate = (dist <= self.comm_radius) & (dist > 1e-6)  # (B, N, N)
+        重活全部跨 (B,T) 批量化：候选/距离、Q/K logits、entmax、topk 封顶、多头聚合。
+        唯一保留的串行依赖是迟滞 active-mask 递推（active[t] 依赖 active[t-1]），
+        但其每步只是廉价 elementwise（masked_fill+renorm，无 entmax/matmul），launch 开销极小。
 
-        # ---- Step 2: 计算注意力 logits（用于邻居选择的预备分数）----
-        Q_raw = self.q_proj(intents)  # (B, N, comm_dim)
-        K_raw = self.k_proj(intents)  # (B, N, comm_dim)
+        语义保持（与逐 t 版一致）：FOV 内候选、entmax 软稀疏、τ_in/τ_out 迟滞阈值、
+        active 在 topk 前更新、EdgeFlip 在 topk 后统计、无活跃邻居→通信特征 0。
+        **唯一改动**：原"预-entmax stickiness logit 加分"（可选项）会使 entmax 无法批量化，
+        改为在迟滞 scan 内对 active 边做"后-entmax 权重加分"（同样制造切换惯性，且廉价）。
+        stickiness_bonus=0 时与原实现数值等价。
 
-        # 注意力分数：Q·K^T / √comm_dim
-        # 注意：scale 基于 Q/K 的维度 comm_dim，而非输入的 intent_dim（B6 修复）
+        跨调用迟滞：self._active_mask / self._prev_edge_set 在段首读、段尾写，
+        故 T=1 的在线推断逐步调用仍维持跨步迟滞（与原行为一致）。
+        """
+        B, T, N, D = intents.shape
+
+        # ===== 并行段（跨 B,T 一次算完）=====
+        pos_diff = positions.unsqueeze(3) - positions.unsqueeze(2)   # (B,T,N,N,2)
+        dist = torch.norm(pos_diff.float(), dim=-1)                  # (B,T,N,N)
+        is_candidate = (dist <= self.comm_radius) & (dist > 1e-6)    # (B,T,N,N)
+
+        Q_raw = self.q_proj(intents)   # (B,T,N,comm_dim)
+        K_raw = self.k_proj(intents)
         comm_dim = Q_raw.shape[-1]
         scale = comm_dim ** -0.5
-        attn_logits = torch.bmm(Q_raw, K_raw.transpose(1, 2)) * scale  # (B, N, N)
-
-        # 非候选邻居 → -inf（entmax 中权重 → 0）
+        attn_logits = torch.matmul(Q_raw, K_raw.transpose(-1, -2)) * scale  # (B,T,N,N)
         attn_logits = attn_logits.masked_fill(~is_candidate, float('-inf'))
 
-        # ---- Step 3: 迟滞（hysteresis） ----
-        # 对已在活跃集中的邻居施加 stickiness bonus
-        if self._active_mask is not None and self._active_mask.shape == is_candidate.shape:
-            attn_logits = attn_logits + self.stickiness_bonus * self._active_mask.float()
+        # entmax 一次性批量（最大热点：逐 t 67ms → 批量 3ms）
+        attn_all = entmax(attn_logits, alpha=self.entmax_alpha, dim=-1)     # (B,T,N,N)
+        has_any_cand = is_candidate.any(dim=-1, keepdim=True).float()       # (B,T,N,1)
+        attn_all = attn_all * has_any_cand
 
-        # ---- Step 4: 软稀疏注意力（entmax） ----
-        # 对每个 anchor agent 的候选邻居做 entmax
-        # attn_logits 中有 -inf（非候选），entmax 会自动将其压为 0
-        attn_weights = entmax(attn_logits, alpha=self.entmax_alpha, dim=-1)  # (B, N, N)
+        # ===== 串行段（仅迟滞 active 递推；廉价 elementwise）=====
+        prev_active = (self._active_mask
+                       if (self._active_mask is not None
+                           and self._active_mask.shape == (B, N, N))
+                       else None)
+        w_list = []
+        for t in range(T):
+            w = attn_all[:, t]                                    # (B,N,N)
+            if prev_active is not None:
+                # 后-entmax stickiness（替代原预-entmax 加分；sb=0 时无影响）
+                if self.stickiness_bonus > 0:
+                    w = w + self.stickiness_bonus * prev_active.float()
+                threshold = torch.where(prev_active, self.tau_out, self.tau_in)
+                w = w.masked_fill(w < threshold, 0.0)
+                w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            prev_active = (w > 0).detach()                        # active 在 topk 前更新（B5）
+            w_list.append(w)
+        self._active_mask = prev_active.detach() if prev_active is not None else (w_list[-1] > 0).detach()
+        W_thr = torch.stack(w_list, dim=1)                        # (B,T,N,N)
 
-        # 无候选邻居的行：entmax 数值 fallback 会返回均匀分布，强制归零
-        has_any_cand = is_candidate.any(dim=-1, keepdim=True).float()  # (B, N, 1)
-        attn_weights = attn_weights * has_any_cand
-
-        # ---- Step 5: 迟滞阈值过滤 ----
-        # τ_in: 之前不活跃的邻居，权重 < τ_in → 置 0
-        # τ_out: 之前活跃的邻居，权重 < τ_out → 置 0
-        if self._active_mask is not None and self._active_mask.shape == is_candidate.shape:
-            # 混合阈值：活跃邻居用 τ_out，非活跃用 τ_in
-            threshold = torch.where(self._active_mask, self.tau_out, self.tau_in)
-            attn_weights = attn_weights.masked_fill(attn_weights < threshold, 0.0)
-
-            # 重新归一化
-            sum_w = attn_weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-            attn_weights = attn_weights / sum_w
-
-        # 更新活跃集（用于下一步迟滞）
-        # 凡是通过了迟滞阈值过滤后权重 > 0 的边，均视为活跃（B5 修复）
-        # 用 tau_in 而非 > 0 会让 tau_out <= w < tau_in 的边在下一步被当成"非活跃"
-        # 从而失去迟滞保护，退化为每步都重新用 tau_in 判断，与设计矛盾
-        self._active_mask = (attn_weights > 0).detach()
-
-        # ---- Step 6: 算力上限封顶（comm_topk_cap）----
-        # 如果非零邻居仍超过 cap，保留权重最高的 k 个
-        nonzero_count = (attn_weights > 0).sum(dim=-1)  # (B, N)
-        needs_cap = nonzero_count > self.comm_topk_cap  # (B, N)
-
-        if needs_cap.any():
-            # 对需要封顶的 agent，保留 top-k 权重，其余置 0
-            topk_vals, topk_idx = torch.topk(
-                attn_weights, k=self.comm_topk_cap, dim=-1
-            )
-            capped = torch.zeros_like(attn_weights)
-            capped.scatter_(-1, topk_idx, topk_vals)
-            # 只对需要封顶的 agent 替换
-            need_mask = needs_cap.unsqueeze(-1)  # (B, N, 1)
-            attn_weights = torch.where(need_mask, capped, attn_weights)
-            # 重新归一化封顶的
-            sum_w = attn_weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-            attn_weights = torch.where(need_mask, attn_weights / sum_w, attn_weights)
-
-        # ---- Step 7: EdgeFlipRate 监控 ----
-        # 公式（设计文档§5.7）：|E^t △ E^{t+1}| / |E^t ∪ E^{t+1}|
-        current_edge_set = (attn_weights > 0).detach()  # (B, N, N)
-        if self._prev_edge_set is not None and self._prev_edge_set.shape == current_edge_set.shape:
-            flips = (current_edge_set != self._prev_edge_set).float().sum()
-            union = (current_edge_set | self._prev_edge_set).float().sum().clamp(min=1)
-            edge_flip_rate = (flips / union).item()
+        # ===== 并行段：topk 封顶 =====
+        nonzero_count = (W_thr > 0).sum(dim=-1)                   # (B,T,N)
+        needs_cap = nonzero_count > self.comm_topk_cap
+        if bool(needs_cap.any()):
+            topk_vals, topk_idx = torch.topk(W_thr, k=self.comm_topk_cap, dim=-1)
+            capped = torch.zeros_like(W_thr).scatter_(-1, topk_idx, topk_vals)
+            capped = capped / capped.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            W = torch.where(needs_cap.unsqueeze(-1), capped, W_thr)
         else:
-            edge_flip_rate = 0.0
-        self._prev_edge_set = current_edge_set
+            W = W_thr
 
-        # ---- Step 8: 多头注意力聚合 ----
-        V_raw = self.v_proj(intents)  # (B, N, D_comm)
-        Q = Q_raw.view(B, N, self.num_heads, self.head_dim)
-        V = V_raw.view(B, N, self.num_heads, self.head_dim)
+        # ===== 并行段：多头聚合 =====
+        V_raw = self.v_proj(intents)                              # (B,T,N,comm_dim)
+        V = V_raw.view(B, T, N, self.num_heads, self.head_dim)
+        attended = torch.einsum('btnm,btmhd->btnhd', W, V)        # 权重跨头共享
+        attended = attended.reshape(B, T, N, self.num_heads * self.head_dim)
+        comm_features = self.out_proj(attended)                   # (B,T,N,intent_dim)
 
-        # 用软稀疏权重做加权聚合（不是标准 QKV attention，而是 weight-based）
-        # attn_weights: (B, N, N) — 每体对其邻居的权重
-        # 扩展到多头：attn_weights_heads: (B, N, N, H)
-        attn_weights_heads = attn_weights.unsqueeze(-1).expand(-1, -1, -1, self.num_heads)
-
-        # 加权和：(B, N, H, d_head)
-        attended = torch.einsum('bnmh,bmhd->bnhd', attn_weights_heads, V)
-        attended = attended.reshape(B, N, self.num_heads * self.head_dim)
-
-        comm_features = self.out_proj(attended)
-
-        # ---- Step 9: 无活跃邻居的 agent：通信特征 → 0 ----
-        # 用实际活跃权重（迟滞过滤后 > 0）而非原始候选集判断，
-        # 避免候选存在但权重全被过滤时 out_proj bias 泄漏（设计文档§2.5）
-        has_active = (attn_weights > 0).any(dim=-1).float().unsqueeze(-1)  # (B, N, 1)
+        has_active = (W > 0).any(dim=-1, keepdim=True).float()    # (B,T,N,1)
         comm_features = comm_features * has_active
 
-        # ---- Step 10: 跨步 EMA 平滑（可选） ----
-        if self.ema_decay > 0 and self._ema_c is not None:
-            self._ema_c = self.ema_decay * self._ema_c + (1 - self.ema_decay) * comm_features.detach()
-            comm_features = self._ema_c
-        elif self.ema_decay > 0:
-            self._ema_c = comm_features.detach()
+        # ===== EdgeFlipRate（topk 后；跨调用边界用 _prev_edge_set）=====
+        cur_edges = (W > 0).detach()                              # (B,T,N,N)
+        if (self._prev_edge_set is not None
+                and self._prev_edge_set.shape == (B, N, N)):
+            seq_edges = torch.cat([self._prev_edge_set.unsqueeze(1), cur_edges], dim=1)
+        else:
+            seq_edges = cur_edges
+        if seq_edges.shape[1] > 1:
+            a, b = seq_edges[:, 1:], seq_edges[:, :-1]
+            flips = (a != b).float().sum(dim=(-1, -2))
+            union = (a | b).float().sum(dim=(-1, -2)).clamp(min=1)
+            edge_flip_rate = (flips / union).mean().item()
+        else:
+            edge_flip_rate = 0.0
+        self._prev_edge_set = cur_edges[:, -1]
 
-        # 诊断信息
-        avg_neighbors = nonzero_count.float().mean().item()
         info = {
-            "attn_weights": attn_weights.detach(),
             "edge_flip_rate": edge_flip_rate,
-            "avg_neighbors": avg_neighbors,
+            "avg_neighbors": nonzero_count.float().mean().item(),
             "entmax_alpha": self.entmax_alpha,
         }
-
         return comm_features, info

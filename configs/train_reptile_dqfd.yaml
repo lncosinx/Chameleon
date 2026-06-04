@@ -56,16 +56,21 @@ debug: false             # true 时启用 Profiler，每 profile_interval 个 me
 profile_interval: 200   # profiler 报告频率（debug=true 时生效）
 
 # 并行（目标硬件 2×RTX 5090 + 47 核 CPU）
-# 已实现并被代码读取：task_parallel_gpus、tasks_per_gpu。
-# ⚠️ 其余键当前【未接线】（代码 0 引用）——env-worker 多进程采样(T5.2)、AMP、
-#    torch.compile/CUDA graphs 尚未实现。设为 true 不会启用任何优化，性能预期
-#    勿据此估算（见设计文档 §4.2/§4.3）。接线后再移除 [未实现] 标注。
+# [已实现]：task_parallel_gpus、tasks_per_gpu、use_amp、use_torch_compile。
+# [未实现]：env-worker 多进程自游走采样子系统（T5.2，§4.5）——num_env_workers /
+#          num_lacam_workers / start_method / shared_buffer_dtype。当前阶段二 selfplay
+#          buffer 未填充，这些键暂不生效；接线后移除标注。
 parallel:
   task_parallel_gpus: [0, 1]   # [已实现] 双卡 task-并行 Reptile
   tasks_per_gpu: 2             # [已实现] 每卡串行 inner loop 数；总 task = len(gpus)*tasks_per_gpu
+  # 实测(B=32,N=96,RTX5090)：AMP 让纯前向+反向 573→513ms(~10%)+省激活显存 → 默认开。
+  # torch.compile 只编 patch_encoder（仅占前向+反向 66/573≈11%），且 +~20s 启动 +
+  # 与 Reptile 每轮 load_state_dict 的 CUDA-graph 脆弱性，端到端无可测收益 → 默认关。
+  # 真正的瓶颈在 ① 逐 t 通信 Python 循环(顺序、launch 多) ② Reptile 每轮
+  # load_state_dict/deepcopy/CPU 传输(~22%)；要提速应优先向量化通信循环（§4.3），非精度/编译。
+  use_amp: true                # [已实现] AMP 混合精度（autocast+GradScaler；entmax/mellowmax 内部 fp32；CPU 自动停用）
+  use_torch_compile: false     # [已实现，默认关] torch.compile patch_encoder（reduce-overhead→default→eager 回退）；编码瓶颈时再开
   num_env_workers: 40          # [未实现] CPU 多进程 env/观测构建（spawn，不碰 CUDA）
   num_lacam_workers: 4         # [未实现] C++ 绑定，按需生成/介入
   start_method: spawn          # [未实现]
   shared_buffer_dtype: uint8   # [未实现] patch 共享内存 zero-copy
-  use_amp: false               # [未实现] AMP 混合精度（接线后改 true）
-  use_torch_compile: false     # [未实现] torch.compile + CUDA graphs（接线后改 true）

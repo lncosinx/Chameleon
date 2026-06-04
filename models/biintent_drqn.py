@@ -62,6 +62,8 @@ class BiIntentGATDRQN(nn.Module):
         # Dueling Q
         dueling_hidden_dim: int = 256,
         num_actions: int = 5,
+        # 性能（§4.2）
+        use_torch_compile: bool = False,
     ):
         super().__init__()
 
@@ -73,6 +75,13 @@ class BiIntentGATDRQN(nn.Module):
             cnn_channels=cnn_channels,
             d_patch=d_patch,
         )
+
+        # torch.compile：只编译 patch encoder（B·T·N 次 CNN 前向是最大算力热点，
+        # 且无状态、形状固定 → 编译友好）。不编译整网，因通信模块带跨步可变迟滞
+        # 状态 + 逐 t Python 循环，整网编译会 graph-break 或捕获错误状态（§4.2 风险说明）。
+        # reduce-overhead 启用 CUDA graphs 砍 launch 开销；失败则回退默认 mode，再回退 eager。
+        if use_torch_compile:
+            self.patch_encoder = self._try_compile(self.patch_encoder)
         self.scalar_encoder = ScalarEncoder(
             in_dim=scalar_feat_dim,
             d_scalar=d_scalar,
@@ -114,6 +123,21 @@ class BiIntentGATDRQN(nn.Module):
         # 缓存超参
         self.num_actions = num_actions
         self.gru_hidden_dim = gru_hidden_dim
+
+    @staticmethod
+    def _try_compile(module: nn.Module) -> nn.Module:
+        """尝试 torch.compile（reduce-overhead→default→eager 逐级回退），不让编译失败中断训练。"""
+        if not hasattr(torch, "compile"):
+            return module
+        for mode in ("reduce-overhead", "default"):
+            try:
+                compiled = torch.compile(module, mode=mode)
+                print(f"[torch.compile] patch_encoder compiled (mode={mode})")
+                return compiled
+            except Exception as e:  # noqa: BLE001
+                print(f"[torch.compile] mode={mode} failed ({type(e).__name__}); trying next")
+        print("[torch.compile] all modes failed; running eager")
+        return module
 
     def reset_comm_state(self):
         """
@@ -170,21 +194,11 @@ class BiIntentGATDRQN(nn.Module):
 
         fused = torch.cat([patch_feat, scalar_feat], dim=-1)  # (B, T, N, fused_dim)
 
-        # ---- 2. 通信（逐时间步，迟滞状态跨步持续） ----
+        # ---- 2. 通信（向量化整段；迟滞 active 递推内部串行，重活批量化）----
         intent = self.intent_proj(fused)  # (B, T, N, intent_dim)
-
-        comm_list = []
-        edge_flip_rates = []
-        avg_neighbors_list = []
-        for t in range(T):
-            intent_t = intent[:, t]        # (B, N, intent_dim)
-            pos_t = positions[:, t]        # (B, N, 2)
-            comm_t, comm_info = self.communication(intent_t, pos_t)
-            comm_list.append(comm_t)
-            edge_flip_rates.append(comm_info.get("edge_flip_rate", 0.0))
-            avg_neighbors_list.append(comm_info.get("avg_neighbors", 0.0))
-
-        comm_feat = torch.stack(comm_list, dim=1)  # (B, T, N, intent_dim)
+        comm_feat, comm_info = self.communication.forward_sequence(intent, positions)
+        edge_flip_rates = [comm_info.get("edge_flip_rate", 0.0)]
+        avg_neighbors_list = [comm_info.get("avg_neighbors", 0.0)]
 
         # ---- 3. GRU ----
         # 拼接 fused + comm → (B*N, T, gru_input_dim)
