@@ -20,18 +20,45 @@ grad_clip: 10.0        # 梯度范数裁剪（inner loop SGD）
 # 等权重会让 Q 值被 margin 目标主导而非 TD，导致专家退火后崩溃。
 # 推荐范围：0.1–0.5；配合 lambda_l2 加强来限制 Q 量级（见下方注释）。
 lambda_td: 1.0
-lambda_nstep: 1.0
-lambda_margin: 0.5    # 从 1.0 降至 0.5；初始化时 L_margin/L_TD ≈ 100x，等权重会让 margin 主导
+lambda_nstep: 0.5     # 1.0→0.5：n-step 是最大/最噪的 TD 项，诊断中它主导真实 loss 并淹没模仿。
+lambda_margin: 1.0    # 0.5→1.0：配合 td_losses 改 Huber（TD 梯度封顶），让模仿梯度能与 TD 竞争。
+                      # 原注释"λ_margin 需远小于 1.0"是按初始化调的；训练中 TD 量级反转暴涨、
+                      # margin 被淹没致 SR=0（maze/random 全 0、AR 随训练下降），见 memory phase2 诊断。
 lambda_l2: 0.0001     # 从 1e-5 提至 1e-4（DQfD 原论文值），限制 Q 量级防止爆炸
 margin: 0.5           # 间隔值 m；对 Q_max≈5~10 时意味着 5-10% 区分间隔，合理
 
+# reward 尺度：在 dqfd_sequence_loss 处对 reward 统一乘此系数（专家+自游走同处同系数）。
+# 根因修复——PBRS 让 Q≈BFS距离~15-30（unclipped），平方/线性 TD 损失随之暴涨、淹没 margin
+# （标准 DQfD 用 clipped reward、Q 有界）。reward 线性缩放 → Q→c·Q（策略不变、PBRS 保持），
+# 0.1 使 Q~1.5-3，则 margin(0.5)/TD/n-step 三项同量级，占比回归标准 DQfD。
+# 注：在 loss 处缩放（非改 env/重生成数据），专家.npz 旧尺度 reward 与自游走自动同标度。
+reward_scale: 0.3
+
 # 数值安全
-mellowmax_alpha: 1.0   # 先取 1.0，按 Q_max/Q_mean 在 {0.5,1,2} 中调
+mellowmax_alpha: 1.0   # 设计默认。诊断结论：α=2 仅均匀缩 loss ~10%、不改动力学（td 同样上爬），
+                       # α 不是 loss 攀升的杠杆，故还原 1.0。loss 高的真因是 n-step/1-step 目标
+                       # 结构性分歧（n-step 主导真实 loss），见 memory phase2 诊断。
 
 # 阶段二专家/自游走混合比例（课程式）
+# self-play 已接线（selfplay.enable=true 时 sp_buf 被 producer 填充）→ 恢复课程式衰减：
+# 早期专家为主（0.9），后期增自游走（0.5），让 OOD 脏状态的 Q 被 self-play TD 压回真值。
+# 注意：consumer 端 total = er·L_expert + (1-er)·L_selfplay（_inner_step），且 selfplay 关 margin。
 expert_ratio_start: 0.9
 expert_ratio_end: 0.5
 expert_ratio_decay_iters: 8000
+
+# 自游走（阶段二 off-policy，填充 sp_buf；见 trainers/selfplay_producer.py）
+selfplay:
+  enable: true
+  rollout_interval: 4        # 每隔 K 个 meta-iter 同步 θ_meta 后采一次（θ_meta 漂移极小→近当前策略）
+  n_env_per_family: 2        # 每族并行 env 数（4 族 → 每次 rollout 产 4×n_env 段）
+  num_agents: 96             # ★ 与专家数据对齐（专家 buffer 为 96 体）
+  map_size: 64               # ★ 与专家数据对齐
+  segment_len: 32            # = sequence_len，配合 burn_in_len=8 + n_step=5
+  obs_radius: 5              # K=2r+1=11，与 patch 一致
+  buffer_capacity_segments: 512   # sp_buf 容量（按段计；每段 ~十几 MB）
+  families: [random, warehouse, maze, room]
+  env_config_tpl: "configs/env_{fam}.yaml"
 
 # 地图采样概率（前期/中期/后期）
 map_schedule:
