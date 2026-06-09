@@ -103,3 +103,27 @@ def collate_samples_to_tensors(
         out = {k: v.to(device, non_blocking=pin_memory) for k, v in out.items()}
 
     return out
+
+
+# 多体自游走段的列式键（与 envs/env_worker.VecEnvManager._build_seg 产出一致）
+_SELFPLAY_SEG_KEYS = [
+    "obs_patches", "obs_scalars", "positions",
+    "next_obs_patches", "next_obs_scalars", "next_positions",
+    "actions_expert", "rewards", "dones", "valid",
+    "action_masks", "next_action_masks", "margin_excluded", "margin_weights",
+]
+
+
+def collate_selfplay_segments(segments: List[dict]) -> Dict[str, np.ndarray]:
+    """将多个多体自游走段 (T, N, ...) 堆叠成 (B, T, N, ...) 的 batch。
+
+    段来自 VecEnvManager._build_seg，键与专家 batch 同构（含 positions / actions_expert /
+    margin 已置零），可直接喂 _inner_step → dqfd_sequence_loss（selfplay 处关 margin）。
+    返回 numpy（留在 CPU，由 _inner_step 负责搬设备）。
+    """
+    if not segments:
+        return {}
+    out: Dict[str, np.ndarray] = {}
+    for k in _SELFPLAY_SEG_KEYS:
+        out[k] = np.stack([np.asarray(s[k]) for s in segments], axis=0)
+    return out
