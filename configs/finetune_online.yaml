@@ -33,9 +33,12 @@ expert_decay_steps: 4000    # 退火 segment 数（配 --num-segments 5000）
 lambda_margin_start: 1.0    # 初期 margin loss 权重
 lambda_margin_end: 0.0      # 末期归零，退化为纯近 on-policy Q 学习
 
-# --- 硬件分工（阶段三无 task 并行，见设计文档 §4.5）---
-# ⚠️ 以下为占位符，多进程 env-worker（T5.2）尚未实现，当前代码不读取这些键。
-num_parallel_envs: 64        # [未实现] 并行 env 数
-learner_gpu: 0               # [未实现] GPU0 = learner（训练）
-actor_gpu: 1                 # [未实现] GPU1 = batched 推理 actor
-num_env_workers: 40          # [未实现] 并行 env（同步段采样，lag≤1）
+# --- 硬件分工（阶段三无 task 并行，见设计文档 §4.5 / SEED-RL 同步批量 actor）---
+# ✅ 已实现：scripts/finetune_target_map.py --num-envs >0 启用同步批量并行采样
+#   （envs/env_worker.py 的 N_env CPU worker + trainers/seed_actor.py 批量推理 actor）。
+#   并行参数当前由 CLI 显式传入（--num-envs / --learner-gpu / --actor-gpu），
+#   以下键作为推荐默认值留档；如需改为读 config，在 run_parallel 中接入。
+num_parallel_envs: 64        # 建议并行 env 数（CLI: --num-envs）
+learner_gpu: 0               # GPU0 = learner 训练（CLI: --learner-gpu）
+actor_gpu: 1                 # GPU1 = batched 推理 actor（CLI: --actor-gpu）
+num_env_workers: 40          # 每 env 一个 CPU worker（同步段采样，lag≤1）
