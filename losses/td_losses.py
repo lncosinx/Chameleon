@@ -10,10 +10,20 @@ import torch
 import torch.nn.functional as F
 
 
-def _weighted_mse(pred: torch.Tensor, target: torch.Tensor,
-                  weights: torch.Tensor = None) -> torch.Tensor:
-    """加权 MSE：weights=None 时退化为普通 mean。weights 为 0/1 时屏蔽无效样本。"""
-    se = (pred - target) ** 2
+def _weighted_td_loss(pred: torch.Tensor, target: torch.Tensor,
+                      weights: torch.Tensor = None,
+                      huber_beta: float = 1.0) -> torch.Tensor:
+    """加权 TD 损失。
+
+    用 Huber(smooth-L1, beta=1.0) 而非 MSE：诊断发现 Q 校准到 ~15-30 时，MSE 的
+    TD 梯度 ∝ 误差(~10) 会碾压 margin 梯度(∝λ_margin)，模仿信号被淹没 → 策略失效。
+    Huber 在 |误差|>beta 时梯度封顶 ±1，让 TD 不再压制模仿。beta<=0 时退化为 MSE。
+    weights=None 时普通 mean；weights 为 0/1 时屏蔽无效样本。
+    """
+    if huber_beta and huber_beta > 0:
+        se = F.smooth_l1_loss(pred, target, reduction="none", beta=huber_beta)
+    else:
+        se = (pred - target) ** 2
     if weights is None:
         return se.mean()
     weights = weights.to(se.dtype)
@@ -45,7 +55,7 @@ def one_step_td_loss(
     done_mask = (~dones.bool()).float() if dones.dtype == torch.bool else (1.0 - dones)
     td_target = rewards + gamma * done_mask * v_target  # (...,)
 
-    return _weighted_mse(q_sa, td_target.detach(), weights)
+    return _weighted_td_loss(q_sa, td_target.detach(), weights)
 
 
 def n_step_td_loss(
@@ -124,4 +134,4 @@ def n_step_td_loss(
     td_target_n = (return_sum + v_term).detach()
 
     q_sa = q_values.gather(dim=-1, index=actions.unsqueeze(-1)).squeeze(-1)
-    return _weighted_mse(q_sa, td_target_n, weights)
+    return _weighted_td_loss(q_sa, td_target_n, weights)
