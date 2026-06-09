@@ -36,6 +36,11 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="checkpoints/finetuned.pt")
+    # —— SEED-RL 并行采样（同步批量 actor）；num-envs=0 走原单进程串行路径 ——
+    parser.add_argument("--num-envs", type=int, default=0,
+                        help="CPU env-worker 数（>0 启用同步批量并行采样）")
+    parser.add_argument("--learner-gpu", type=int, default=0, help="learner 训练 GPU")
+    parser.add_argument("--actor-gpu", type=int, default=1, help="批量推理 actor GPU")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -47,26 +52,12 @@ def main():
         net_cfg = yaml.safe_load(f)
 
     # 网络
-    net = BiIntentGATDRQN(
-        patch_channels=net_cfg.get("patch_channels", 4),
-        cnn_channels=net_cfg.get("cnn_channels", [32, 64, 64]),
-        d_patch=net_cfg.get("d_patch", 256),  # 与 train_meta 默认一致，防 ckpt 维度不匹配
-        scalar_feat_dim=net_cfg.get("scalar_feat_dim", 8),
-        d_scalar=net_cfg.get("d_scalar", 32),
-        intent_dim=net_cfg.get("intent_dim", 64),
-        comm_dim=net_cfg.get("comm_dim", 64),
-        comm_radius=net_cfg.get("comm_radius", 4),
-        comm_topk_cap=net_cfg.get("comm_topk_cap", 6),
-        num_attention_heads=net_cfg.get("num_attention_heads", 4),
-        entmax_alpha=net_cfg.get("entmax_alpha", 1.5),
-        tau_in=net_cfg.get("tau_in", 0.05),
-        tau_out=net_cfg.get("tau_out", 0.02),
-        stickiness_bonus=net_cfg.get("stickiness_bonus", 0.1),
-        ema_decay=net_cfg.get("ema_decay", 0.0),
-        gru_hidden_dim=net_cfg.get("gru_hidden_dim", 256),
-        dueling_hidden_dim=net_cfg.get("dueling_hidden_dim", 256),
-        use_torch_compile=bool(cfg.get("use_torch_compile", False)),
-    )
+    net = _build_net(net_cfg, cfg)
+
+    # —— SEED-RL 并行采样路径（同步批量 actor）——
+    if args.num_envs > 0:
+        run_parallel(args, cfg, net_cfg, net)
+        return
 
     trainer = FinetuneOnlineTrainer(net, cfg, device=device)
     trainer.load_meta_checkpoint(args.init)
@@ -119,6 +110,107 @@ def main():
                       f"margin_lambda={metrics.get('lambda_margin', 0):.3f}")
 
     save_checkpoint(trainer.state_dict(), args.output, "finetuned")
+    print(f"Checkpoint saved to {args.output}")
+
+
+def _build_net(net_cfg, cfg):
+    """按配置构建 BiIntentGATDRQN（learner / actor 共用，保证维度一致）。"""
+    return BiIntentGATDRQN(
+        patch_channels=net_cfg.get("patch_channels", 4),
+        cnn_channels=net_cfg.get("cnn_channels", [32, 64, 64]),
+        d_patch=net_cfg.get("d_patch", 256),  # 与 train_meta 默认一致，防 ckpt 维度不匹配
+        scalar_feat_dim=net_cfg.get("scalar_feat_dim", 8),
+        d_scalar=net_cfg.get("d_scalar", 32),
+        intent_dim=net_cfg.get("intent_dim", 64),
+        comm_dim=net_cfg.get("comm_dim", 64),
+        comm_radius=net_cfg.get("comm_radius", 4),
+        comm_topk_cap=net_cfg.get("comm_topk_cap", 6),
+        num_attention_heads=net_cfg.get("num_attention_heads", 4),
+        entmax_alpha=net_cfg.get("entmax_alpha", 1.5),
+        tau_in=net_cfg.get("tau_in", 0.05),
+        tau_out=net_cfg.get("tau_out", 0.02),
+        stickiness_bonus=net_cfg.get("stickiness_bonus", 0.1),
+        ema_decay=net_cfg.get("ema_decay", 0.0),
+        gru_hidden_dim=net_cfg.get("gru_hidden_dim", 256),
+        dueling_hidden_dim=net_cfg.get("dueling_hidden_dim", 256),
+        use_torch_compile=bool(cfg.get("use_torch_compile", False)),
+    )
+
+
+def run_parallel(args, cfg, net_cfg, net):
+    """
+    SEED-RL 同步批量采样训练循环（§4.5）：
+      learner(GPU0) + 批量推理 actor(GPU1) + N_env 个 CPU env-worker。
+
+    每次迭代为同质（按 expert_prob 整迭代选 专家 / 自游走），自游走走 lockstep 批量
+    前向，专家由各 worker 自主跑 LaCAM。每迭代产 N_env 段，统一打 train_step 版本标，
+    train_on_segment 后 sync 权重到 actor（lag≤1，INVARIANT 9）。
+    """
+    from trainers.seed_actor import SeedActor
+    from envs.env_worker import VecEnvManager
+    from utils.checkpoint import save_checkpoint as _save
+
+    learner_device = torch.device(f"cuda:{args.learner_gpu}"
+                                  if torch.cuda.is_available() else "cpu")
+    actor_device = torch.device(f"cuda:{args.actor_gpu}"
+                                if torch.cuda.device_count() > args.actor_gpu else learner_device)
+
+    # learner
+    trainer = FinetuneOnlineTrainer(net, cfg, device=learner_device)
+    trainer.load_meta_checkpoint(args.init)
+
+    # actor（冻结副本，独立 GPU；权重每步从 learner sync）
+    actor_net = _build_net(net_cfg, cfg)
+    actor = SeedActor(actor_net, actor_device, use_amp=bool(cfg.get("use_amp", False)))
+    actor.load_weights(trainer.net.state_dict())
+
+    obs_radius = net_cfg.get("obs_radius", 5)
+    worker_cfg = {
+        "env_config": args.env,
+        "map_size": args.map_size,
+        "lambda_f": (cfg.get("reward", {}) or {}).get("lambda_f", 0.1),
+    }
+    manager = VecEnvManager(
+        n_env=args.num_envs, num_agents=args.num_agents,
+        segment_len=trainer.rollout_segment_len, obs_radius=obs_radius,
+        worker_cfg=worker_cfg,
+    )
+
+    print(f"[SEED-RL] parallel finetune | envs={args.num_envs} | "
+          f"learner={learner_device} actor={actor_device} | "
+          f"agents={args.num_agents} | iters={args.num_segments}")
+
+    rng = np.random.default_rng(args.seed)
+    try:
+        for it in range(args.num_segments):
+            seeds = [args.seed * 1_000_003 + it * args.num_envs + slot
+                     for slot in range(args.num_envs)]
+
+            if rng.random() < trainer.expert_prob():
+                segs = manager.rollout_expert(seeds)
+            else:
+                segs = manager.rollout_selfplay(actor, seeds)
+
+            added = 0
+            for seg in segs:
+                if seg is not None:
+                    trainer.add_rollout_samples(seg, trainer.train_step)
+                    added += 1
+
+            metrics = trainer.train_on_segment()
+            # 同步权重到 actor（lag≤1）
+            actor.load_weights(trainer.net.state_dict())
+
+            if (it + 1) % 10 == 0:
+                print(f"  iter {it+1}/{args.num_segments}: segs+={added} "
+                      f"loss={metrics.get('loss_total', 0):.4f} "
+                      f"expert_p={metrics.get('expert_prob', 0):.2f} "
+                      f"margin_lambda={metrics.get('lambda_margin', 0):.3f} "
+                      f"buf={metrics.get('buffer_size', 0)}")
+    finally:
+        manager.close()
+
+    _save(trainer.state_dict(), args.output, "finetuned")
     print(f"Checkpoint saved to {args.output}")
 
 
