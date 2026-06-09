@@ -29,6 +29,7 @@ Thumbs.db
 checkpoints/
 logs/
 data/
+data_test/
 
 # Project — C++ build artifacts
 lacam/build/
