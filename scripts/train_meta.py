@@ -66,12 +66,34 @@ def main():
                         help="每 N 个 meta-iter 原子写一次 checkpoints/meta_latest.pt（断点续跑用）")
     parser.add_argument("--resume",         type=str, default="none",
                         help="'none'=从头训；'auto'=若有 checkpoints/meta_latest.pt 则续；或指定 ckpt 路径")
+    parser.add_argument("--ckpt-milestones", type=str, default="",
+                        help="逗号分隔的 meta-iter 里程碑，在这些点另存 checkpoints/meta_iter_{N}.pt（SR-vs-iters 曲线用）")
+    parser.add_argument("--no-selfplay", action="store_true",
+                        help="强制关闭自游走（隔离测 DQfD 核心；覆盖 config 的 selfplay.enable）")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VAL",
+                        help="覆盖 config 顶层键（可多次，值经 yaml 解析），用于实验不污染 config。"
+                             "如 --set lambda_td=0 --set inner_lr=0.003")
+    parser.add_argument("--bc-iters", type=int, default=0,
+                        help="两阶段：前 N 个 meta-iter 纯 BC（强制 lambda_td=lambda_nstep=0，"
+                             "只学专家 margin 排序），之后恢复全 λ 做 DQfD 价值 grounding。0=关闭。")
     args = parser.parse_args()
+    milestones = {int(x) for x in args.ckpt_milestones.split(",") if x.strip()}
 
     set_seed(args.seed)
 
     with open(args.config)         as f: cfg     = yaml.safe_load(f)
     with open(args.network_config) as f: net_cfg = yaml.safe_load(f)
+    if args.no_selfplay:
+        cfg.setdefault("selfplay", {})["enable"] = False
+    for kv in args.set:
+        k, _, v = kv.partition("=")
+        val = yaml.safe_load(v)
+        keys = k.strip().split(".")          # 支持嵌套键，如 selfplay.families
+        d = cfg
+        for kk in keys[:-1]:
+            d = d.setdefault(kk, {})
+        d[keys[-1]] = val
+        print(f"[override] {k.strip()} = {val}")
 
     # ---- 确定使用哪些 GPU ----
     n_cuda = torch.cuda.device_count()
@@ -138,7 +160,11 @@ def main():
     print(f"Expert buffer: {len(expert_buf):,} timesteps × {expert_buf.num_agents} agents "
           f"({expert_buf.num_episodes} episodes)")
 
-    sp_buf = SelfPlayBuffer(capacity=500_000)
+    # 自游走段是 (T,N,...) 大对象（每段 ~十几 MB），容量按「段数」计，
+    # 勿沿用单步样本的 500k（会占 TB 级内存）。
+    sp_buf = SelfPlayBuffer(
+        capacity=cfg.get("selfplay", {}).get("buffer_capacity_segments", 512)
+    )
 
     # ---- 构建训练器 ----
     _use_compile = bool(cfg.get("parallel", {}).get("use_torch_compile", False))
@@ -152,6 +178,17 @@ def main():
     else:
         trainer = ReptileDQfDTrainer(net, cfg, device=devices[0])
         print(f"Trainer: ReptileDQfDTrainer     (single device: {devices[0]})")
+
+    # ---- 自游走 producer（阶段二 off-policy 自游走，填充 sp_buf；enable=False 时全 no-op）----
+    from trainers.selfplay_producer import SelfPlayProducer
+    sp_producer = SelfPlayProducer(net, cfg, sp_buf, device=devices[0])
+    if sp_producer.enabled:
+        print(f"SelfPlay: ON | families={sp_producer.families} | "
+              f"{sp_producer.n_env}env/family × {sp_producer.num_agents}agents "
+              f"@size{sp_producer.map_size} | rollout every {sp_producer.K} meta-iters "
+              f"| buffer cap={sp_buf._buffer.maxlen} segs")
+    else:
+        print("SelfPlay: OFF (selfplay.enable=false)")
 
     # ---- 断点续跑 ----
     os.makedirs("checkpoints", exist_ok=True)
@@ -172,11 +209,35 @@ def main():
         save_checkpoint(state, path + ".tmp", "meta")
         os.replace(path + ".tmp", path)
 
+    # ---- 两阶段（--bc-iters）：前 N iter 纯 BC（lambda_td=lambda_nstep=0），之后恢复全 λ ----
+    # 设在 trainer（DualGPU 则各 sub_trainer）的 lambda_td/lambda_nstep 上，_inner_step 即时生效。
+    _cfg_lam_td = cfg.get("lambda_td", 1.0)
+    _cfg_lam_n  = cfg.get("lambda_nstep", 1.0)
+    def _set_td_lambdas(lam_td, lam_n):
+        for t in (getattr(trainer, "sub_trainers", None) or [trainer]):
+            t.lambda_td = lam_td
+            t.lambda_nstep = lam_n
+
     # ---- 训练循环（按 trainer.meta_iter 驱动，支持续跑）----
     start_iter = trainer.meta_iter
-    print(f"\nStarting training: {start_iter} → {args.meta_iters} meta-iterations\n")
+    print(f"\nStarting training: {start_iter} → {args.meta_iters} meta-iterations"
+          + (f"  (BC pretrain 前 {args.bc_iters} iter)" if args.bc_iters > 0 else "") + "\n")
+    _prev_bc = None
     for i in range(start_iter, args.meta_iters):
+        in_bc = i < args.bc_iters
+        if in_bc != _prev_bc:
+            _set_td_lambdas(0.0, 0.0) if in_bc else _set_td_lambdas(_cfg_lam_td, _cfg_lam_n)
+            print(f"  [phase] {'BC (margin only)' if in_bc else 'DQfD (full λ, +TD)'} @ iter {i}", flush=True)
+            _prev_bc = in_bc
         metrics = trainer.meta_step(expert_buf, sp_buf, env_factory=None)
+
+        # 自游走：每隔 K 个 meta-iter 用**当前** θ_meta 采四族段填 sp_buf（producer 内部判 K）。
+        # BC 期 TD 关、自游走 TD-only loss 贡献为 0，跳过 rollout 省算力。
+        if not in_bc:
+            theta_meta = trainer._meta_state if hasattr(trainer, "_meta_state") else trainer.net.state_dict()
+            n_sp = sp_producer.maybe_rollout(i + 1, theta_meta)
+            if n_sp > 0:
+                print(f"  [selfplay] +{n_sp} segs @ iter {i+1} (sp_buf={len(sp_buf)})", flush=True)
 
         if (i + 1) % args.log_interval == 0:
             # 兼容单/双 GPU 返回的 map_type vs map_types
@@ -184,8 +245,18 @@ def main():
             mt_str = "+".join(mt) if isinstance(mt, list) else str(mt)
             n_tasks = metrics.get("num_tasks", metrics.get("num_gpus", 1))
             meta_lr = metrics.get("meta_lr", cfg.get("meta_lr_start", 0.0))
+            # loss 分量（加权贡献，应约等于 loss_total）。BC 期 td/n 的有效 λ=0，显示按有效值。
+            _lt = 0.0 if in_bc else cfg.get("lambda_td", 1.0)
+            _ln = 0.0 if in_bc else cfg.get("lambda_nstep", 1.0)
+            w_td  = _lt * metrics.get("loss_td", 0.0)
+            w_n   = _ln * metrics.get("loss_nstep", 0.0)
+            w_mgn = cfg.get("lambda_margin", 0.5) * metrics.get("loss_margin", 0.0)
+            w_l2  = cfg.get("lambda_l2", 1e-4)    * metrics.get("l2_reg", 0.0)
             print(f"  iter {i+1:>6}/{args.meta_iters}: "
                   f"loss={metrics['inner_loss_mean']:.4f}  "
+                  f"Qmax={metrics.get('q_max', 0.0):.2f}  "
+                  f"Qmean={metrics.get('q_mean', 0.0):.2f}  "
+                  f"[td={w_td:.2f} n={w_n:.2f} mgn={w_mgn:.2f} l2={w_l2:.2f}]  "
                   f"map={mt_str:<20}  "
                   f"er={metrics['expert_ratio']:.2f}  "
                   f"tasks={n_tasks}  meta_lr={meta_lr:.5f}", flush=True)
@@ -195,10 +266,19 @@ def main():
             _atomic_save(trainer.state_dict(), latest_path)
             print(f"  [ckpt] meta_latest.pt @ iter {i+1}", flush=True)
 
+        # 里程碑编号存档（SR-vs-iters 曲线评估用，不被覆盖）
+        if (i + 1) in milestones:
+            mpath = f"checkpoints/meta_iter_{i+1}.pt"
+            save_checkpoint(trainer.state_dict(), mpath, "meta")
+            print(f"  [ckpt] {mpath} @ iter {i+1}", flush=True)
+
     # ---- 保存最终 checkpoint ----
     save_checkpoint(trainer.state_dict(), "checkpoints/meta_init.pt", "meta")
     _atomic_save(trainer.state_dict(), latest_path)
     print("\nCheckpoint saved to checkpoints/meta_init.pt")
+
+    # 清理自游走 worker 进程（spawn 的 CPU 池）
+    sp_producer.close()
 
 
 if __name__ == "__main__":
