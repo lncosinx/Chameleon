@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from losses.q_target import masked_mellowmax
+from losses.q_target import masked_mellowmax, masked_double_q_target
 from losses.td_losses import one_step_td_loss, n_step_td_loss
 
 
@@ -89,6 +89,7 @@ def dqfd_total_loss(
     dones: torch.Tensor,               # (B, N) bool
     action_masks_next: torch.Tensor,   # (B, N, num_actions) s' 时刻合法动作掩码
     expert_actions: torch.Tensor,      # (B, N) long, 专家动作
+    online_q_next: torch.Tensor = None,  # (B, N, num_actions) 在线 Q(s',·)；给定则用 Double DQN target
     # n-step
     rewards_seq: torch.Tensor = None,  # (B, N, n)
     dones_seq: torch.Tensor = None,    # (B, N, n)
@@ -119,7 +120,11 @@ def dqfd_total_loss(
     info = {}
 
     # ---- 1-step TD ----
-    v_target = masked_mellowmax(target_q_next, action_masks_next, alpha=mellowmax_alpha)
+    # Double DQN（默认，抑制高估）：online 选 a*、target 评估；online_q_next=None 时回退 mellowmax。
+    if online_q_next is not None:
+        v_target = masked_double_q_target(online_q_next, target_q_next, action_masks_next)
+    else:
+        v_target = masked_mellowmax(target_q_next, action_masks_next, alpha=mellowmax_alpha)
     loss_td = one_step_td_loss(q_values, actions, rewards, dones, v_target, gamma,
                                weights=sample_weights)
     info["loss_td"] = loss_td.item()
@@ -163,5 +168,12 @@ def dqfd_total_loss(
         + lambda_l2 * l2_reg
     )
     info["loss_total"] = total.item()
+
+    # ---- Q 量级诊断（监控高估/发散，设计文档 §5 / line 607 要求）----
+    # q_values=在线 Q(s,·)；v_target=mellowmax 自举值。Q 无界上爬即为高估发散信号。
+    with torch.no_grad():
+        info["q_max"]        = q_values.max().item()
+        info["q_mean"]       = q_values.mean().item()
+        info["vtarget_mean"] = v_target.mean().item()
 
     return total, info

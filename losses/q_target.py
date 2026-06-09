@@ -46,6 +46,24 @@ def masked_mellowmax(
     return v_target
 
 
+def masked_double_q_target(
+    online_q_next: torch.Tensor,   # (..., num_actions) 在线网络 Q(s',·)，用于选 a*
+    target_q_next: torch.Tensor,   # (..., num_actions) target 网络 Q(s',·)，用于评估
+    action_masks: torch.Tensor,    # (..., num_actions) bool, True=合法
+) -> torch.Tensor:
+    """Double DQN target（替代 mellowmax 软聚合，抑制 max 高估）。
+
+    V(s') = Q_target(s', argmax_{a'} [Q_online(s',a') 掩码非法]).
+    online 选动作、target 评估，解耦选择/评估以削弱 hard-max 的系统性高估。
+    INVARIANT 7：非法动作 -inf 掩码后再 argmax，保证选出的是合法动作。
+    调用方负责 detach（本函数仅用于构造 target，通常在 no_grad 下）。
+    """
+    online_masked = online_q_next.float().masked_fill(~action_masks, float("-inf"))
+    a_star = online_masked.argmax(dim=-1, keepdim=True)         # (..., 1)
+    v = target_q_next.float().gather(-1, a_star).squeeze(-1)    # (...,)
+    return v
+
+
 def masked_mellowmax_target(
     online_q: torch.Tensor,        # (B, N, num_actions) 在线网络 Q(s,·)
     target_q: torch.Tensor,        # (B, N, num_actions) target 网络 Q(s',·)
