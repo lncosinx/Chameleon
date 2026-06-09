@@ -21,7 +21,7 @@ from copy import deepcopy
 
 from models.biintent_drqn import BiIntentGATDRQN
 from losses.dqfd_losses import dqfd_total_loss
-from losses.q_target import masked_mellowmax
+from losses.q_target import masked_mellowmax, masked_double_q_target
 from losses.td_losses import n_step_td_loss
 from trainers.scheduler import MapScheduler, expert_ratio
 from utils.checkpoint import save_checkpoint, load_checkpoint
@@ -58,6 +58,7 @@ def dqfd_sequence_loss(
     burn_in_len: int = 8,
     parameters: list = None,
     use_amp: bool = False,
+    reward_scale: float = 1.0,
 ):
     """
     共享的多体序列 DQfD 损失（阶段二 inner loop 与阶段三微调复用）。
@@ -91,6 +92,7 @@ def dqfd_sequence_loss(
             margin_excluded, margin_weights, expert_actions,
             gamma, n_step, mellowmax_alpha, margin,
             lambda_td, lambda_nstep, lambda_margin, lambda_l2, burn_in_len, parameters,
+            reward_scale,
         )
 
 
@@ -102,6 +104,7 @@ def _dqfd_sequence_loss_inner(
     margin_excluded, margin_weights, expert_actions,
     gamma, n_step, mellowmax_alpha, margin,
     lambda_td, lambda_nstep, lambda_margin, lambda_l2, burn_in_len, parameters,
+    reward_scale=1.0,
 ):
     """dqfd_sequence_loss 的计算体（已在 autocast 上下文内）。"""
     hidden = net.init_hidden(B, N, device)
@@ -126,6 +129,8 @@ def _dqfd_sequence_loss_inner(
     qt_bn     = _bn_t(q_target)
     act_bn    = _bn_t(actions)
     rew_bn    = _bn_t(rewards)
+    if reward_scale != 1.0:
+        rew_bn = rew_bn * reward_scale   # reward 降尺度（专家+自游走同处同系数）→ Q→c·Q，策略不变
     done_bn   = _bn_t(dones)
     valid_bn  = _bn_t(valid)
     mask_bn   = _bn_t(action_masks)
@@ -194,6 +199,10 @@ def _dqfd_sequence_loss_inner(
     else:
         loss_info["loss_nstep"] = 0.0
 
+    # loss_total 必须含 n-step（dqfd_total_loss 内以 lambda_nstep=0 计，n-step 在此单独累加）；
+    # 否则报告的 loss 漏掉主导项，严重误导对收敛/发散的判断。
+    loss_info["loss_total"] = total_loss.item()
+
     return total_loss, loss_info
 
 
@@ -235,6 +244,7 @@ class ReptileDQfDTrainer:
         self.lambda_nstep = config.get("lambda_nstep", 1.0)
         self.lambda_margin = config.get("lambda_margin", 1.0)
         self.lambda_l2 = config.get("lambda_l2", 1e-5)
+        self.reward_scale = config.get("reward_scale", 1.0)
         self.grad_clip = config.get("grad_clip", 10.0)
 
         # AMP（§4.2）：autocast 前向/loss + GradScaler。键可在顶层或 parallel 下。
@@ -311,6 +321,12 @@ class ReptileDQfDTrainer:
         inner_optimizer = torch.optim.Adam(self.net.parameters(), lr=self.inner_lr)
 
         inner_losses = []
+        q_max_vals = []
+        q_mean_vals = []
+        td_vals = []
+        nstep_vals = []
+        margin_vals = []
+        l2_vals = []
         for k in range(self.inner_steps):
             n_expert   = max(1, int(self.batch_size * exp_ratio_val))
             n_selfplay = self.batch_size - n_expert
@@ -335,26 +351,37 @@ class ReptileDQfDTrainer:
             selfplay_batch = None
             if selfplay_buffer is not None and len(selfplay_buffer) >= n_selfplay and n_selfplay > 0:
                 with ctx:
-                    sp_samples = selfplay_buffer.sample(n=n_selfplay, rng=rng)
-                if sp_samples:
-                    from buffers.batch_collator import collate_samples_to_tensors
-                    selfplay_batch = collate_samples_to_tensors(
-                        sp_samples, sequence_len=1,
-                        device=self.device, pin_memory=False,
-                    )
+                    sp_segs = selfplay_buffer.sample(n=n_selfplay, rng=rng)
+                if sp_segs:
+                    from buffers.batch_collator import collate_selfplay_segments
+                    selfplay_batch = collate_selfplay_segments(sp_segs)  # (B,T,N,...) numpy，_inner_step 搬设备
 
             if expert_batch is not None:
                 loss, info = self._inner_step(
                     expert_batch, target_net, inner_optimizer,
                     aux_batch=selfplay_batch,
+                    expert_weight=exp_ratio_val,
                 )
                 inner_losses.append(info.get("loss_total", 0.0))
+                q_max_vals.append(info.get("q_max", 0.0))
+                q_mean_vals.append(info.get("q_mean", 0.0))
+                td_vals.append(info.get("loss_td", 0.0))
+                nstep_vals.append(info.get("loss_nstep", 0.0))
+                margin_vals.append(info.get("loss_margin", 0.0))
+                l2_vals.append(info.get("l2_reg", 0.0))
 
         # 返回 θ_inner（CPU，避免 GPU 内存在跨线程传递时的 CUDA 上下文问题）
         theta_inner = {k: v.detach().cpu() for k, v in self.net.state_dict().items()}
+        _avg = lambda xs: float(np.mean(xs)) if xs else 0.0
         return {
             "theta_inner": theta_inner,
             "loss_mean": float(np.mean(inner_losses)) if inner_losses else 0.0,
+            "q_max": max(q_max_vals) if q_max_vals else 0.0,
+            "q_mean": _avg(q_mean_vals),
+            "loss_td": _avg(td_vals),
+            "loss_nstep": _avg(nstep_vals),
+            "loss_margin": _avg(margin_vals),
+            "l2_reg": _avg(l2_vals),
         }
 
     def meta_step(
@@ -411,6 +438,12 @@ class ReptileDQfDTrainer:
             "map_type":        map_type,
             "expert_ratio":    exp_ratio_val,
             "inner_loss_mean": result["loss_mean"],
+            "q_max":           result.get("q_max", 0.0),
+            "q_mean":          result.get("q_mean", 0.0),
+            "loss_td":         result.get("loss_td", 0.0),
+            "loss_nstep":      result.get("loss_nstep", 0.0),
+            "loss_margin":     result.get("loss_margin", 0.0),
+            "l2_reg":          result.get("l2_reg", 0.0),
         }
 
     def _inner_step(
@@ -418,7 +451,8 @@ class ReptileDQfDTrainer:
         batch: dict,
         target_net: BiIntentGATDRQN,
         optimizer: torch.optim.Optimizer,
-        aux_batch: dict = None,  # 自游走 batch（只做 TD loss，无 margin）
+        aux_batch: dict = None,      # 自游走段 batch（多体 (B,T,N,...)，走 dqfd_sequence_loss，关 margin）
+        expert_weight: float = 1.0,  # 课程式混合权重 er：total = er·L_expert + (1-er)·L_selfplay
     ) -> Tuple[torch.Tensor, dict]:
         """单步 inner loop SGD。"""
         self.net.train()
@@ -477,48 +511,47 @@ class ReptileDQfDTrainer:
             margin=self.margin, lambda_td=self.lambda_td, lambda_nstep=self.lambda_nstep,
             lambda_margin=self.lambda_margin, lambda_l2=self.lambda_l2,
             burn_in_len=self.burn_in_len, parameters=list(self.net.parameters()),
-            use_amp=self.use_amp,
+            use_amp=self.use_amp, reward_scale=self.reward_scale,
         )
 
-        # ---- 自游走 batch 补充 TD（课程式混合，无 margin）----
+        # ---- 自游走段：与专家同走 dqfd_sequence_loss，但关 margin（无专家监督）----
+        # 自游走的价值就是覆盖策略实际会漂到的 OOD 脏状态，让 1-step+n-step TD 把那里
+        # 被高估的 Q 压回真值（设计文档 §3.3.1 / line 397）。按 expert_ratio 课程混合。
         if aux_batch is not None:
-            try:
-                aux_obs   = _to_tensor(aux_batch["obs_patches"])
-                aux_sc    = _to_tensor(aux_batch["obs_scalars"])
-                aux_acts  = _to_tensor(aux_batch["actions"], dtype=torch.long)
-                aux_rews  = _to_tensor(aux_batch["rewards"])
-                aux_dones = _to_tensor(aux_batch["dones"], dtype=torch.bool)
-                _amask_np = aux_batch.get("action_masks")
-                aux_masks = (_to_tensor(_amask_np, dtype=torch.bool)
-                             if _amask_np is not None
-                             else torch.ones(*aux_acts.shape, 5, dtype=torch.bool, device=self.device))
+            sp_patches      = _patch_to_gpu(aux_batch["obs_patches"])
+            sp_scalars      = _to_tensor(aux_batch["obs_scalars"])
+            sp_positions    = _to_tensor(aux_batch["positions"])
+            sp_next_patches = _patch_to_gpu(aux_batch["next_obs_patches"])
+            sp_next_scalars = _to_tensor(aux_batch["next_obs_scalars"])
+            sp_next_pos     = _to_tensor(aux_batch["next_positions"])
+            sp_actions      = _to_tensor(aux_batch["actions_expert"], dtype=torch.long)
+            sp_rewards      = _to_tensor(aux_batch["rewards"])
+            sp_dones        = _to_tensor(aux_batch["dones"], dtype=torch.bool)
+            sp_valid        = _to_tensor(aux_batch["valid"], dtype=torch.bool)
+            sp_masks        = _to_tensor(aux_batch["action_masks"], dtype=torch.bool)
+            sp_next_masks   = _to_tensor(aux_batch["next_action_masks"], dtype=torch.bool)
 
-                B_sp = aux_obs.shape[0]
-                T_sp = aux_obs.shape[1] if aux_obs.dim() == 5 else 1
-                pos_sp = torch.zeros(B_sp, T_sp, 1, 2, device=self.device)
-                h_sp   = self.net.init_hidden(B_sp, 1, self.device)
-                h_t_sp = target_net.init_hidden(B_sp, 1, self.device)
-
-                # (B_sp, T_sp, 4, K, K) → unsqueeze N=1
-                obs_in = aux_obs.unsqueeze(-4) if aux_obs.dim() == 4 else aux_obs
-                sc_in  = aux_sc.unsqueeze(-3)  if aux_sc.dim()  == 3 else aux_sc
-
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-                    with torch.no_grad():
-                        q_t_sp, _, _ = target_net(obs_in, sc_in, pos_sp, h_t_sp)
-                    q_sp, _, _ = self.net(obs_in, sc_in, pos_sp, h_sp)
-                    mask_sp_flat = aux_masks.reshape(-1, 5)
-                    v_sp = masked_mellowmax(q_t_sp.reshape(-1, 5), mask_sp_flat,
-                                            alpha=self.mellowmax_alpha)
-                    from losses.td_losses import one_step_td_loss as _1step_loss
-                    sp_td_loss = _1step_loss(
-                        q_sp.reshape(-1, 5), aux_acts.reshape(-1),
-                        aux_rews.reshape(-1), aux_dones.reshape(-1), v_sp, self.gamma,
-                    )
-                total_loss = total_loss + self.lambda_td * sp_td_loss
-                loss_info["loss_sp_td"] = sp_td_loss.item()
-            except Exception:
-                pass  # 自游走 batch 格式不兼容时静默跳过
+            sp_loss, sp_info = dqfd_sequence_loss(
+                self.net, target_net,
+                obs_patches=sp_patches, obs_scalars=sp_scalars, positions=sp_positions,
+                next_obs_patches=sp_next_patches, next_obs_scalars=sp_next_scalars,
+                next_positions=sp_next_pos,
+                actions=sp_actions, rewards=sp_rewards, dones=sp_dones, valid=sp_valid,
+                action_masks=sp_masks, next_action_masks=sp_next_masks,
+                expert_actions=sp_actions,
+                gamma=self.gamma, n_step=self.n_step, mellowmax_alpha=self.mellowmax_alpha,
+                margin=self.margin, lambda_td=self.lambda_td, lambda_nstep=self.lambda_nstep,
+                lambda_margin=0.0,   # 自游走无专家动作监督，关 margin
+                lambda_l2=0.0,       # L2 已在专家项对 self.net 计入，勿重复
+                burn_in_len=self.burn_in_len, parameters=None,
+                use_amp=self.use_amp, reward_scale=self.reward_scale,
+            )
+            # 课程式混合：expert 项 ×er，selfplay 项 ×(1-er)
+            total_loss = expert_weight * total_loss + (1.0 - expert_weight) * sp_loss
+            loss_info["loss_sp"]       = sp_loss.item()
+            loss_info["loss_sp_td"]    = sp_info.get("loss_td", 0.0)
+            loss_info["loss_sp_nstep"] = sp_info.get("loss_nstep", 0.0)
+            loss_info["loss_total"]    = total_loss.item()
 
         # AMP：scaler.scale → backward → unscale → clip → step → update。
         # use_amp=False 时 GradScaler(enabled=False) 全为 no-op，与原路径等价。
@@ -794,12 +827,21 @@ class DualGPUReptileTrainer:
             print()
 
         loss_vals = [r["loss_mean"] for r in valid if r["loss_mean"] > 0]
+        q_max_vals  = [r.get("q_max", 0.0) for r in valid]
+        q_mean_vals = [r.get("q_mean", 0.0) for r in valid]
+        _avg = lambda key: float(np.mean([r.get(key, 0.0) for r in valid])) if valid else 0.0
 
         return {
             "meta_iter":       self.meta_iter,
             "map_types":       map_types,
             "expert_ratio":    exp_ratio_val,
             "inner_loss_mean": float(np.mean(loss_vals)) if loss_vals else 0.0,
+            "q_max":           max(q_max_vals) if q_max_vals else 0.0,
+            "q_mean":          float(np.mean(q_mean_vals)) if q_mean_vals else 0.0,
+            "loss_td":         _avg("loss_td"),
+            "loss_nstep":      _avg("loss_nstep"),
+            "loss_margin":     _avg("loss_margin"),
+            "l2_reg":          _avg("l2_reg"),
             "num_tasks":       len(valid),
             "meta_lr":         cur_meta_lr,
         }
