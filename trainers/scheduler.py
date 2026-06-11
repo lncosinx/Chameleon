@@ -62,8 +62,19 @@ class MapScheduler:
 
 def expert_ratio(cur_iter: int, total_iters: int,
                  start: float = 0.9, end: float = 0.5,
-                 decay_iters: int = 8000) -> float:
-    """课程式 expert/self-play 混合比例（线性衰减）。"""
-    if cur_iter >= decay_iters:
+                 decay_iters: int = 8000, bc_offset: int = 0) -> float:
+    """课程式 expert/self-play 混合比例（线性衰减）。
+
+    bc_offset: 两阶段 BC 预训练步数。BC 期（cur_iter < bc_offset）self-play rollout 被
+    跳过、sp_buf 为空，此时 er 必须 = 1.0：否则 n_expert=int(B·er)<B，剩下的 n_selfplay
+    个 batch 槽既无 self-play 数据填充、也不补给专家，等于白扔 (1-er) 比例的 batch
+    （er=0.9 时 BC 实际只在 28/32 序列上训）。故 BC 期返回 1.0（全 batch 给专家）。
+    iter=bc_offset 时 er 自然跌到 start（self-play 从 1-start 温和起步），随后在
+    [bc_offset, bc_offset+decay_iters] 上线性衰减到 end。
+    """
+    if cur_iter < bc_offset:
+        return 1.0
+    eff_iter = cur_iter - bc_offset
+    if eff_iter >= decay_iters:
         return end
-    return start - (start - end) * cur_iter / decay_iters
+    return start - (start - end) * eff_iter / decay_iters

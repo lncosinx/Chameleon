@@ -46,6 +46,37 @@ def masked_mellowmax(
     return v_target
 
 
+def masked_max(
+    q_values: torch.Tensor,        # (..., num_actions)
+    action_masks: torch.Tensor,    # (..., num_actions) bool, True=合法
+) -> torch.Tensor:
+    """标准 Q-learning bootstrap：V(s') = max_{a' 合法} Q(s',a')。
+
+    取贪婪动作的值（专家/最优动作，被 margin 顶上去的正值），不像 mellowmax 把
+    margin 压低的非专家动作平均进来 → 避免小 Q 时 V_target 被拖负、负向发散。
+    INVARIANT 7：非法动作 -inf 掩码后再 max。
+    """
+    safe_q = q_values.float().masked_fill(~action_masks, float("-inf"))
+    return safe_q.max(dim=-1).values
+
+
+def masked_clipped_double_q(
+    q_a: torch.Tensor,             # (..., num_actions) critic 头 A 的 Q(s',·)
+    q_b: torch.Tensor,             # (..., num_actions) critic 头 B 的 Q(s',·)
+    action_masks: torch.Tensor,    # (..., num_actions) bool, True=合法
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Clipped double-Q bootstrap（TD3 式，抑制 tail 过估）。
+
+    V(s') = min( mellowmax_a'(Q_A(s',a')), mellowmax_a'(Q_B(s',a')) ).
+    两个独立 critic 头各自 mellowmax 聚合后取 min → 系统性下偏，压住 tail 高估。
+    调用方负责 detach（通常在 no_grad 下构造 target）。
+    """
+    v_a = masked_mellowmax(q_a, action_masks, alpha=alpha)
+    v_b = masked_mellowmax(q_b, action_masks, alpha=alpha)
+    return torch.minimum(v_a, v_b)
+
+
 def masked_double_q_target(
     online_q_next: torch.Tensor,   # (..., num_actions) 在线网络 Q(s',·)，用于选 a*
     target_q_next: torch.Tensor,   # (..., num_actions) target 网络 Q(s',·)，用于评估

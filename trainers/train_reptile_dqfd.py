@@ -21,7 +21,7 @@ from copy import deepcopy
 
 from models.biintent_drqn import BiIntentGATDRQN
 from losses.dqfd_losses import dqfd_total_loss
-from losses.q_target import masked_mellowmax, masked_double_q_target
+from losses.q_target import masked_mellowmax, masked_double_q_target, masked_clipped_double_q, masked_max
 from losses.td_losses import n_step_td_loss
 from trainers.scheduler import MapScheduler, expert_ratio
 from utils.checkpoint import save_checkpoint, load_checkpoint
@@ -183,8 +183,9 @@ def _dqfd_sequence_loss_inner(
         rewards_seq = torch.stack([rew_bn[:, i:T - n + i] for i in range(n)], dim=-1)
         dones_seq   = torch.stack([done_bn[:, i:T - n + i].float() for i in range(n)], dim=-1)
         # qt_bn[k]=Q_target(s_{k+1}); bootstrap 状态 s_n..s_{T-1} ↔ qt_bn[:, n-1:T-1]
-        v_target_n = masked_mellowmax(
-            qt_bn[:, n - 1:T - 1], mask_bn[:, n:], alpha=mellowmax_alpha,
+        # masked max bootstrap（标准 Q-learning）：取贪婪动作值，避免 mellowmax 拖负。
+        v_target_n = masked_max(
+            qt_bn[:, n - 1:T - 1], mask_bn[:, n:],
         )
         q_nstep = q_bn[:, :T - n, :].reshape(BN * (T - n), 5)
         a_nstep = act_bn[:, :T - n].reshape(BN * (T - n))
@@ -202,6 +203,14 @@ def _dqfd_sequence_loss_inner(
     # loss_total 必须含 n-step（dqfd_total_loss 内以 lambda_nstep=0 计，n-step 在此单独累加）；
     # 否则报告的 loss 漏掉主导项，严重误导对收敛/发散的判断。
     loss_info["loss_total"] = total_loss.item()
+
+    # reward 诊断（post reward_scale，按 valid 过滤）：PBRS shaping 每步~+1，return~30-80，
+    # ×scale 后即合法 Q 尺度，便于判断 Qmax 是真高估还是合法大 return。
+    with torch.no_grad():
+        _vm = valid_bn.bool()
+        _rv = rew_bn[_vm] if _vm.any() else rew_bn
+        loss_info["r_mean"] = _rv.mean().item()
+        loss_info["r_max"]  = _rv.max().item()
 
     return total_loss, loss_info
 
@@ -257,6 +266,7 @@ class ReptileDQfDTrainer:
         self.expert_ratio_start = config.get("expert_ratio_start", 0.9)
         self.expert_ratio_end = config.get("expert_ratio_end", 0.5)
         self.expert_ratio_decay_iters = config.get("expert_ratio_decay_iters", 8000)
+        self.bc_iters = config.get("bc_iters", 0)   # 两阶段 BC 步数；er 衰减时钟偏移它
 
         # 地图调度器
         self.scheduler = MapScheduler(config.get("map_schedule", None))
@@ -327,6 +337,8 @@ class ReptileDQfDTrainer:
         nstep_vals = []
         margin_vals = []
         l2_vals = []
+        rmean_vals = []
+        rmax_vals = []
         for k in range(self.inner_steps):
             n_expert   = max(1, int(self.batch_size * exp_ratio_val))
             n_selfplay = self.batch_size - n_expert
@@ -369,6 +381,8 @@ class ReptileDQfDTrainer:
                 nstep_vals.append(info.get("loss_nstep", 0.0))
                 margin_vals.append(info.get("loss_margin", 0.0))
                 l2_vals.append(info.get("l2_reg", 0.0))
+                rmean_vals.append(info.get("r_mean", 0.0))
+                rmax_vals.append(info.get("r_max", 0.0))
 
         # 返回 θ_inner（CPU，避免 GPU 内存在跨线程传递时的 CUDA 上下文问题）
         theta_inner = {k: v.detach().cpu() for k, v in self.net.state_dict().items()}
@@ -382,6 +396,8 @@ class ReptileDQfDTrainer:
             "loss_nstep": _avg(nstep_vals),
             "loss_margin": _avg(margin_vals),
             "l2_reg": _avg(l2_vals),
+            "r_mean": _avg(rmean_vals),
+            "r_max": max(rmax_vals) if rmax_vals else 0.0,
         }
 
     def meta_step(
@@ -404,7 +420,7 @@ class ReptileDQfDTrainer:
         exp_ratio_val = expert_ratio(
             self.meta_iter, self.total_meta_iters,
             self.expert_ratio_start, self.expert_ratio_end,
-            self.expert_ratio_decay_iters,
+            self.expert_ratio_decay_iters, bc_offset=self.bc_iters,
         )
 
         _seg = self.profiler.segment if self.profiler else lambda _: nullcontext()
@@ -444,6 +460,8 @@ class ReptileDQfDTrainer:
             "loss_nstep":      result.get("loss_nstep", 0.0),
             "loss_margin":     result.get("loss_margin", 0.0),
             "l2_reg":          result.get("l2_reg", 0.0),
+            "r_mean":          result.get("r_mean", 0.0),
+            "r_max":           result.get("r_max", 0.0),
         }
 
     def _inner_step(
@@ -636,6 +654,7 @@ class DualGPUReptileTrainer:
         self.expert_ratio_start       = cfg.get("expert_ratio_start",       0.9)
         self.expert_ratio_end         = cfg.get("expert_ratio_end",         0.5)
         self.expert_ratio_decay_iters = cfg.get("expert_ratio_decay_iters", 8000)
+        self.bc_iters                 = cfg.get("bc_iters",                  0)
 
         self.scheduler = MapScheduler(cfg.get("map_schedule", None))
 
@@ -663,7 +682,7 @@ class DualGPUReptileTrainer:
         exp_ratio_val = expert_ratio(
             meta_iter, self.total_meta_iters,
             self.expert_ratio_start, self.expert_ratio_end,
-            self.expert_ratio_decay_iters,
+            self.expert_ratio_decay_iters, bc_offset=self.bc_iters,
         )
         n_expert_seqs = max(1, int(ref.batch_size * exp_ratio_val))
         all_pre = []
@@ -741,7 +760,7 @@ class DualGPUReptileTrainer:
         exp_ratio_val = expert_ratio(
             self.meta_iter, self.total_meta_iters,
             self.expert_ratio_start, self.expert_ratio_end,
-            self.expert_ratio_decay_iters,
+            self.expert_ratio_decay_iters, bc_offset=self.bc_iters,
         )
 
         # 采样 n_tasks 个地图类型（相邻偏移保证多样性）
@@ -842,6 +861,8 @@ class DualGPUReptileTrainer:
             "loss_nstep":      _avg("loss_nstep"),
             "loss_margin":     _avg("loss_margin"),
             "l2_reg":          _avg("l2_reg"),
+            "r_mean":          _avg("r_mean"),
+            "r_max":           max((r.get("r_max", 0.0) for r in valid), default=0.0),
             "num_tasks":       len(valid),
             "meta_lr":         cur_meta_lr,
         }
