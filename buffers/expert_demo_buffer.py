@@ -65,6 +65,9 @@ class ExpertDemoBuffer:
 
         self._rng = np.random.default_rng()
 
+        # 底层存储数组的 torch 零拷贝视图缓存（GIL-free gather 用，见 sample/_torch_views）。
+        self._tv_cache = None
+
     # ------------------------------------------------------------------
     # 数组初始化
     # ------------------------------------------------------------------
@@ -93,6 +96,7 @@ class ExpertDemoBuffer:
         self._episode_ids       = np.full(cap, -1,             dtype=np.int64)
 
         self._arrays_inited = True
+        self._tv_cache = None   # 数组重建后失效 torch 视图缓存
 
     # ------------------------------------------------------------------
     # 写入
@@ -293,29 +297,69 @@ class ExpertDemoBuffer:
         # (B, T) 连续索引（已保证不跨 episode，无需取模，但安全起见取模）
         idx_mat = (start_indices[:, None] + np.arange(sequence_len)[None, :]) % self.capacity
 
-        # patches 保留 uint8（不在 CPU 上 astype/255）：
-        # 实测 CPU 端 astype/255 占采样 ~75% 耗时（334/441 ms），且 float32 传输量是 uint8 的 4×。
-        # 改为传 uint8 到 GPU、在 GPU 上 .float()/255（实测整条 patch 管道快 ~5.9×）。
-        # 消费方（trainer）负责 GPU 端归一化（见 _patch_to_gpu）。
-        obs_p  = self._obs_patches[idx_mat]        # (B,T,N,C,K,K) uint8
-        nobs_p = self._next_obs_patches[idx_mat]   # uint8
+        # 用 torch 高级索引（index_select）替代 numpy fancy-index 做 gather。
+        # 背景：DualGPU 异步预取线程的采样占 meta_step wall ~38%（profile 实测），且与
+        # 两 GPU 线程争 GIL 难以完全重叠。**实测**真实 DualGPU 端到端：torch 版中位
+        # 3001→2637 ms/iter（~12%）且方差更低（numpy 2817-3075 抖动 vs torch 2616-2909）。
+        # 机制未完全坐实（torch 张量直接喂 _patch_to_gpu，省 numpy→torch 包裹；gather 更稳），
+        # 但数值**逐位等价**（已验证 max|Δ|=0，同一 idx_mat）。注意：注释别再写"GIL-free"——
+        # 校准测试显示 numpy fancy-index 反而更好地释放 GIL，torch CPU 索引持 GIL 更多；
+        # 这里的收益不是来自 GIL 释放，而是端到端更快更稳的经验结果。真正吃掉那 38% 需进程级
+        # 并行（共享内存 buffer + 每卡独立进程，破 GIL）——见 memory 提速记录。
+        # torch.from_numpy 零拷贝包裹底层存储（缓存复用，见 _torch_views），index_select
+        # 输出即新张量（语义等价原 numpy .copy()）。patches 仍保留 uint8（消费方 _patch_to_gpu
+        # 在 GPU 上 .float()/255，省 4× 传输；见原注释）。
+        import torch  # 惰性 import：env_worker 等 CPU-only 模块不会在导入期拉入 torch
+        tv = self._torch_views()
+        idx = torch.from_numpy(np.ascontiguousarray(idx_mat.reshape(-1)))  # (B*T,) int64
+        B, T = idx_mat.shape
+        N, C, K = self.num_agents, self.obs_channels, self.patch_size
+
+        def _g(name, tail):
+            return tv[name].index_select(0, idx).reshape(B, T, *tail)
 
         return {
-            "obs_patches":       obs_p,
-            "obs_scalars":       self._obs_scalars[idx_mat].copy(),
-            "positions":         self._positions[idx_mat].copy(),
-            "actions_expert":    self._actions_expert[idx_mat].copy(),
-            "rewards":           self._rewards[idx_mat].copy(),
-            "next_obs_patches":  nobs_p,
-            "next_obs_scalars":  self._next_obs_scalars[idx_mat].copy(),
-            "next_positions":    self._next_positions[idx_mat].copy(),
-            "dones":             self._dones[idx_mat].copy(),
-            "valid":             self._valid[idx_mat].copy(),
-            "action_masks":      self._action_masks[idx_mat].copy(),
-            "next_action_masks": self._next_action_masks[idx_mat].copy(),
-            "margin_excluded":   self._margin_excluded[idx_mat].copy(),
-            "margin_weights":    self._margin_weights[idx_mat].copy(),
+            "obs_patches":       _g("obs_patches",       (N, C, K, K)),
+            "obs_scalars":       _g("obs_scalars",       (N, 8)),
+            "positions":         _g("positions",         (N, 2)),
+            "actions_expert":    _g("actions_expert",    (N,)),
+            "rewards":           _g("rewards",           (N,)),
+            "next_obs_patches":  _g("next_obs_patches",  (N, C, K, K)),
+            "next_obs_scalars":  _g("next_obs_scalars",  (N, 8)),
+            "next_positions":    _g("next_positions",    (N, 2)),
+            "dones":             _g("dones",             (N,)),
+            "valid":             _g("valid",             (N,)),
+            "action_masks":      _g("action_masks",      (N, 5)),
+            "next_action_masks": _g("next_action_masks", (N, 5)),
+            "margin_excluded":   _g("margin_excluded",   (N,)),
+            "margin_weights":    _g("margin_weights",    (N,)),
         }
+
+    def _torch_views(self) -> dict:
+        """底层存储数组的 torch 零拷贝视图（缓存）。供 sample 的 GIL-free gather 用。
+
+        torch.from_numpy 与 numpy 数组共享内存：循环 buffer 的就地写入对视图可见；
+        阶段二专家 buffer 载入后只读，更无失效问题。_init_arrays 重建数组时清缓存。
+        """
+        if self._tv_cache is None:
+            import torch
+            self._tv_cache = {
+                "obs_patches":       torch.from_numpy(self._obs_patches),
+                "next_obs_patches":  torch.from_numpy(self._next_obs_patches),
+                "obs_scalars":       torch.from_numpy(self._obs_scalars),
+                "next_obs_scalars":  torch.from_numpy(self._next_obs_scalars),
+                "positions":         torch.from_numpy(self._positions),
+                "next_positions":    torch.from_numpy(self._next_positions),
+                "actions_expert":    torch.from_numpy(self._actions_expert),
+                "rewards":           torch.from_numpy(self._rewards),
+                "dones":             torch.from_numpy(self._dones),
+                "valid":             torch.from_numpy(self._valid),
+                "action_masks":      torch.from_numpy(self._action_masks),
+                "next_action_masks": torch.from_numpy(self._next_action_masks),
+                "margin_excluded":   torch.from_numpy(self._margin_excluded),
+                "margin_weights":    torch.from_numpy(self._margin_weights),
+            }
+        return self._tv_cache
 
     # ------------------------------------------------------------------
     # 统计与维护
