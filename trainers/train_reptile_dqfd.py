@@ -262,6 +262,21 @@ class ReptileDQfDTrainer:
         self.use_amp = self.use_amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
+        # 持久化 inner 优化器：默认 Adam(foreach=None) 构造会探测设备能力，实测每次构造
+        # ~27-40ms；每 meta-iter 4 task 各新建 = ~110-160ms 纯开销。改为构造一次、每个
+        # task 用 state.clear() 重置（0.004ms）。state 清空后首次 step 重新惰性初始化
+        # exp_avg/exp_avg_sq/step → 与"每 task 新建优化器"数值等价（Reptile 每 task 从
+        # θ_meta 全新起步、无跨 task 动量残留），且保留默认 step 路径不改数值。
+        self.inner_optimizer = torch.optim.Adam(self.net.parameters(), lr=self.inner_lr)
+
+        # 持久化 target 网络：inner loop 内冻结于 θ_meta（INVARIANT 8）。每 task 起始
+        # 用 load_state_dict 原地刷入当前 θ_meta，避免每 task deepcopy 整网造成的显存
+        # 分配/释放抖动。requires_grad=False 只设一次。
+        self.target_net = deepcopy(self.net)
+        self.target_net.eval()
+        for _p in self.target_net.parameters():
+            _p.requires_grad = False
+
         # 课程参数
         self.expert_ratio_start = config.get("expert_ratio_start", 0.9)
         self.expert_ratio_end = config.get("expert_ratio_end", 0.5)
@@ -321,14 +336,16 @@ class ReptileDQfDTrainer:
         # cuDNN GRU 要求权重连续；load_state_dict 后显式调用以消除警告和潜在性能损失
         self.net.gru.gru.flatten_parameters()
 
-        # target 冻结于 θ_meta（INVARIANT 8）
-        target_net = deepcopy(self.net)
-        target_net.gru.gru.flatten_parameters()   # deepcopy 后重新打包 cuDNN 权重
-        target_net.eval()
-        for p in target_net.parameters():
-            p.requires_grad = False
+        # target 冻结于 θ_meta（INVARIANT 8）：复用持久化 target_net，原地拷贝当前
+        # θ_meta（self.net 刚载入）。避免每 task deepcopy 整网的显存分配/释放抖动
+        # （用户反映的"显存占用不稳定"来源之一）；state_dict() 是引用、load 原地复制。
+        target_net = self.target_net
+        target_net.load_state_dict(self.net.state_dict())
+        target_net.gru.gru.flatten_parameters()   # 拷贝后重新打包 cuDNN 权重
 
-        inner_optimizer = torch.optim.Adam(self.net.parameters(), lr=self.inner_lr)
+        # 复用持久化优化器：清空 Adam 动量状态，等价于每 task 新建（无跨 task 残留）。
+        inner_optimizer = self.inner_optimizer
+        inner_optimizer.state.clear()
 
         inner_losses = []
         q_max_vals = []

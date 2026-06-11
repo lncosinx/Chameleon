@@ -186,12 +186,14 @@ def main():
     from trainers.selfplay_producer import SelfPlayProducer
     sp_producer = SelfPlayProducer(net, cfg, sp_buf, device=devices[0])
     if sp_producer.enabled:
-        print(f"SelfPlay: ON | families={sp_producer.families} | "
+        print(f"SelfPlay: ON (async overlap) | families={sp_producer.families} | "
               f"{sp_producer.n_env}env/family × {sp_producer.num_agents}agents "
-              f"@size{sp_producer.map_size} | rollout every {sp_producer.K} meta-iters "
+              f"@size{sp_producer.map_size} | sync every {sp_producer.K} meta-iters "
               f"| buffer cap={sp_buf._buffer.maxlen} segs")
     else:
         print("SelfPlay: OFF (selfplay.enable=false)")
+    # 后台 rollout 线程：与 inner loop 重叠（rollout 是 CPU/延迟 bound，藏进训练 GPU 空泡）。
+    sp_producer.start()
 
     # ---- 断点续跑 ----
     os.makedirs("checkpoints", exist_ok=True)
@@ -226,6 +228,8 @@ def main():
     print(f"\nStarting training: {start_iter} → {args.meta_iters} meta-iterations"
           + (f"  (BC pretrain 前 {args.bc_iters} iter)" if args.bc_iters > 0 else "") + "\n")
     _prev_bc = None
+    import time as _time
+    _last_log_t = _time.perf_counter()
     for i in range(start_iter, args.meta_iters):
         in_bc = i < args.bc_iters
         if in_bc != _prev_bc:
@@ -234,13 +238,12 @@ def main():
             _prev_bc = in_bc
         metrics = trainer.meta_step(expert_buf, sp_buf, env_factory=None)
 
-        # 自游走：每隔 K 个 meta-iter 用**当前** θ_meta 采四族段填 sp_buf（producer 内部判 K）。
-        # BC 期 TD 关、自游走 TD-only loss 贡献为 0，跳过 rollout 省算力。
-        if not in_bc:
+        # 自游走（异步重叠）：每 K 个 meta-iter 非阻塞地把**当前** θ_meta 快照推给后台线程，
+        # 由它在训练 GPU 空泡里 rollout 填 sp_buf（不再阻塞主循环）。BC 期 TD 关、自游走
+        # TD-only loss 贡献为 0，跳过 sync 省算力（sp_buf 空时消费端自然 no-op）。
+        if sp_producer.enabled and not in_bc and (i + 1) % sp_producer.K == 0:
             theta_meta = trainer._meta_state if hasattr(trainer, "_meta_state") else trainer.net.state_dict()
-            n_sp = sp_producer.maybe_rollout(i + 1, theta_meta)
-            if n_sp > 0:
-                print(f"  [selfplay] +{n_sp} segs @ iter {i+1} (sp_buf={len(sp_buf)})", flush=True)
+            sp_producer.sync_weights(theta_meta)
 
         if (i + 1) % args.log_interval == 0:
             # 兼容单/双 GPU 返回的 map_type vs map_types
@@ -248,6 +251,9 @@ def main():
             mt_str = "+".join(mt) if isinstance(mt, list) else str(mt)
             n_tasks = metrics.get("num_tasks", metrics.get("num_gpus", 1))
             meta_lr = metrics.get("meta_lr", cfg.get("meta_lr_start", 0.0))
+            _now = _time.perf_counter()
+            _spi = (_now - _last_log_t) / args.log_interval   # 墙钟 s/iter（含 rollout 重叠后净值）
+            _last_log_t = _now
             # loss 分量（加权贡献，应约等于 loss_total）。BC 期 td/n 的有效 λ=0，显示按有效值。
             _lt = 0.0 if in_bc else cfg.get("lambda_td", 1.0)
             _ln = 0.0 if in_bc else cfg.get("lambda_nstep", 1.0)
@@ -263,6 +269,7 @@ def main():
                   f"[td={w_td:.2f} n={w_n:.2f} mgn={w_mgn:.2f} l2={w_l2:.2f}]  "
                   f"map={mt_str:<20}  "
                   f"er={metrics['expert_ratio']:.2f}  "
+                  f"sp={len(sp_buf)}  {_spi:.2f}s/it  "
                   f"tasks={n_tasks}  meta_lr={meta_lr:.5f}", flush=True)
 
         # 周期性原子存档（断点续跑）
