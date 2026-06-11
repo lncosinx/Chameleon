@@ -85,6 +85,9 @@ def main():
     with open(args.network_config) as f: net_cfg = yaml.safe_load(f)
     if args.no_selfplay:
         cfg.setdefault("selfplay", {})["enable"] = False
+    # BC 步数注入 cfg → trainer 用它把 expert_ratio 衰减时钟偏移 bc_iters
+    # （BC 期 er 冻结在 start，self-play 从 iter=bc_iters 起才温和衰减；见 scheduler.expert_ratio）。
+    cfg["bc_iters"] = args.bc_iters
     for kv in args.set:
         k, _, v = kv.partition("=")
         val = yaml.safe_load(v)
@@ -256,6 +259,7 @@ def main():
                   f"loss={metrics['inner_loss_mean']:.4f}  "
                   f"Qmax={metrics.get('q_max', 0.0):.2f}  "
                   f"Qmean={metrics.get('q_mean', 0.0):.2f}  "
+                  f"r={metrics.get('r_mean', 0.0):.2f}/{metrics.get('r_max', 0.0):.2f}  "
                   f"[td={w_td:.2f} n={w_n:.2f} mgn={w_mgn:.2f} l2={w_l2:.2f}]  "
                   f"map={mt_str:<20}  "
                   f"er={metrics['expert_ratio']:.2f}  "

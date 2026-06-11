@@ -162,6 +162,7 @@ def _run_selfplay(slot, obs_barrier, act_barrier, v, wrapper, obs_builder,
     prev_goals = wrapper.get_targets_xy()
     ever_done = [False] * N
 
+    reward_builder.begin_episode()   # 归一 shaping：本段起点距离缓存
     for t in range(T):
         prev_ever = list(ever_done)
         agents_xy = wrapper.get_agents_xy()

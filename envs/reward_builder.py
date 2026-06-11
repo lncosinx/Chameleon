@@ -35,12 +35,13 @@ class RewardBuilder:
 
     def __init__(
         self,
-        lambda_f: float = 1.0,
+        lambda_f: float = 0.3,
         shaping_clip: float = 5.0,
-        goal_reward: float = 1.0,
-        step_cost: float = 0.01,
+        goal_reward: float = 0.7,
+        step_cost: float = 0.002,
         collision_cost: float = 0.1,
         gamma: float = 0.99,
+        normalize_shaping: bool = True,
     ):
         self.lambda_f      = lambda_f
         self.shaping_clip  = shaping_clip
@@ -48,19 +49,28 @@ class RewardBuilder:
         self.step_cost     = step_cost
         self.collision_cost = collision_cost
         self.gamma         = gamma
+        # 归一化：Φ 除以每 episode 的 d_BFS(start)，使 shaping 累积 return≈lambda_f（跨族/距离统一），
+        # 配合 goal_reward 使总 return≈1、Q≈1，避免 td/n 随距离暴涨淹没 margin。
+        self.normalize_shaping = normalize_shaping
+        self._d_start = None   # 每 episode 的归一距离（begin_episode 清空，compute 首次惰性计算）
 
         self._cache = PotentialFieldCache()
+
+    def begin_episode(self):
+        """每 episode 开始时调用：清空归一距离缓存，下一次 compute 用 prev_pos(=start) 计算。"""
+        self._d_start = None
 
     @classmethod
     def from_config(cls, cfg: dict) -> "RewardBuilder":
         """从 yaml config dict 构建（键名与 __init__ 参数一致）。"""
         return cls(
-            lambda_f      = cfg.get("lambda_f",      1.0),
+            lambda_f      = cfg.get("lambda_f",      0.3),
             shaping_clip  = cfg.get("shaping_clip",  5.0),
-            goal_reward   = cfg.get("goal_reward",   1.0),
-            step_cost     = cfg.get("step_cost",     0.01),
+            goal_reward   = cfg.get("goal_reward",   0.7),
+            step_cost     = cfg.get("step_cost",     0.002),
             collision_cost= cfg.get("collision_cost",0.1),
             gamma         = cfg.get("gamma",         0.99),
+            normalize_shaping = cfg.get("normalize_shaping", True),
         )
 
     # ------------------------------------------------------------------
@@ -104,7 +114,7 @@ class RewardBuilder:
         # ---- 2. 每步惩罚 ----
         rewards  -= active.astype(np.float32) * self.step_cost
 
-        # ---- 3. 碰撞惩罚（向量化 O(N²)）----
+        # ---- 3. 顶点碰撞惩罚（两体同格，向量化 O(N²)）----
         pos_i = curr_pos[:, np.newaxis, :]
         pos_j = curr_pos[np.newaxis, :, :]
         same  = np.all(pos_i == pos_j, axis=-1)
@@ -112,7 +122,27 @@ class RewardBuilder:
         collision_counts = same.sum(axis=1)
         rewards -= collision_counts.astype(np.float32) * self.collision_cost * active
 
-        # ---- 4. PBRS shaping（关键修复）----
+        # ---- 3b. 交换碰撞惩罚（两体对穿：i 走到 j 旧格、同时 j 走到 i 旧格）----
+        # 软碰撞下对穿不触发顶点碰撞，是协调失败/振荡 deadlock 的漏洞，须同等惩罚。
+        match_a = np.all(prev_pos[:, np.newaxis, :] == curr_pos[np.newaxis, :, :], axis=-1)  # prev_i==curr_j
+        match_b = np.all(curr_pos[:, np.newaxis, :] == prev_pos[np.newaxis, :, :], axis=-1)  # curr_i==prev_j
+        swap = match_a & match_b
+        np.fill_diagonal(swap, False)
+        swap_counts = swap.sum(axis=1)
+        rewards -= swap_counts.astype(np.float32) * self.collision_cost * active
+
+        # ---- 4. PBRS shaping（归一化）----
+        # 归一距离 d_start：首次 compute 用 prev_pos(=episode start) 的 BFS 距离，缓存整段。
+        if self.normalize_shaping and self._d_start is None:
+            ds = np.empty(N, dtype=np.float32)
+            for i in range(N):
+                ds[i] = -self._phi(obstacles,
+                                   (int(prev_pos[i, 0]), int(prev_pos[i, 1])),
+                                   (int(prev_goal[i, 0]), int(prev_goal[i, 1])))
+            # 不可达/已在目标 → 用 1.0 兜底，避免除 0 / 极端值
+            ds = np.where((ds > 0.5) & (ds < UNREACHABLE_CONSTANT / 2), ds, 1.0)
+            self._d_start = ds
+
         shaping = np.zeros(N, dtype=np.float32)
         for i in range(N):
             if done_mask[i]:
@@ -143,11 +173,14 @@ class RewardBuilder:
                 # clip 防止强制绕路（多体 MAPF）或 goal-restart 残差产生极端惩罚
                 shaping[i] = float(np.clip(raw, -self.shaping_clip, self.shaping_clip))
 
+        if self.normalize_shaping and self._d_start is not None:
+            shaping = shaping / self._d_start   # Φ 按 d_BFS(start) 归一 → shaping 累积≈lambda_f
         rewards += self.lambda_f * shaping
 
         info = {
             "reward/goal_count":      int(arrived.sum()),
             "reward/collision_count": int((collision_counts > 0).sum()),
+            "reward/swap_count":      int((swap_counts > 0).sum()),
             "reward/shaping_mean":    float(shaping[active].mean()) if active.any() else 0.0,
             "reward/total_mean":      float(rewards.mean()),
         }

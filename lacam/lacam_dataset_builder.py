@@ -94,6 +94,7 @@ def build_dataset_from_rollout(
     # ever_done：累计完成掩码，单调递增（一旦 True 永远 True）。
     ever_done = [False] * N
 
+    reward_builder.begin_episode()   # 归一 shaping：本 episode 起点距离缓存（首次 compute 惰性计算）
     for t in range(max_steps):
         prev_ever_done = list(ever_done)
 

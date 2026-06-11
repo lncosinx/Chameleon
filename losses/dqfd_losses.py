@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from losses.q_target import masked_mellowmax, masked_double_q_target
+from losses.q_target import masked_mellowmax, masked_double_q_target, masked_clipped_double_q, masked_max
 from losses.td_losses import one_step_td_loss, n_step_td_loss
 
 
@@ -90,6 +90,8 @@ def dqfd_total_loss(
     action_masks_next: torch.Tensor,   # (B, N, num_actions) s' 时刻合法动作掩码
     expert_actions: torch.Tensor,      # (B, N) long, 专家动作
     online_q_next: torch.Tensor = None,  # (B, N, num_actions) 在线 Q(s',·)；给定则用 Double DQN target
+    q_values2: torch.Tensor = None,      # (B, N, num_actions) 第二在线头 Q(s,·)；clipped double-Q 双头 TD
+    target_q2_next: torch.Tensor = None, # (B, N, num_actions) 第二 target 头 Q(s',·)；给定则 clipped(min) target
     # n-step
     rewards_seq: torch.Tensor = None,  # (B, N, n)
     dones_seq: torch.Tensor = None,    # (B, N, n)
@@ -120,13 +122,21 @@ def dqfd_total_loss(
     info = {}
 
     # ---- 1-step TD ----
-    # Double DQN（默认，抑制高估）：online 选 a*、target 评估；online_q_next=None 时回退 mellowmax。
-    if online_q_next is not None:
+    # bootstrap 默认 masked max（标准 Q-learning，取贪婪动作值，避免 mellowmax 把 margin
+    # 压低的非专家动作平均进来导致小 Q 时负向发散）。clipped/double-Q 仅在显式传参时启用。
+    if target_q2_next is not None:
+        v_target = masked_clipped_double_q(target_q_next, target_q2_next,
+                                           action_masks_next, alpha=mellowmax_alpha)
+    elif online_q_next is not None:
         v_target = masked_double_q_target(online_q_next, target_q_next, action_masks_next)
     else:
-        v_target = masked_mellowmax(target_q_next, action_masks_next, alpha=mellowmax_alpha)
+        v_target = masked_max(target_q_next, action_masks_next)
     loss_td = one_step_td_loss(q_values, actions, rewards, dones, v_target, gamma,
                                weights=sample_weights)
+    # clipped double-Q：第二头也向同一 clipped target 训 1-step TD
+    if q_values2 is not None:
+        loss_td = loss_td + one_step_td_loss(q_values2, actions, rewards, dones, v_target, gamma,
+                                             weights=sample_weights)
     info["loss_td"] = loss_td.item()
 
     # ---- n-step TD ----

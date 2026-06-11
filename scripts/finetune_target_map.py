@@ -247,6 +247,7 @@ def _rollout_with_policy(wrapper, obs_builder, reward_builder, net, device, segm
     ever_done = [False] * N
     prev_goals = wrapper.get_targets_xy()
 
+    reward_builder.begin_episode()   # 归一 shaping：本段起点距离缓存
     for t in range(T):
         prev_ever_done = list(ever_done)
         patches, scalars = build_observations(wrapper, obs_list, prev_actions, obs_builder)

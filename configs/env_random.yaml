@@ -18,9 +18,10 @@ on_target: finish             # 到达目标即停（标准 MAPF；与 LaCAM 固
 # shaping_clip=5.0: 截断多体绕路和 goal-restart 引起的极端 shaping（原最大-9.1→现-5）
 # wait_cost 已移除：等待是拥挤 MAPF 的合理策略，不应额外惩罚
 reward:
-  lambda_f:       1.0
+  lambda_f:       1.5
   shaping_clip:   5.0
-  goal_reward:    1.0
-  step_cost:      0.001
-  collision_cost: 0.1
+  goal_reward:    3.5
+  step_cost:      0.005
+  collision_cost: 0.3
+  normalize_shaping: true
   gamma:          0.99
