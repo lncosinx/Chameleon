@@ -17,6 +17,32 @@
 
 ---
 
+## 0′. v3 战略转向（2026-06-15，最高优先级，覆盖下文冲突处）
+
+> 本节是当前生效的方向。与下文 v2 正文冲突时**以本节为准**；下文相关小节已标注 `[v3 superseded]`。本节记录**为什么转**、**转去哪**、以及**哪些已定 / 哪些待定**。
+
+**触发（竞品分析结论）**：同实验室（CogAI/AIRI，Skrynnik 等）的系列工作已占据本赛道——`When-to-Switch`（学习+搜索混合）、`MAPF-GPT`（transformer 基础模型，~10 亿 (obs,action) 离线 IL）、`LC-MAPF`（MAPF-GPT + 多轮通信，learnable decentralized SOTA）。本项目 `meta_iter_20000` 在 POGEMA 一次性 MAPF 上实测 **≈ 经典 MARL(QMIX/QPLEX) 档**（CSR≈0、ISR/AR 0.45-0.65），**远低于 SCRIMP/DCC/LC-MAPF**。结论：**用 CNN+GRU 骨干 + ~10× 更少数据、在人家造的 benchmark 上比"泛化/刷 SR"，赢不了**。故转向。
+
+**新论文定位（已定）**：
+- **头条贡献 = 通信本身**，不是"泛化/通用元模型"（"泛化"是 LC-MAPF 的头号卖点，不与其正面比）。具体押 **软稀疏(entmax)+迟滞 的通信图时间稳定性（抗边闪烁 EdgeFlipRate）/ 通信效率 / 受限或有损通信下的鲁棒性**——LC-MAPF 的 4 轮 dense message passing 没专门处理这些。
+- **骨干现代化**：`CNN patch + GRU + 单轮 GAT` → **tokenized 观测 + Transformer（或 时间维 Mamba/SSM + 体间注意力）**。动机：① 小卷积在 5090 上吃不满 tensor core、是当前训练大头；② transformer 是该领域 SOTA 骨干、且离线训练 GPU 友好；③ 是被严肃对待的"入场券"。**换骨干是入场券、不是贡献**。
+- **训练范式**：转向 **离线 IL（对专家动作做监督/交叉熵，MAPF-GPT 式）为主**——可去掉在线 RL 机器（DQfD 的 TD/n-step、selfplay、BFS-PBRS reward 在纯 IL 下不参与），换来又快又简单的 dataloader→transformer 训练。
+- **Reptile 保留**，但**重新定位为"通信策略对新环境的快速适应"**（meta×communication 交叉点），**不**包装成"泛化"。前提：**必须保留一个适应评估**（见下），否则 Reptile 无意义（meta-init 不适应 ≈ 还不如直接多任务联合训练）。
+- **阶段三在线 near-on-policy 微调 → 改为离线 few-shot 适应评估**：在 held-out 地图族上比 "普通预训练→微调" vs "Reptile-init→微调" 的适应速度/数据量，并对位 `MAPF-GPT active fine-tuning`（IROS 2025）这条 baseline。
+
+**待定（不要在代码/文档里写死，需先定）**：
+- **Transformer vs Mamba/SSM** 作骨干（倾向 transformer=主流可比；Mamba 更省、若 MAPF 未被做过可作小新意，但有撞车风险）。
+- **是否保留一点 DQfD 价值项**（纯 IL vs IL+轻量 TD grounding）——默认先做纯 IL，价值项作为可选消融。
+- 通信贡献的最终窄口（稳定性 / 受限带宽 / 有损 / 异步 选一主打）。
+
+**仍然有效（与骨干/范式无关，继续遵守）**：INVARIANT 1（动作序 wait=0）、2（policy 只吃局部）、3（特权信号只训练期：LaCAM 仍只产专家数据）、10（通信只与 FOV 内邻居、软稀疏+迟滞、非 hard top-k、监控 EdgeFlipRate——现在是**头条**）、第 5 章评价指标、阶段一 LaCAM 专家数据生成。
+
+**因转范式而废弃/降级**：BFS-PBRS reward（§3.3 INVARIANT 4，纯 IL 不用）、DQfD 的 TD/n-step/mellowmax/双 buffer 课程混合（§3.3.3 / §4 损失，降为可选消融）、selfplay 自游走子系统、阶段三在线 near-on-policy（§3.6，改离线 few-shot）。下文这些小节标 `[v3 superseded]`。
+
+**基线（必须对照）**：公开有代码的 SCRIMP / DCC / MAPF-GPT（仓库 `pogema-benchmark/` 内有它们的 POGEMA 结果），适应性对位 active fine-tuning。LC-MAPF 盲审无源码，只能对其论文报的 POGEMA 曲线。
+
+---
+
 ## 0. 方案定位
 
 本方案面向基于 **Pogema** 网格环境的部分可观测多智能体路径规划（MAPF）任务。环境部分可观测：每个智能体仅能使用自身局部视野（FOV）内的信息决策，**不能访问全局地图、全局最短路距离场、或全局规划器输出的未来轨迹**。
@@ -333,6 +359,8 @@ metrics（足够细以定位问题来源）、profiler（env/forward/batch/IPC/�
 
 ## 2. 网络架构
 
+> **[v3 superseded 骨干]** 本章描述的 `Patch CNN + 标量 MLP + 单轮软稀疏 GAT + GRU + Dueling Q` 骨干在 v3 中被 **tokenized 观测 + Transformer（或时间维 Mamba + 体间注意力）** 取代（见 §0′）。**仍有效**：输入只含局部信息（INVARIANT 2）、目标相对方向作合法局部特征、通信只与 FOV 内邻居（§2.5/INVARIANT 10，v3 头条）。**变化**：Q 头（Dueling DQN）→ 动作 logits + 交叉熵（离线 IL）；GRU 记忆 → transformer 上下文 / Mamba。
+
 ### 2.1 问题建模
 每体共享参数网络 $f_\theta$，依局部观测 $o_i^t$、隐状态 $h_i^{t-1}$、邻居通信 $\mathbf{c}_i^t$ 选动作：
 
@@ -392,6 +420,8 @@ h -> dueling Q head -> Q(5)
 对每种地图类型采样任务 $\tau=(m, \text{size}, N, \text{struct}, \text{starts}, \text{goals})$，LaCAM 求解；成功转动作入专家 buffer，失败入 hard case 池。
 
 ### 3.3 阶段二：DQfD + Reptile 联合预训练
+
+> **[v3 superseded 训练范式]** v3 改为**离线 IL（对专家动作做监督/交叉熵）为主**（见 §0′）。本节的 DQfD 价值学习（1-step/n-step TD、mellowmax、防高估、专家+自游走课程混合、selfplay）**降为可选消融**，默认不启用。**仍保留**：Reptile（§3.4，重定位为"通信策略快速适应"）、专家数据来自 LaCAM、burn-in（若用循环/Mamba 骨干）。BFS-PBRS reward（INVARIANT 4）在纯 IL 下不参与。
 
 #### 3.3.1 防高估混合策略（**课程式**）
 纯专家预训练会令策略一旦偏离 LaCAM 轨迹就进入未见过的"脏状态"，Q 值在那里塌缩/高估、退火即崩。故每个 inner-loop batch 按比例混合专家与自游走：
@@ -467,6 +497,8 @@ for meta_iter = 1 ... M:
 某类失败率显著偏高时启用自适应采样 $P(m)\propto \exp(\eta\cdot\text{failrate}(m))$。
 
 ### 3.6 阶段三：目标地图近 on-policy 微调
+
+> **[v3 superseded]** v3 **取消在线 near-on-policy 微调**（§3.6–3.8 全节，含实时专家介入、lag≤1、margin/专家退火）。改为 **离线 few-shot 适应评估**：在 held-out 地图族上对比 "普通预训练→微调" vs "Reptile-init→微调" 的适应速度/数据量，并对位 `MAPF-GPT active fine-tuning`。这是 Reptile 在 v3 里的存在理由（见 §0′），定位为"通信策略对新环境的快速适应"，**不**包装成泛化。
 初始化 $\theta\leftarrow\theta^\*$。采用短窗口 recent buffer + 同步段采样，丢弃 $v_{\text{learner}}-v_{\text{sample}}>1$ 的样本（见 §3.1 分工说明）。
 
 ### 3.7 LaCAM 实时专家介入
@@ -617,6 +649,8 @@ Actor FPS、Learner Update FPS、IPC 等待、序列化耗时、显存拷贝、�
 ---
 
 ## 7. 预期与验证（**全部降级为待验证假设**）
+
+> **[v3 调整]** v3 的核心待验证假设改为：**H-comm（头条）**——软稀疏+迟滞的通信图时间稳定性（低 EdgeFlipRate）/ 受限带宽鲁棒性，相比 dense 多轮通信（LC-MAPF 式）在协调/死锁/规模上更优或更省；**H-adapt（Reptile 重定位）**——Reptile meta-init 的通信策略在 held-out 族上比"普通预训练→微调"适应更快/更省数据（对位 active fine-tuning）。下列 H1/H3（自游走、BFS-PBRS）随范式转离线 IL 而**废弃**；H2（泛化）保留但**降为对照项、非卖点**（泛化是 LC-MAPF 的主张，不正面比）。H5 通信消融升级为头条实验。
 
 > 以下为**假设**，需以对照实验证伪，不是承诺结论。
 
