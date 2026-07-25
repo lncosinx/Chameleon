@@ -72,7 +72,17 @@ class LaCAMRunner:
             try:
                 self._solver = _LacamNativeSolver(time_limit)
                 self.backend = "lacam"
-            except ImportError:
+            except ImportError as exc:
+                # ★ 必须大声报警：静默回退会产出**质量差得多的"专家"**数据
+                # （实测 native LaCAM: valid-wait 2%；prioritized fallback: 42%、SoC 2×），
+                # 用它做模仿学习会把 fallback 的坏行为当成专家学进去，且不报错。
+                # 2026-07-22 踩过一次：_lacam.so 为 py3.10 编译，py3.11 下 ImportError → 静默回退。
+                import warnings
+                msg = ("[LaCAM] native binding UNAVAILABLE -> falling back to the Python "
+                       f"'prioritized' planner. Expert data quality will be MUCH worse "
+                       f"(wait ratio ~20x higher, SoC ~2x). Reason: {exc}")
+                print("\n" + "=" * 100 + f"\n!! {msg}\n" + "=" * 100 + "\n", flush=True)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
                 self._solver = _PrioritizedSolver(time_limit)
                 self.backend = "prioritized"
         elif backend == "lacam":

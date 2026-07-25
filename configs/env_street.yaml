@@ -1,0 +1,22 @@
+# Pogema street 地图族（when-to-switch registry：street-* 街区网格训练集）
+# Reptile 任务=族；专家数据/训练只取 street-* 的 train split（8:2）。64×64。
+map_type: street
+map_name: "street-"    # 只取 when-to-switch street-* 族（envs/map_registry.py 内 8:2 划 train/test）
+map_size: 64           # 仅作元数据/回退用；地图实际尺寸由 registry 地图串决定
+num_agents: 8          # 开发默认；目标 96；命令行 --num-agents 覆盖
+obs_radius: 5
+max_episode_steps: 512
+
+collision_system: soft
+on_target: finish
+
+reward:
+  lambda_f:       1.5
+  shaping_clip:   5.0
+  goal_reward:    3.5
+  step_cost:      0.005
+  collision_cost: 0.3
+  normalize_shaping: true
+  gamma:          0.99
+  stuck_cost:     0.05
+  stuck_patience: 5

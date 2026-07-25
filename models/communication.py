@@ -285,6 +285,10 @@ class BiIntentAttention(nn.Module):
         has_active = (W > 0).any(dim=-1, keepdim=True).float()    # (B,T,N,1)
         comm_features = comm_features * has_active
 
+        # 实际生效的通信度数（topk 封顶后，W>0），才是真实带宽/消息量口径；
+        # 上面的 nonzero_count 是 topk 前的 FOV 候选数，会高估通信量。
+        active_neighbors = (W > 0).sum(dim=-1)                    # (B,T,N)
+
         # ===== EdgeFlipRate（topk 后；跨调用边界用 _prev_edge_set）=====
         cur_edges = (W > 0).detach()                              # (B,T,N,N)
         if (self._prev_edge_set is not None
@@ -304,6 +308,7 @@ class BiIntentAttention(nn.Module):
         info = {
             "edge_flip_rate": edge_flip_rate,
             "avg_neighbors": nonzero_count.float().mean().item(),
+            "avg_active_neighbors": active_neighbors.float().mean().item(),  # topk 封顶后的真实度数
             "entmax_alpha": self.entmax_alpha,
         }
         return comm_features, info

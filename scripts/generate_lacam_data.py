@@ -72,7 +72,7 @@ def save_buffer_to_disk(buffer, path: str):
         "episode_ids":       buffer._episode_ids[:n].astype(np.int32),
     }
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    np.savez_compressed(path, **arrays)
+    np.savez(path, **arrays)
     print(f"  Saved {n:,} timesteps → {path}  ({os.path.getsize(path)/1e6:.1f} MB)")
 
 
@@ -215,7 +215,8 @@ def _worker_generate(args: tuple):
     模块级函数保证 spawn 启动方式下可 pickle。
     不创建 CUDA 上下文（env/LaCAM 均为 CPU-only）。
     """
-    config_path, num_agents, map_size, backend, seeds, worker_id, tmp_dir = args
+    (config_path, num_agents, map_size, backend, seeds, worker_id, tmp_dir,
+     use_cost2go, cost2go_clip) = args
 
     # spawn 下需确保 sys.path 含项目根目录
     _proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -232,7 +233,8 @@ def _worker_generate(args: tuple):
     wrapper = PogemaWrapper(config_path)
     wrapper.map_size = map_size
     wrapper.num_agents = num_agents
-    obs_builder = ObservationBuilder(num_agents=num_agents, obs_radius=5)
+    obs_builder = ObservationBuilder(num_agents=num_agents, obs_radius=5,
+                                     use_cost2go=use_cost2go, cost2go_clip=cost2go_clip)
     with open(config_path) as f:
         env_cfg = yaml.safe_load(f)
     reward_builder = RewardBuilder.from_config(env_cfg.get("reward", {}))
@@ -289,7 +291,7 @@ def _worker_generate(args: tuple):
     }
 
     tmp_path = os.path.join(tmp_dir, f".tmp_worker_{worker_id:04d}.npz")
-    np.savez_compressed(tmp_path, **merged)
+    np.savez(tmp_path, **merged)
     print(f"  [worker {worker_id:2d}] ok={success_count} fail={fail_count} "
           f"timesteps={total_steps}", flush=True)
     return tmp_path, success_count, fail_count, total_steps, quality
@@ -332,7 +334,9 @@ def _merge_tmp_npz(tmp_paths: list, output_path: str, max_samples: int):
             merged[k] = merged[k][-max_samples:]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    np.savez_compressed(output_path, **merged)
+    # 不压缩：zlib 对这些数值数组要单核跑 ~13min/族 才省 7× 磁盘，而磁盘管够。
+    # 改 np.savez 后合并从 ~13min 降到 ~1min，且训练启动时加载也免去解压（快得多）。
+    np.savez(output_path, **merged)
     final_n = len(merged.get("episode_ids", []))
     print(f"  Saved {final_n:,} timesteps → {output_path}  "
           f"({os.path.getsize(output_path)/1e6:.1f} MB)")
@@ -353,6 +357,8 @@ def generate_data(
     max_buffer_samples: int = 2_000_000,
     save_to_disk: bool = True,
     num_workers: int = 1,
+    use_cost2go: bool = False,
+    cost2go_clip: float = 10.0,
 ):
     """
     对一种地图族生成专家数据，支持多进程并行。
@@ -393,7 +399,8 @@ def generate_data(
         wrapper = PogemaWrapper(config_path)
         wrapper.map_size = map_size
         wrapper.num_agents = num_agents
-        obs_builder    = ObservationBuilder(num_agents=num_agents, obs_radius=5)
+        obs_builder    = ObservationBuilder(num_agents=num_agents, obs_radius=5,
+                                            use_cost2go=use_cost2go, cost2go_clip=cost2go_clip)
         reward_builder = RewardBuilder.from_config(env_cfg.get("reward", {}))
         runner         = LaCAMRunner(backend=backend)
         # 容量按「时间步」计（每步含 N 体）；单进程按实际 episode 数上界分配，
@@ -465,7 +472,7 @@ def generate_data(
 
         worker_args = [
             (config_path, num_agents, map_size, backend,
-             seed_chunks[i], i, tmp_dir)
+             seed_chunks[i], i, tmp_dir, use_cost2go, cost2go_clip)
             for i in range(num_workers)
         ]
 

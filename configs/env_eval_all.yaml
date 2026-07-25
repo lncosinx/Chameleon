@@ -1,0 +1,11 @@
+# 评估专用：when-to-switch 全部族的 test split（47 张 held-out 地图）。
+# 用于 comm 消融的聚合 SR 对比（训练用全 5 族混采，评估用其 test split）。
+map_type: mixed
+map_name: "all"        # 全池；PogemaWrapper(split='test') → 仅 47 张测试地图
+map_size: 64           # 仅元数据；实际尺寸由 registry 地图决定
+num_agents: 8          # 命令行 --num-agents 覆盖
+obs_radius: 5
+max_episode_steps: 512
+
+collision_system: soft
+on_target: finish

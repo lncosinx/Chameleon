@@ -1,0 +1,28 @@
+# 小图 maze：匹配 validation-mazes 分布(~21x21, density~0.3)。
+map_type: maze
+map_size: 21
+num_agents: 48
+obs_radius: 5
+max_episode_steps: 256
+obstacle_density: 0.3
+collision_system: soft
+on_target: nothing
+maze:
+  width_min: 20
+  width_max: 22
+  height_min: 20
+  height_max: 22
+  obstacle_density_min: 0.25
+  obstacle_density_max: 0.38
+  wall_components_min: 2
+  wall_components_max: 8
+reward:
+  lambda_f: 1.5
+  shaping_clip: 5.0
+  goal_reward: 3.5
+  step_cost: 0.005
+  collision_cost: 0.3
+  normalize_shaping: true
+  gamma: 0.99
+  stuck_cost: 0.05
+  stuck_patience: 5

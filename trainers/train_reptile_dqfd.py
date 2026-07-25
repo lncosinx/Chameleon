@@ -28,6 +28,23 @@ from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.profiler import Profiler
 
 
+def _normalize_buffers(buffers) -> Dict[str, object]:
+    """把 meta_step 的 expert 参数统一成 {族名: buffer} 字典（兼容单一 buffer 旧调用）。"""
+    if isinstance(buffers, dict):
+        return buffers
+    return {"mixed": buffers}
+
+
+def _assign_task_families(fams: List[str], meta_iter: int, seed, n_tasks: int) -> List[str]:
+    """确定性地为本 meta-iter 的 n_tasks 个 task 分配地图族（presample 与执行须一致）。
+    n_tasks ≤ 族数时无放回采样（保证 task 跨族多样、Reptile 才有适应意义）。"""
+    base = (seed if seed is not None else 0) + meta_iter * 7919 + 13
+    rng = np.random.default_rng(base)
+    replace = n_tasks > len(fams)
+    idx = rng.choice(len(fams), size=n_tasks, replace=replace)
+    return [fams[i] for i in idx]
+
+
 def dqfd_sequence_loss(
     net: "BiIntentGATDRQN",
     target_net: "BiIntentGATDRQN",
@@ -281,7 +298,9 @@ class ReptileDQfDTrainer:
 
     def _current_meta_lr(self) -> float:
         """线性衰减 meta_lr：meta_lr_start → meta_lr_end。"""
-        t = self.meta_iter / max(1, self.total_meta_iters - 1)
+        # clamp 到 [0,1]：resume 续训越过 total_meta_iters 时防止线性外推出负 meta_lr
+        # （负 meta_lr → 外层更新反向 → 发散）。越过末点后 meta_lr 恒为 meta_lr_end。
+        t = min(1.0, max(0.0, self.meta_iter / max(1, self.total_meta_iters - 1)))
         return self.meta_lr_start + (self.meta_lr_end - self.meta_lr_start) * t
 
     def run_inner_loop(
@@ -410,13 +429,17 @@ class ReptileDQfDTrainer:
         """
         执行一次 meta-iteration（单 GPU）：
         run_inner_loop → outer update。
+
+        expert_buffer 可为 {族名: buffer} 字典（Reptile 任务=族，单 GPU 每 iter 轮转选一族）
+        或单一 buffer（旧用法）。
         """
         theta_meta = {k: v.detach().cpu().clone()
                       for k, v in self.net.state_dict().items()}
 
-        map_type = self.scheduler.sample(
-            self.meta_iter, self.total_meta_iters, adaptive=False
-        )
+        buffers = _normalize_buffers(expert_buffer)
+        fams = sorted(buffers.keys())
+        map_type = fams[self.meta_iter % len(fams)]   # 单 GPU：轮转选族
+        expert_buffer = buffers[map_type]
         exp_ratio_val = expert_ratio(
             self.meta_iter, self.total_meta_iters,
             self.expert_ratio_start, self.expert_ratio_end,
@@ -589,7 +612,8 @@ class ReptileDQfDTrainer:
         }
 
     def load_state_dict(self, state: dict):
-        self.net.load_state_dict(state["net"])
+        # 剥 torch.compile 的 "_orig_mod." 前缀（旧 compile ckpt 兼容；幂等）。
+        self.net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in state["net"].items()})
         self.meta_iter = state.get("meta_iter", 0)
 
 
@@ -674,11 +698,14 @@ class DualGPUReptileTrainer:
     # 预采样 + 异步预取
     # ------------------------------------------------------------------
 
-    def _presample(self, expert_buffer, meta_iter: int, seed) -> list:
-        """采样某 meta-iter 全部 GPU×task×inner 的 expert batch。布局 [gpu][task][inner]。"""
+    def _presample(self, expert_buffers: dict, meta_iter: int, seed) -> list:
+        """采样某 meta-iter 全部 GPU×task×inner 的 expert batch（按 task 所属族取 buffer）。
+        布局 [gpu][task][inner]。task→族分配与 meta_step 用同一确定性函数。"""
         n_gpus = len(self.devices)
         tpg = self.tasks_per_gpu
         ref = self.sub_trainers[0]
+        fams = sorted(expert_buffers.keys())
+        task_fams = _assign_task_families(fams, meta_iter, seed, n_gpus * tpg)
         exp_ratio_val = expert_ratio(
             meta_iter, self.total_meta_iters,
             self.expert_ratio_start, self.expert_ratio_end,
@@ -690,12 +717,13 @@ class DualGPUReptileTrainer:
             gpu_b = []
             for task_offset in range(tpg):
                 task_idx = gpu_idx * tpg + task_offset
+                buf = expert_buffers[task_fams[task_idx]]
                 task_seed = (seed or meta_iter * 1000) + task_idx * 99991
                 rng = np.random.default_rng(task_seed)
                 batches = []
                 for _ in range(ref.inner_steps):
                     try:
-                        batches.append(expert_buffer.sample(
+                        batches.append(buf.sample(
                             batch_size=n_expert_seqs,
                             sequence_len=ref.sequence_len,
                             burn_in_len=ref.burn_in_len,
@@ -707,7 +735,7 @@ class DualGPUReptileTrainer:
             all_pre.append(gpu_b)
         return all_pre
 
-    def _get_presample(self, expert_buffer, meta_iter: int, seed) -> list:
+    def _get_presample(self, expert_buffers: dict, meta_iter: int, seed) -> list:
         """取本轮预采样：命中上一轮后台预取则直接用，否则同步采样。"""
         if self._prefetch_thread is not None:
             self._prefetch_thread.join()
@@ -716,19 +744,21 @@ class DualGPUReptileTrainer:
             batches = self._prefetched[1]
             self._prefetched = None
             return batches
-        return self._presample(expert_buffer, meta_iter, seed)
+        return self._presample(expert_buffers, meta_iter, seed)
 
-    def _start_prefetch(self, expert_buffer, meta_iter: int, seed):
+    def _start_prefetch(self, expert_buffers: dict, meta_iter: int, seed):
         """后台线程预采下一轮（与本轮 GPU inner loop 重叠；CUDA kernel 释放 GIL 时 CPU 采样得以并行）。"""
         key = (meta_iter, seed)
         def _work():
-            self._prefetched = (key, self._presample(expert_buffer, meta_iter, seed))
+            self._prefetched = (key, self._presample(expert_buffers, meta_iter, seed))
         self._prefetch_thread = threading.Thread(target=_work, name="prefetch", daemon=True)
         self._prefetch_thread.start()
 
     def _current_meta_lr(self) -> float:
         """线性衰减 meta_lr：meta_lr_start → meta_lr_end。"""
-        t = self.meta_iter / max(1, self.total_meta_iters - 1)
+        # clamp 到 [0,1]：resume 续训越过 total_meta_iters 时防止线性外推出负 meta_lr
+        # （负 meta_lr → 外层更新反向 → 发散）。越过末点后 meta_lr 恒为 meta_lr_end。
+        t = min(1.0, max(0.0, self.meta_iter / max(1, self.total_meta_iters - 1)))
         return self.meta_lr_start + (self.meta_lr_end - self.meta_lr_start) * t
 
     @property
@@ -744,14 +774,18 @@ class DualGPUReptileTrainer:
         seed: int = None,
     ) -> Dict[str, float]:
         """
-        执行一次 meta-iteration（双 GPU 并行）：
+        执行一次 meta-iteration（双 GPU，**顺序执行不并发**）：
 
-        1. 主线程顺序预采样两张 GPU 所需的全部 expert batch（消除跨线程锁竞争）
-        2. 两线程在各自 GPU 上并行跑 K 步 inner loop（纯 GPU compute，无 Python 锁）
-        3. 收集两份 θ_inner
+        1. 预采样全部 GPU×task×inner 的 expert batch（按 task 所属族取 buffer）
+        2. 两卡**依次**各跑 tasks_per_gpu 个 K 步 inner loop（硬件约束：两卡不能同时跑）
+        3. 收集 n_tasks 份 θ_inner
         4. 平均增量，做 outer update
         5. 将新 θ_meta 同步回两卡
+
+        expert_buffer 可为 {族名: buffer} 字典（Reptile 任务=族）或单一 buffer（旧用法）。
         """
+        expert_buffers = _normalize_buffers(expert_buffer)
+        fams = sorted(expert_buffers.keys())
         theta_meta = self._meta_state   # 当前 θ_meta（CPU tensors）
         n_gpus     = len(self.devices)
         tpg        = self.tasks_per_gpu   # 每卡串行任务数
@@ -763,11 +797,9 @@ class DualGPUReptileTrainer:
             self.expert_ratio_decay_iters, bc_offset=self.bc_iters,
         )
 
-        # 采样 n_tasks 个地图类型（相邻偏移保证多样性）
-        map_types = [
-            str(self.scheduler.sample(self.meta_iter + i, self.total_meta_iters))
-            for i in range(n_tasks)
-        ]
+        # 本 meta-iter 各 task 的地图族（与 _presample 用同一确定性分配）。日志即族名。
+        task_fams = _assign_task_families(fams, self.meta_iter, seed, n_tasks)
+        map_types = list(task_fams)
 
         _seg = self.profiler.segment if self.profiler else lambda _: nullcontext()
 
@@ -775,10 +807,10 @@ class DualGPUReptileTrainer:
         # 本轮 batch：命中上一轮后台预取直接用；随后立即启动下一轮预取，与下方
         # GPU inner loop 重叠（patch 已是 uint8，转换在 GPU；此处只剩 gather，可被隐藏）。
         with _seg("presample"):
-            all_pre_batches = self._get_presample(expert_buffer, self.meta_iter, seed)
-        self._start_prefetch(expert_buffer, self.meta_iter + 1, seed)
+            all_pre_batches = self._get_presample(expert_buffers, self.meta_iter, seed)
+        self._start_prefetch(expert_buffers, self.meta_iter + 1, seed)
 
-        # ---- 并行 inner loop（每线程在各自 GPU 上串行跑 tasks_per_gpu 个任务）----
+        # ---- inner loop：两卡顺序执行（不并发，硬件约束 "不能同时跑"）----
         results: Dict[int, List[Optional[Dict]]] = {i: [] for i in range(n_gpus)}
         errors:  Dict[int, Optional[Exception]]  = {i: None for i in range(n_gpus)}
 
@@ -787,9 +819,10 @@ class DualGPUReptileTrainer:
                 gpu_results: List[Optional[Dict]] = []
                 for task_offset in range(tpg):
                     task_idx  = gpu_idx * tpg + task_offset
+                    fam       = task_fams[task_idx]
                     task_seed = (seed or self.meta_iter * 1000) + task_idx * 99991
                     r = self.sub_trainers[gpu_idx].run_inner_loop(
-                        expert_buffer   = expert_buffer,
+                        expert_buffer   = expert_buffers[fam],
                         selfplay_buffer = selfplay_buffer,
                         theta_meta_cpu  = theta_meta,
                         exp_ratio_val   = exp_ratio_val,
@@ -803,10 +836,8 @@ class DualGPUReptileTrainer:
                 errors[gpu_idx] = exc
 
         with _seg("inner_loop_wall"):
-            threads = [threading.Thread(target=_run_gpu, args=(i,), name=f"inner-gpu{i}")
-                       for i in range(n_gpus)]
-            for t in threads: t.start()
-            for t in threads: t.join()
+            for i in range(n_gpus):     # 顺序：GPU0 跑完它的 tasks，再 GPU1
+                _run_gpu(i)
 
         for idx, exc in errors.items():
             if exc is not None:
@@ -875,7 +906,9 @@ class DualGPUReptileTrainer:
         }
 
     def load_state_dict(self, state: dict):
-        self._meta_state = {k: v.cpu() for k, v in state["net"].items()}
+        # 剥 torch.compile 的 "_orig_mod." 前缀：旧 ckpt 可能在 use_torch_compile=True 下存的，
+        # 当前非编译网络 load 会 key 不匹配（幂等，对干净 ckpt 无副作用）。
+        self._meta_state = {k.replace("_orig_mod.", ""): v.cpu() for k, v in state["net"].items()}
         self.meta_iter   = state.get("meta_iter", 0)
         for trainer in self.sub_trainers:
             trainer.net.load_state_dict(

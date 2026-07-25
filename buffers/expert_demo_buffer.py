@@ -239,6 +239,7 @@ class ExpertDemoBuffer:
         burn_in_len: int = 8,
         rng: Optional[np.random.Generator] = None,
         max_retries: int = 20,
+        need_next: bool = True,
     ) -> Dict[str, np.ndarray]:
         """
         采样一个 batch，返回 float32 tensors，形状均以 (B, T, N, ...) 为前缀。
@@ -298,24 +299,29 @@ class ExpertDemoBuffer:
         # 改为传 uint8 到 GPU、在 GPU 上 .float()/255（实测整条 patch 管道快 ~5.9×）。
         # 消费方（trainer）负责 GPU 端归一化（见 _patch_to_gpu）。
         obs_p  = self._obs_patches[idx_mat]        # (B,T,N,C,K,K) uint8
-        nobs_p = self._next_obs_patches[idx_mat]   # uint8
 
-        return {
+        out = {
             "obs_patches":       obs_p,
             "obs_scalars":       self._obs_scalars[idx_mat].copy(),
             "positions":         self._positions[idx_mat].copy(),
             "actions_expert":    self._actions_expert[idx_mat].copy(),
-            "rewards":           self._rewards[idx_mat].copy(),
-            "next_obs_patches":  nobs_p,
-            "next_obs_scalars":  self._next_obs_scalars[idx_mat].copy(),
-            "next_positions":    self._next_positions[idx_mat].copy(),
-            "dones":             self._dones[idx_mat].copy(),
             "valid":             self._valid[idx_mat].copy(),
             "action_masks":      self._action_masks[idx_mat].copy(),
-            "next_action_masks": self._next_action_masks[idx_mat].copy(),
             "margin_excluded":   self._margin_excluded[idx_mat].copy(),
             "margin_weights":    self._margin_weights[idx_mat].copy(),
         }
+        # next_obs/rewards/dones 仅 DQfD 的 TD 项需要；纯 IL 用不到 → 默认可跳过，
+        # 省掉 ~一半 CPU gather/copy（next_obs_patches 单项即 ~148MB/步）。
+        if need_next:
+            out.update({
+                "rewards":           self._rewards[idx_mat].copy(),
+                "next_obs_patches":  self._next_obs_patches[idx_mat],
+                "next_obs_scalars":  self._next_obs_scalars[idx_mat].copy(),
+                "next_positions":    self._next_positions[idx_mat].copy(),
+                "dones":             self._dones[idx_mat].copy(),
+                "next_action_masks": self._next_action_masks[idx_mat].copy(),
+            })
+        return out
 
     # ------------------------------------------------------------------
     # 统计与维护

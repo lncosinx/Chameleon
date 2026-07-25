@@ -81,7 +81,7 @@ def build_dataset_from_rollout(
     K = obs_builder.K
 
     # per-step 存储（长度 max_steps；next_* 通过移位获得）
-    S_patch  = np.zeros((max_steps, N, 4, K, K), dtype=np.float32)
+    S_patch  = np.zeros((max_steps, N, obs_builder.patch_channels, K, K), dtype=np.float32)
     S_scalar = np.zeros((max_steps, N, 8),        dtype=np.float32)
     S_pos    = np.full((max_steps, N, 2), FINISHED_AGENT_SENTINEL, dtype=np.float32)
     S_action = np.zeros((max_steps, N),           dtype=np.int64)
@@ -100,7 +100,7 @@ def build_dataset_from_rollout(
 
         # ---- 观测（step 前的状态 s_t）----
         agents_xy = wrapper.get_agents_xy()
-        patches, scalars = _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder)
+        patches, scalars = _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder, obstacles=obstacles)
         S_patch[t]  = patches
         S_scalar[t] = scalars
 
@@ -217,15 +217,15 @@ def build_dataset_from_rollout(
     return ep
 
 
-def _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder):
-    """安全构建观测（处理可能的错误）。"""
+def _build_obs_safe(wrapper, obs_list, prev_actions, obs_builder, obstacles=None):
+    """安全构建观测（处理可能的错误）。obstacles 供 cost2go 通道使用。"""
     try:
         agents = wrapper.get_agents_xy()
         targets = wrapper.get_targets_xy()
-        return obs_builder.build(obs_list, agents, targets, prev_actions)
+        return obs_builder.build(obs_list, agents, targets, prev_actions, obstacles=obstacles)
     except Exception:
         N = wrapper.num_agents
         K = wrapper.obs_radius * 2 + 1
-        dummy_patches = np.zeros((N, 4, K, K), dtype=np.float32)
+        dummy_patches = np.zeros((N, obs_builder.patch_channels, K, K), dtype=np.float32)
         dummy_scalars = np.zeros((N, 8), dtype=np.float32)
         return dummy_patches, dummy_scalars

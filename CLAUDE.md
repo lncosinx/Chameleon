@@ -16,12 +16,20 @@
 
 ## 项目概述
 
-基于 **Pogema** 网格环境的**部分可观测多智能体路径规划（MAPF）**。流水线：
-`LaCAM 专家（训练期特权）→ DQfD 模仿（阶段二，off-policy）→ Reptile 跨四地图族元学习 → 目标地图低滞后近 on-policy 微调（阶段三）`。
+基于 **Pogema** 网格环境的**部分可观测多智能体路径规划（MAPF）**。
 
-网络是**共享参数的去中心化 Dueling DRQN（BiIntent-GAT-DRQN）**：每体只用自身局部观测输出 5 维动作价值 Q。**不用 QMIX、不构造 $Q_{tot}$。**
+> **⚠️ v3 战略转向（2026-06-15，最高优先级，详见设计文档 §0′）**：原 `DQfD/CNN+GRU/在线 RL/刷泛化 SR` 路线**比不过同实验室的 LC-MAPF/MAPF-GPT**（meta_iter_20000 实测≈经典 MARL 档），已转向：
+> - **头条贡献 = 通信**（软稀疏 entmax + 迟滞，抗边闪烁/受限带宽/稳定性），**不**比"泛化"。
+> - **骨干**：`CNN patch + GRU + 单轮 GAT` → **tokenized 观测 + Transformer（或时间维 Mamba + 体间注意力）**（transformer vs Mamba 待定）。
+> - **范式**：在线 DQfD(TD/n-step/selfplay/BFS-PBRS) → **离线 IL（专家动作监督/交叉熵）为主**（价值项作可选消融）。
+> - **Reptile 保留**，重定位为"通信策略对新环境的快速适应"；阶段三在线微调 → **离线 few-shot 适应评估**（对位 MAPF-GPT active fine-tuning）。
+> - 下文带 `[v3]` 标注的条目为现行；未标注但属旧范式（reward shaping/DQfD 损失/selfplay/阶段三在线）的内容在 v3 中**降为可选或废弃**。
 
-目标硬件：**2×RTX 5090 + 47 核 CPU**。吞吐目标 **≥ 4×10³ env-step/s**。
+旧流水线（v2，已被上面取代）：`LaCAM 专家 → DQfD 模仿（off-policy）→ Reptile 元学习 → 近 on-policy 微调`。
+
+网络（旧）：**共享参数的去中心化 Dueling DRQN（BiIntent-GAT-DRQN）**。**仍坚持**：每体只用自身局部观测、去中心化、**不用 QMIX/不构造 $Q_{tot}$**；v3 把 Q 头换成动作 logits + 交叉熵（离线 IL）。
+
+目标硬件：**2×RTX 5090 + 47 核 CPU**。
 
 ---
 
@@ -29,18 +37,21 @@
 
 > 改动任何一条前，先在设计文档找到对应小节并同步更新。这些是项目里最容易被改坏、且改坏后症状隐蔽的地方。
 
+> **[v3 适用性]** 仍铁律：**1**(动作序)、**2**(只吃局部)、**3**(特权只训练期/LaCAM 只产专家数据)、**6**(目标方向是合法局部特征)、**10**(通信——现为**头条贡献**)。因转**离线 IL**而**废弃/降可选**：**4**(BFS-PBRS reward 纯 IL 不用)、**8**(Reptile 的 DQfD target)、**9**(on/off-policy 分工、阶段三 lag)、**11**(margin 过滤)、**12**(mellowmax α)、**13**(burn-in，取决于骨干)。**5/7** 随骨干换 tokenized 观测 + 交叉熵可能调整（观测语义保留、非法动作仍需屏蔽）。详见设计文档 §0′。
+
 1. **Pogema 动作顺序（已实测，勿凭记忆）**：
    `0=wait(0,0)`, `1=up(-1,0)`, `2=down(+1,0)`, `3=left(0,-1)`, `4=right(0,+1)`。
    **wait 在第 0 位**。one-hot、动作掩码、LaCAM 专家动作转换、Q 头输出语义**全部以此为准**。改顺序会让模仿学习整体错位且不报错。
 
-2. **部分可观测：policy 只吃局部信息**。policy 网络输入**仅**为 `(4,11,11) patch + 8 维标量特征`。**严禁**把全局地图、全局距离场、LaCAM 路径、其他体未来轨迹喂进 policy。
+2. **部分可观测：policy 只吃局部信息**。policy 网络输入**仅**为 `(C,11,11) patch + 8 维标量特征`（C=4，或启用 cost2go 时 5，见 INVARIANT 5）。**严禁**把全局地图、**整幅**全局距离场、LaCAM 路径、其他体未来轨迹喂进 policy。（cost2go 只取 FOV 内裁剪，属合法局部特征，见 INVARIANT 3 [v4] 放宽。）
 
-3. **特权信号只在训练期、只进 reward/专家，绝不进 policy**：BFS 测地距离与 LaCAM 都是训练期特权信号。BFS 距离**只用于环境计算 reward shaping**；LaCAM **只产专家动作**。部署期无 reward、无 LaCAM。→ 这不破坏部分可观测性。
+3. **特权信号只在训练期、只进 reward/专家，绝不进 policy**：LaCAM 是训练期特权信号，**只产专家动作**，绝不进 policy；部署期无 LaCAM。
+   > **[v4 放宽，2026-07-22]** **cost2go（FOV 内 BFS 测地距离场的局部裁剪）现为合法局部特征、可进 policy 观测**（channel 4，见 INVARIANT 5）。理由：EPH(heuri_map)、MAPF-GPT(cost2go)、SCRIMP 等**所有对比 baseline 都喂障碍感知的目标梯度**；只给穿墙方向向量导致 mazes SR=0、纯 IL 塌缩到直线策略（实测双稳态：wait_pred 非 0 即 1）。cost2go 仅取**每体 FOV 内**的 BFS 距离（从全局静态障碍图算、相对自身居中），**不泄露全局地图/他体轨迹/未来**，不破坏部分可观测性。**全局 BFS 距离场整幅、他体路径、LaCAM 路径仍严禁进 policy。** 部署期 cost2go 由已知静态地图现算（与 baseline 惯例一致）。
 
 4. **Reward = BFS 势函数 shaping（PBRS）**：$F=\gamma\Phi(s')-\Phi(s)$，$\Phi=-d_\text{BFS}(p_i,\text{goal}_i)$。
    **禁止**重新引入"动作方向对齐点积奖励"（非势函数、会偏置最优策略、是 maze 失败根因，已删除）。**禁止**用曼哈顿距离做 shaping 的势函数（梯度穿墙）。
 
-5. **观测通道**：Pogema 原生 `(3,11,11)` = `[障碍 / 智能体(自身恒在中心格) / 目标边界投影]`。本仓库追加 **channel 3 = 时间衰减自身足迹**（范围 [0,0.8]，当前位置=1.0），共 4 通道。
+5. **观测通道**：Pogema 原生 `(3,11,11)` = `[障碍 / 智能体(自身恒在中心格) / 目标边界投影]`。本仓库追加 **channel 3 = 时间衰减自身足迹**（范围 [0,0.8]，当前位置=1.0）。**[v4] channel 4 = cost2go**（FOV 内 BFS 到目标测地距离，相对自身居中到 [0,1]，0.5=同距，见 INVARIANT 3 放宽）。启用 cost2go 时 patch=**5 通道**，否则 4 通道（`ObservationBuilder(use_cost2go=...)`，`patch_channels` 配置须匹配数据）。
    **禁止**再加一个"目标投影通道"——与原生 channel 2 重复。自身位置已由 channel 1 中心格表达，不需单独通道。
 
 6. **目标相对方向是合法的局部特征**：智能体始终知道自己的 goal（`get_targets_xy`），归一化方向向量可作输入。它不是全局地图泄露。
@@ -126,6 +137,18 @@ DQfD 总损失：`L = λ_td·L_TD + λ_nstep·L_n + λ_margin·L_margin + λ_l2�
 
 ---
 
+## 环境与协议（2026-07-23，v4 实测，最高操作优先级）
+
+> **换服务器后完整交接见 `SCHEDULE.md` 顶部"服务器迁移交接"。** 以下是每次工作都要知道的硬事实：
+
+- **3 个 conda 环境**：`gat`（本仓库训练/评测，pogema 2.0.0a）；`marlgpt`（marl-gpt/MAPF-GPT/pogema-benchmark，**pogema==1.4.0**）；`lacam310`（**py3.10，只为生成专家数据**）。
+- **★ LaCAM 致命坑**：`lacam/_lacam.so` 是 **py3.10 编译**，py3.11 下 import 失败 → `backend=auto` **静默回退到差得多的 prioritized 规划器**（污染专家数据、不报错）。**所有 LaCAM 数据生成必须用 `lacam310` 环境**（`lacam_runner.py` 已加大声告警）。
+- **评测协议 = `on_target: nothing`**（标准 MAPF，到达即守位）、`max_episode_steps=128`、observation_type MAPF、CSR/ISR。这是 pogema-benchmark leaderboard（DCC/SCRIMP/MAMBA/LaCAM 已算好，可直接引用）与 MAPF-GPT 的协议。`finish`(到达消失) 训的模型在 `nothing` 下不守位 → CSR≈0。
+- **判性能只看 rollout，不看 loss**：训练 loss ~2000 步就平台震荡，但 rollout CSR 涨到 20000+。**别在 ≤25% 训练下结论。**
+- **v4 主线现状**：`il_joint`（MAPFCommNet 2.16M，5ch cost2go + full-flatten，joint，nothing）≈ DCC~SCRIMP 档、低于 MAPF-GPT-2M；**头条=通信消融**（通信在拥堵区 +0.2~0.5 CSR）。数据 `/data/lncosinx/chameleon_data/c2g_small/`，ckpt `ckpt_il/il_smallwarm_iter_20000.pt`。
+- **root 所有不可写**：`checkpoints/`、`data/`、`logs/` → 改用 `ckpt_il/`、`/data/...`、scratchpad。
+- **进程**：多进程数据生成/训练用 `setsid` 独立进程组，`kill -9 -- -PGID`（`pkill -f 脚本名` 杀不掉 spawn 子进程，会留孤儿写坏数据）。
+
 ## 命令（预期入口；实现后请校准）
 
 > 项目处于设计→实现阶段，以下为**预期**命令；新增/改名脚本时同步此节。
@@ -197,4 +220,5 @@ python scripts/evaluate_policy.py --ckpt <finetuned_ckpt> --config configs/env_m
 - [ ] env-worker 里是否误建了 CUDA 上下文？
 - [ ] 热路径是否残留 per-agent/per-step 的 Python 循环？
 - [x] 通信邻居选择是否用了软稀疏+迟滞（而非 hard top-k 做选择）？EdgeFlipRate 是否在监控？
+- [ ] 训练/评估地图是否互不相交？（地图直接取自 when-to-switch 全部 231 张 `when-to-switch/pomapf_env/maps.yaml`，**全池不分类别**、全局 8:2 划 train/test（184/47），见 `envs/map_registry.py`。配置 `map_name: "all"`；想只用某族改成正则前缀如 `random-`。`PogemaWrapper(split=...)` 默认 'train'，评估脚本须传 `split='test'`。`pick_map` 用乘法哈希按 seed 取图（连续 seed 跨族分布、确定性）。`envs/dataset_split.py` 把 train/test 的 seed 段隔开保证评估可复现。)
 - [ ] 是否在没 profile 的情况下就动手写 Rust？（不要）
