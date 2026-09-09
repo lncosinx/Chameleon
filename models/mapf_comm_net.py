@@ -45,6 +45,7 @@ class MAPFCommNet(nn.Module):
         stickiness_bonus: float = 0.1,
         ema_decay: float = 0.0,
         num_attention_heads: int = 4,
+        hard_topk_select: bool = False,   # SQ3 消融：hard top-k 做选择（预期引起边闪烁）
         # 时间核
         temporal_backend: str = "mamba",
         temporal_layers: int = 2,
@@ -73,6 +74,7 @@ class MAPFCommNet(nn.Module):
                 comm_topk_cap=comm_topk_cap, num_heads=num_attention_heads,
                 entmax_alpha=entmax_alpha, tau_in=tau_in, tau_out=tau_out,
                 stickiness_bonus=stickiness_bonus, ema_decay=ema_decay,
+                hard_topk_select=hard_topk_select,
             )
         else:
             self.communication = build_comm_baseline(

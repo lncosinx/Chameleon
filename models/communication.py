@@ -164,6 +164,9 @@ class BiIntentAttention(nn.Module):
         stickiness_bonus: float = 0.1,  # 已活跃邻居的加分
         # 平滑参数
         ema_decay: float = 0.0,       # 跨步 EMA 平滑（0=不平滑）
+        # SQ3 消融：用 **hard top-k 做邻居选择**（而非只作算力上限）。INVARIANT 10 断言这会
+        # 引起通信图闪烁（边界排名交换→边反复通断），本开关就是为了把该断言做成可证伪的实验。
+        hard_topk_select: bool = False,
     ):
         super().__init__()
         self.comm_radius = comm_radius
@@ -174,6 +177,7 @@ class BiIntentAttention(nn.Module):
         self.tau_out = tau_out
         self.stickiness_bonus = stickiness_bonus
         self.ema_decay = ema_decay
+        self.hard_topk_select = hard_topk_select
         self.head_dim = comm_dim // num_heads
 
         # 意图 → query/key/value
@@ -245,6 +249,17 @@ class BiIntentAttention(nn.Module):
         attn_all = attn_all * has_any_cand
 
         # ===== 串行段（仅迟滞 active 递推；廉价 elementwise）=====
+        if self.hard_topk_select:
+            # 消融臂：直接按注意力权重取 top-k 作为邻居集合，不做迟滞、不做软稀疏。
+            # 与主臂的唯一区别就是"选择方式"，其余（候选集、聚合、统计）完全一致。
+            k = min(self.comm_topk_cap, N)
+            topv, topi = torch.topk(attn_all, k=k, dim=-1)
+            W = torch.zeros_like(attn_all).scatter_(-1, topi, topv)
+            W = W * (attn_all > 0).float()          # 候选集外的位置不能被选进来
+            W = W / W.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            self._active_mask = (W[:, -1] > 0).detach()
+            return self._aggregate(W, intents, B, T, N)
+
         prev_active = (self._active_mask
                        if (self._active_mask is not None
                            and self._active_mask.shape == (B, N, N))
@@ -275,6 +290,11 @@ class BiIntentAttention(nn.Module):
         else:
             W = W_thr
 
+        return self._aggregate(W, intents, B, T, N)
+
+    def _aggregate(self, W, intents, B, T, N):
+        """把权重矩阵 W (B,T,N,N) 聚合成通信特征 + 统计量（主臂/消融臂共用，保证口径一致）。"""
+        nonzero_count = (W > 0).sum(dim=-1)
         # ===== 并行段：多头聚合 =====
         V_raw = self.v_proj(intents)                              # (B,T,N,comm_dim)
         V = V_raw.view(B, T, N, self.num_heads, self.head_dim)
@@ -305,6 +325,8 @@ class BiIntentAttention(nn.Module):
             edge_flip_rate = 0.0
         self._prev_edge_set = cur_edges[:, -1]
 
+        # 注：avg_neighbors 现在与 avg_active_neighbors 同义，都是**topk 封顶后**的真实度数
+        # （即真实带宽/消息量口径）。封顶前的 FOV 候选数会高估通信量，不再作为主指标上报。
         info = {
             "edge_flip_rate": edge_flip_rate,
             "avg_neighbors": nonzero_count.float().mean().item(),

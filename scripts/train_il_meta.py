@@ -34,6 +34,7 @@ def build_net(nc: dict) -> MAPFCommNet:
         head_hidden=nc.get("head_hidden", 128),
         spatial_pool=nc.get("spatial_pool", 0),   # 0=全展平（保留空间布局）
         comm_type=nc.get("comm_type", "madcl"),   # SQ3：只换通信模块的消融轴
+        hard_topk_select=nc.get("hard_topk_select", False),
     )
 
 
@@ -60,6 +61,10 @@ def main():
                    help="覆盖 network config 键（消融用，可多次），如 --set-net tau_in=0 --set-net entmax_alpha=1.0")
     p.add_argument("--tag", default="il", help="ckpt 前缀，区分不同 run（里程碑存 checkpoints/{tag}_iter_N.pt）")
     p.add_argument("--init", default=None, help="热启动 ckpt 路径（训练前 load_state_dict，strict=False）")
+    p.add_argument("--reinit-comm", action="store_true",
+                   help="载入 --init 后**重新随机初始化通信模块**。SQ3 必须开：否则本文的"
+                        "消融臂（参数名相同）会继承已训练好的通信权重，而外部通信基线"
+                        "（参数名不同）只能随机起步 —— 那不是唯一变量对照，是给自己开小灶。")
     p.add_argument("--out", default=None)
     p.add_argument("--buffer-mmap-dir", default=None,
                    help="给定则各族 ExpertDemoBuffer 用磁盘内存映射（mmap）存储，不整族占用 "
@@ -129,9 +134,12 @@ def main():
     if args.init:
         ck = torch.load(args.init, map_location="cpu")
         state = {k.replace("_orig_mod.", ""): v for k, v in ck["net"].items()}
+        if args.reinit_comm:
+            state = {k: v for k, v in state.items() if not k.startswith("communication.")}
         missing, unexpected = net.load_state_dict(state, strict=False)
         print(f"[init] warm-start from {args.init} "
-              f"(missing={len(missing)} unexpected={len(unexpected)})")
+              f"(missing={len(missing)} unexpected={len(unexpected)})"
+              + ("  [通信模块已重新随机初始化]" if args.reinit_comm else ""))
     print(f"Net: MAPFCommNet {n_params/1e6:.2f}M params | temporal={nc.get('temporal_backend','mamba')} "
           f"| {'DualGPU '+str(devices) if use_dual else 'single '+devices[0]}"
           + (f" | init={args.init}" if args.init else ""))

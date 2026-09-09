@@ -208,6 +208,55 @@ EdgeFlipRate 显著低于 dense/hard-topk 臂。
 
 ---
 
+## 6.5 进展与已定论（2026-09-10 更新，滚动维护）
+
+### ★ 已定论 1：推断规则 = **纯策略采样**（不是贪心 argmax）
+同一个 v4 checkpoint、同协议同实例、128 图，只换动作选取方式：
+
+| 推断规则 | random 32/48/64 | mazes 32/48/64 |
+|---|---|---|
+| 贪心 argmax（原做法） | 0.30 / 0.10 / 0.05 | 0.15 / 0.00 / 0.05 |
+| **按策略分布采样 τ=1.0** | **0.88 / 0.62 / 0.41** | **0.52 / 0.24 / 0.13** |
+| 只在卡住时采样(escape,k=3) | 0.84 / 0.51 / 0.21 | 0.42 / 0.17 / 0.09 |
+| 采样 + 到目标即守位(greedy) | 0.76 / 0.56 / 0.25 | 0.43 / 0.20 / 0.09 |
+
+**机理**：共享参数 + 贪心 ⇒ 对称局面下所有体选同一动作 ⇒ 互锁且无法自破。
+**escape 输给纯采样**说明关键不是"卡住后逃逸"，而是**持续的随机性让僵局根本形不成**。
+到目标即守位反而更差 —— `nothing` 协议下守位体有时必须主动让路。
+→ **所有臂一律用 `--action-mode sample --escape-temp 1.0`**（含所有基线消融，保证公平）。
+
+### ★ 已定论 2：leaderboard 数字可直接引用（三条前提已逐一核对）
+1. 地图逐字节相同（`pogema-benchmark/raw_data_MAPF` vs `marl-gpt/eval_configs`，两族各 128/128）；
+2. 协议相同（nothing / 128 步 / soft / seed 0 / agents 8..64）；
+3. **实例相同**：`eval_bench.py` 已改 `split="all"`，不再重映射 seed，起终点布局与 leaderboard 一致
+   → 我们与 SCRIMP/DCC/LaCAM 是**逐实例配对**可比，不是"同图不同实例"。
+
+### ★ 当前站位（v4 模型 + 采样推断，128 图，同实例）
+- **已全档胜**：DCC、MAMBA、QMIX、VDN、IQL、QPLEX（random 与 mazes 六档全胜）。
+- **仍落后**：SCRIMP（random 差距大：0.88/0.62/0.41 vs 0.96/0.84/0.70；mazes 差距小：
+  0.52/0.24/0.13 vs 0.56/0.28/0.15）、MAPF-GPT-2M。
+- 表由 `scripts/make_sq1_table.py` 自动生成（含"对每个对手是否全档胜"的判决行）。
+
+### ★ 已就绪的实验基础设施
+| 组件 | 位置 | 状态 |
+|---|---|---|
+| 统一评测台（CSR/ISR/SoC/通信量，批量 rollout，TTA） | `scripts/eval_bench.py` | ✅ |
+| SQ1 合表（leaderboard 引用 + 判决） | `scripts/make_sq1_table.py` | ✅ |
+| D4 对称增强（M1）+ 单测 | `envs/d4_augment.py`, `scripts/test_d4_augment.py` | ✅ 96 组合全过 |
+| DAgger 纠错管线（M3，两阶段跨 py 版本） | `scripts/generate_dagger_data.py` | ✅ 端到端跑通 |
+| SQ3 六个外部通信基线（同骨干移植）+ 公平性单测 | `models/comm_baselines.py`, `scripts/test_comm_baselines.py` | ✅ 7 臂全过 |
+| SQ3 内部消融（无通信/dense/无迟滞/hard-topk/全局） | `models/communication.py` + `--set-net` | ✅ |
+| SQ3 驱动脚本（12 臂串行训练+评测） | `/root/autodl-tmp/run_sq3.sh` | ✅ |
+| SQ2 few-shot 适应驱动 | `scripts/run_sq2_adaptation.py` | ✅ |
+| SQ4 持续学习驱动（4 臂 + forgetting/BWT） | `scripts/run_sq4_continual.py` | ✅ |
+
+### ★ 进行中
+- 专家数据扩充：`random@64` 已完成（1.93M 步 / 19,915 ep）；`maze@64` 生成中。
+  32 体两族推迟（性价比低于 64 体，评测弱项在高密度）。
+- v5 主训练双臂（D4 on/off，唯一变量）：数据齐即由 `/root/autodl-tmp/night_driver.sh` 自动拉起。
+
+---
+
 ## 7. 判决原则（沿用 v4，是本项目最贵的教训）
 
 1. 让数据判决，不靠论证；每改一项 → 同图台重测 → 看 rollout CSR。
