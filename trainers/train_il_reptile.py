@@ -17,6 +17,7 @@ from copy import deepcopy
 from typing import Dict, List
 
 from losses.il_losses import il_cross_entropy_loss
+from envs.d4_augment import d4_augment_batch
 
 _SENTINEL = object()  # 预取队列结束标记
 
@@ -49,6 +50,9 @@ class ILReptileTrainer:
         self.excluded_weight = cfg.get("excluded_weight", 0.3)
         self.label_smoothing = cfg.get("label_smoothing", 0.0)
         self.wait_weight = cfg.get("il_wait_weight", 1.0)   # wait 类别平衡（<1 降权）
+        # M1：D4 对称增强（8 群元，逐 batch 元素随机取）。网格 MAPF 在旋转/镜像下等变，
+        # 一条专家样本等价 8 条 → 缓解数据量瓶颈。正确性见 scripts/test_d4_augment.py。
+        self.d4_augment = bool(cfg.get("d4_augment", False))
         # reptile=False → 普通 joint 训练（消融）：不保存/恢复 θ_meta、不做外层平均、
         # **保留优化器动量**（Reptile 路径每 task 清动量；joint 若也清会被不公平削弱）。
         self.use_reptile = bool(cfg.get("reptile", True))
@@ -87,6 +91,9 @@ class ILReptileTrainer:
     def _inner_step(self, batch: dict) -> dict:
         self.net.train()
         b = self._to_gpu(batch)
+        if self.d4_augment:
+            b["patches"], b["scalars"], b["actions"], b["masks"] = d4_augment_batch(
+                b["patches"], b["scalars"], b["actions"], b["masks"])
         amp_ctx = torch.autocast(device_type=self.device.type, enabled=self.use_amp)
         with amp_ctx:
             logits, info = self.net(b["patches"], b["scalars"], b["positions"],

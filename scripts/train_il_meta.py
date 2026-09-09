@@ -10,7 +10,7 @@ import numpy as np, torch
 
 from models.mapf_comm_net import MAPFCommNet
 from buffers.expert_demo_buffer import ExpertDemoBuffer
-from scripts.generate_lacam_data import load_buffer_from_disk
+from scripts.generate_lacam_data import load_buffer_from_disk, expert_data_exists
 from utils.seed import set_seed
 from utils.checkpoint import save_checkpoint
 from trainers.train_il_reptile import ILReptileTrainer, DualGPUILReptileTrainer
@@ -50,12 +50,21 @@ def main():
                    help="逗号分隔 meta-iter 里程碑，另存 checkpoints/il_iter_{N}.pt（SR-vs-iter 用）")
     p.add_argument("--batch-size", type=int, default=None, help="覆盖 config batch_size")
     p.add_argument("--seq-len", type=int, default=None, help="覆盖 config sequence_len")
+    p.add_argument("--d4-augment", dest="d4_augment", action="store_true", default=None,
+                   help="开启 D4 对称数据增强（M1，等效 8× 数据）")
+    p.add_argument("--no-d4-augment", dest="d4_augment", action="store_false",
+                   help="关闭 D4 增强（消融对照臂）")
     p.add_argument("--comm-rounds", type=int, default=None, help="覆盖 network comm_rounds（通信消融轴）")
     p.add_argument("--set-net", action="append", default=[], metavar="K=V",
                    help="覆盖 network config 键（消融用，可多次），如 --set-net tau_in=0 --set-net entmax_alpha=1.0")
     p.add_argument("--tag", default="il", help="ckpt 前缀，区分不同 run（里程碑存 checkpoints/{tag}_iter_N.pt）")
     p.add_argument("--init", default=None, help="热启动 ckpt 路径（训练前 load_state_dict，strict=False）")
     p.add_argument("--out", default=None)
+    p.add_argument("--buffer-mmap-dir", default=None,
+                   help="给定则各族 ExpertDemoBuffer 用磁盘内存映射（mmap）存储，不整族占用 "
+                        "常驻 RAM——数据量超出可用内存时用（见 CLAUDE.md 服务器迁移记忆：本机 "
+                        "内存硬限额 62GB）。默认 None=常驻内存（小数据集更快）。会在此目录下按 "
+                        "族建子目录，内容为该次训练的临时磁盘缓存，可随时删除。")
     args = p.parse_args()
     set_seed(args.seed)
     milestones = {int(x) for x in args.ckpt_milestones.split(",") if x.strip()}
@@ -65,6 +74,7 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     if args.batch_size is not None: cfg["batch_size"] = args.batch_size
     if args.seq_len is not None:    cfg["sequence_len"] = args.seq_len
+    if args.d4_augment is not None: cfg["d4_augment"] = args.d4_augment
     nc = yaml.safe_load(open(args.network_config))
     if args.comm_rounds is not None: nc["comm_rounds"] = args.comm_rounds
     for kv in args.set_net:
@@ -83,24 +93,33 @@ def main():
 
     print(f"Device: {device} | meta-train families: {fams}"
           + (f" | held-out: {held_out}" if held_out else ""))
-    def _peek_steps(path: str) -> int:
-        d = np.load(path, allow_pickle=False)
-        return int(len(d["episode_ids"])) if "episode_ids" in d.files else -1
+    def _peek_steps(base_path: str) -> int:
+        """新格式（目录）只读 episode_ids.npy 的 shape；旧格式（.npz）读 episode_ids 键。"""
+        ep_npy = os.path.join(base_path, "episode_ids.npy")
+        if os.path.exists(ep_npy):
+            return int(np.load(ep_npy, mmap_mode="r").shape[0])
+        npz_path = base_path + ".npz"
+        if os.path.exists(npz_path):
+            d = np.load(npz_path, allow_pickle=False)
+            return int(len(d["episode_ids"])) if "episode_ids" in d.files else -1
+        return -1
 
     family_buffers = {}
     for fam in fams:
-        npz = os.path.join(args.data_dir, f"expert_{fam}.npz")
-        if not os.path.exists(npz):
-            print(f"  [skip] {npz} not found"); continue
-        cap = _peek_steps(npz)
+        base_path = os.path.join(args.data_dir, f"expert_{fam}")
+        if not expert_data_exists(base_path):
+            print(f"  [skip] {base_path}(.npz) not found"); continue
+        cap = _peek_steps(base_path)
         if cap < 0:
-            raise ValueError(f"{npz} 为旧格式（无 episode_ids），需重新生成")
-        buf = ExpertDemoBuffer(capacity=max(cap, 1))   # 按 npz 实际步数分配容量
-        load_buffer_from_disk(npz, buf)
+            raise ValueError(f"{base_path} 为旧格式（无 episode_ids），需重新生成")
+        mmap_dir = os.path.join(args.buffer_mmap_dir, fam) if args.buffer_mmap_dir else None
+        buf = ExpertDemoBuffer(capacity=max(cap, 1), mmap_dir=mmap_dir)   # 按数据实际步数分配容量
+        load_buffer_from_disk(base_path, buf)
         family_buffers[fam] = buf
-        print(f"  {fam}: {len(buf):,} steps × {buf.num_agents} agents")
+        print(f"  {fam}: {len(buf):,} steps × {buf.num_agents} agents"
+              + (f" (mmap: {mmap_dir})" if mmap_dir else ""))
     if not family_buffers:
-        raise FileNotFoundError(f"No expert_*.npz under {args.data_dir}")
+        raise FileNotFoundError(f"No expert_* data under {args.data_dir}")
 
     net = build_net(nc)
     n_params = sum(p.numel() for p in net.parameters())

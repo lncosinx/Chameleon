@@ -3,7 +3,9 @@
 为 when-to-switch 原生 5 族（random/mazes/sc1/street/wc3）批量生成 LaCAM 专家数据。
 
 每族只用其 **train split**（envs/map_registry.py 内 8:2 划分，wrapper 默认 split='train'），
-输出 data/expert_{族}.npz。Reptile 任务=族，训练时各族一个独立 buffer。
+输出 data/expert_{族}/（目录，每个字段一个独立 .npy，支持训练时 mmap 加载，不必整族占内存；
+见 scripts/generate_lacam_data.py 的 save_buffer_to_disk/load_buffer_from_disk）。
+Reptile 任务=族，训练时各族一个独立 buffer。
 
 用法：
   python scripts/generate_expert_data.py                       # 5 族, 96 agents, 3000 ep, 40 workers
@@ -13,7 +15,7 @@
 import sys, os, argparse, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.generate_lacam_data import generate_data
+from scripts.generate_lacam_data import generate_data, expert_data_exists
 
 FAMILIES = ["random", "mazes", "sc1", "street", "wc3"]
 
@@ -45,9 +47,9 @@ def main():
         cfg = args.config_tpl.format(fam=fam)
         if not os.path.exists(cfg):
             print(f"  [skip] 配置不存在: {cfg}"); continue
-        out_npz = os.path.join(args.output_dir, f"expert_{fam}.npz")
-        if args.skip_existing and os.path.exists(out_npz):
-            print(f"  [skip-existing] {out_npz} 已存在"); continue
+        out_base = os.path.join(args.output_dir, f"expert_{fam}")
+        if args.skip_existing and expert_data_exists(out_base):
+            print(f"  [skip-existing] {out_base}(.npz) 已存在"); continue
         print(f"\n===== 生成族 '{fam}'  (config={cfg}) =====", flush=True)
         ft = time.time()
         generate_data(
@@ -67,7 +69,7 @@ def main():
 
     print(f"\n[done] 全部用时 {(time.time()-t0)/60:.1f} min")
     for fam, sec in summary.items():
-        print(f"  {fam}: {sec/60:.1f} min  -> data/expert_{fam}.npz")
+        print(f"  {fam}: {sec/60:.1f} min  -> data/expert_{fam}/")
 
 
 if __name__ == "__main__":
