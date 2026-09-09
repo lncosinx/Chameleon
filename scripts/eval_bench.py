@@ -36,6 +36,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MARLGPT = os.path.join(ROOT, "marl-gpt", "eval_configs")
 FAMILY_DIR = {"random": "01-random", "mazes": "02-mazes",
               "warehouse": "03-warehouse", "movingai": "04-movingai"}
+# 各族的官方网格（pogema-benchmark raw_data_MAPF/*/*.yaml）：族之间协议并不相同，
+# 照搬 random 的设置去跑 warehouse/movingai 得到的数字**不可与 leaderboard 比**。
+FAMILY_PROTOCOL = {
+    "random":    dict(agents=[8, 16, 24, 32, 48, 64],    maps=128, seeds="0",     steps=128),
+    "mazes":     dict(agents=[8, 16, 24, 32, 48, 64],    maps=128, seeds="0",     steps=128),
+    "warehouse": dict(agents=[32, 64, 96, 128, 160, 192], maps=1,  seeds="0-127", steps=128),
+    "movingai":  dict(agents=[64, 128, 192, 256],        maps=128, seeds="0",     steps=256),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +254,9 @@ def main():
     ap.add_argument("--escape-k", type=int, default=3)
     ap.add_argument("--escape-temp", type=float, default=1.0)
     ap.add_argument("--escape-no-wait-after", type=int, default=8)
+    ap.add_argument("--auto-protocol", action="store_true",
+                    help="按各族官方协议跑（见 FAMILY_PROTOCOL），覆盖 --agent-counts/"
+                         "--num-maps/--seeds/--max-steps")
     ap.add_argument("--tta", action="store_true",
                     help="测试期 D4 对称集成（8 视角平均动作分布）")
     ap.add_argument("--goal-hold", default="none", choices=["none", "greedy", "wait"],
@@ -272,22 +283,48 @@ def main():
           f"(k={args.escape_k},T={args.escape_temp},nowait={args.escape_no_wait_after}) | "
           f"protocol: on_target={args.on_target} steps={args.max_steps}", flush=True)
 
+    def _parse_seeds(spec):
+        out = []
+        for tok in str(spec).split(","):
+            tok = tok.strip()
+            if "-" in tok and not tok.startswith("-"):
+                a, _, b = tok.partition("-"); out += list(range(int(a), int(b) + 1))
+            elif tok:
+                out.append(int(tok))
+        return out
+
     fams = [f.strip() for f in args.families.split(",") if f.strip()]
     acs = [int(x) for x in args.agent_counts.split(",")]
-    seeds = [int(s) for s in args.seeds.split(",")]
+    # 支持 "0-127" 区间语法：warehouse 族的官方协议是 **1 张图 × 128 个 seed**
+    # （而 random/mazes 是 128 张图 × seed 0），必须能表达这种网格。
+    seeds = []
+    for tok in args.seeds.split(","):
+        tok = tok.strip()
+        if "-" in tok and not tok.startswith("-"):
+            a, _, b = tok.partition("-"); seeds += list(range(int(a), int(b) + 1))
+        elif tok:
+            seeds.append(int(tok))
     results = {}
     for fam in fams:
-        maps = load_maps(fam, args.num_maps)
-        print(f"\n===== {fam}: {len(maps)} maps × {len(seeds)} seed(s) "
-              f"× {args.max_steps} steps =====", flush=True)
+        # --auto-protocol：按各族**官方**网格跑（agents/图数/seed/步数），避免产出
+        # 与 leaderboard 不可比的数字。warehouse 是 1 图×128 seed、movingai 是 256 步。
+        if args.auto_protocol and fam in FAMILY_PROTOCOL:
+            pr = FAMILY_PROTOCOL[fam]
+            f_acs, f_maps, f_seeds, f_steps = (pr["agents"], pr["maps"],
+                                               _parse_seeds(pr["seeds"]), pr["steps"])
+        else:
+            f_acs, f_maps, f_seeds, f_steps = acs, args.num_maps, seeds, args.max_steps
+        maps = load_maps(fam, f_maps)
+        print(f"\n===== {fam}: {len(maps)} maps × {len(f_seeds)} seed(s) "
+              f"× {f_steps} steps | agents={f_acs} =====", flush=True)
         results[fam] = {}
-        for na in acs:
+        for na in f_acs:
             t0 = time.time()
-            specs = [(ms, nm, sd) for sd in seeds for nm, ms in maps]
+            specs = [(ms, nm, sd) for sd in f_seeds for nm, ms in maps]
             rows = []
             for i in range(0, len(specs), args.batch_envs):
                 chunk = [(ms, nm, sd) for (ms, nm, sd) in specs[i:i + args.batch_envs]]
-                rows += rollout_chunk(net, chunk, na, args.max_steps, device, use_c2g,
+                rows += rollout_chunk(net, chunk, na, f_steps, device, use_c2g,
                                       float(nc.get("cost2go_clip", 10.0)),
                                       on_target=args.on_target, action_mode=args.action_mode,
                                       escape_k=args.escape_k, escape_temp=args.escape_temp,

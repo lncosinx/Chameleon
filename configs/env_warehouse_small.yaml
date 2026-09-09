@@ -1,0 +1,29 @@
+# SQ2 的 held-out 族：warehouse（规则货架 + 窄通道 + 瓶颈，结构与 random/maze 完全不同）。
+# 注意：**不设 map_name** —— 设了会走 when-to-switch 固定地图池；这里要的是 pogema-toolbox
+# 的 warehouse generator 在线生成（结构固定、起终点由 seed 随机），作为"外分布任务族"。
+# 评测用 POGEMA validation 的 03-warehouse 地图（本族数据只用于 few-shot 适应，不进预训练）。
+map_type: warehouse
+map_size: 40
+num_agents: 48
+obs_radius: 5
+max_episode_steps: 256
+collision_system: soft
+on_target: nothing
+warehouse:
+  wall_width: 5
+  wall_height: 2
+  walls_in_row: 5
+  walls_rows: 5
+  bottom_gap: 5
+  horizontal_gap: 1
+  vertical_gap: 3
+reward:
+  lambda_f: 1.5
+  shaping_clip: 5.0
+  goal_reward: 3.5
+  step_cost: 0.005
+  collision_cost: 0.3
+  normalize_shaping: true
+  gamma: 0.99
+  stuck_cost: 0.05
+  stuck_patience: 5
