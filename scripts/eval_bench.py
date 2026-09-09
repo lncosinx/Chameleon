@@ -30,6 +30,7 @@ from envs.pogema_env_wrapper import PogemaWrapper
 from envs.observation_builder import ObservationBuilder, build_observations
 from envs.action_mask import build_action_mask_batch
 from scripts.train_il_meta import build_net
+from envs.d4_augment import transform_patch, transform_dir, _PERMS, _ELEMS
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MARLGPT = os.path.join(ROOT, "marl-gpt", "eval_configs")
@@ -75,7 +76,7 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
 @torch.no_grad()
 def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                   on_target="nothing", action_mode="argmax", escape_k=3, escape_temp=1.0,
-                  escape_no_wait_after=8, goal_hold="none", rng=None):
+                  escape_no_wait_after=8, goal_hold="none", tta=False, rng=None):
     """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。"""
     E, N = len(specs), num_agents
     rng = rng or np.random.default_rng(0)
@@ -136,10 +137,37 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
         st = torch.from_numpy(scalars).unsqueeze(1).to(device)
         po = torch.from_numpy(pos).unsqueeze(1).to(device)
         mt = torch.from_numpy(masks).unsqueeze(1).to(device)
-        logits, info = net(pt, st, po, action_masks=mt, reset_comm=False, stateful=True)
+        if tta:
+            # 测试期 D4 增强：把同一真实状态的 8 个对称视角一起前向，各自逆置换回原动作空间
+            # 后对**概率**求平均。8 个视角各自维护自己的 GRU/通信状态（它们是同一条真实轨迹
+            # 的不同表示），故沿 batch 维扩成 E*8，跨步保持对应关系。
+            pv, sv, mv = [], [], []
+            for k, flip in _ELEMS:
+                pv.append(transform_patch(pt, k, flip))
+                s2 = st.clone()
+                s2[..., 0:2] = transform_dir(st[..., 0:2], k, flip)
+                perm = _PERMS[_ELEMS.index((k, flip))].to(device)
+                s2[..., 2:7] = torch.zeros_like(st[..., 2:7]).index_copy(-1, perm, st[..., 2:7])
+                sv.append(s2)
+                mv.append(torch.zeros_like(mt).index_copy(-1, perm, mt))
+            logits, info = net(torch.cat(pv, 0), torch.cat(sv, 0),
+                               po.repeat(8, 1, 1, 1), action_masks=torch.cat(mv, 0),
+                               reset_comm=False, stateful=True)
+            probs_sum = 0.0
+            for gi, (k, flip) in enumerate(_ELEMS):
+                perm = _PERMS[gi].to(device)
+                lp = logits[gi * E:(gi + 1) * E, 0]                  # (E,N,A) 在变换后的动作空间
+                pr = torch.softmax(lp, dim=-1)
+                # 逆置换回原动作空间：perm[a_orig] = a_transformed ⇒ p_orig[a] = p_trans[perm[a]]
+                probs_sum = probs_sum + pr[..., perm]
+            probs_avg = probs_sum / 8.0
+            lg = torch.log(probs_avg.clamp_min(1e-12))               # 回到 logit 尺度
+            lg = lg.masked_fill(~torch.from_numpy(masks).to(device), float("-inf"))
+        else:
+            logits, info = net(pt, st, po, action_masks=mt, reset_comm=False, stateful=True)
+            lg = logits[:, 0]                                        # (E,N,A)
         comm_neighbors.append(info.get("avg_neighbors", 0.0))
         comm_flips.append(info.get("edge_flip_rate", 0.0))
-        lg = logits[:, 0]                                           # (E,N,A)
 
         if action_mode == "argmax":
             acts = lg.argmax(dim=-1).cpu().numpy()
@@ -218,6 +246,8 @@ def main():
     ap.add_argument("--escape-k", type=int, default=3)
     ap.add_argument("--escape-temp", type=float, default=1.0)
     ap.add_argument("--escape-no-wait-after", type=int, default=8)
+    ap.add_argument("--tta", action="store_true",
+                    help="测试期 D4 对称集成（8 视角平均动作分布）")
     ap.add_argument("--goal-hold", default="none", choices=["none", "greedy", "wait"],
                     help="sample 模式下已到达目标的体是否停止采样（nothing 协议守位）")
     ap.add_argument("--seeds", default="0")
@@ -262,7 +292,7 @@ def main():
                                       on_target=args.on_target, action_mode=args.action_mode,
                                       escape_k=args.escape_k, escape_temp=args.escape_temp,
                                       escape_no_wait_after=args.escape_no_wait_after,
-                                      goal_hold=args.goal_hold,
+                                      goal_hold=args.goal_hold, tta=args.tta,
                                       rng=np.random.default_rng(1234 + i))
             agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
             agg["n"] = len(rows)
