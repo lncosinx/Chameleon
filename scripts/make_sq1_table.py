@@ -23,7 +23,8 @@ FAM_DIR = {"random": "01-random", "mazes": "02-mazes",
            "warehouse": "03-warehouse", "movingai": "04-movingai"}
 # 分类：规划器是天花板（不作对手），去中心化 PO 学习方法才是真对手
 CEILING = {"LaCAM", "CBS", "RHCR"}
-AGENTS = [8, 16, 24, 32, 48, 64]
+AGENTS_BY_FAM = {"random": [8, 16, 24, 32, 48, 64], "mazes": [8, 16, 24, 32, 48, 64],
+                 "warehouse": [32, 64, 96, 128, 160, 192], "movingai": [64, 128, 192, 256]}
 
 
 def leaderboard(fam: str, metric: str) -> dict:
@@ -42,6 +43,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ours", action="append", default=[], metavar="PATH[:LABEL]",
                     help="eval_bench.py 的输出 json，可多次；可用 path:LABEL 指定显示名")
+    ap.add_argument("--extra", action="append", default=[], metavar="PATH[:LABEL]",
+                    help="我们自己跑的**外部方法**结果 json（如 MAPF-GPT），与 --ours 同格式，"
+                         "但在表里归为 foundation-model 类，不计入'去中心化 PO 全档胜'的判决")
     ap.add_argument("--metric", default="CSR", choices=["CSR", "ISR", "SoC", "makespan"])
     ap.add_argument("--families", default="random,mazes")
     ap.add_argument("--out", default=None, help="额外写出 markdown 文件")
@@ -49,6 +53,7 @@ def main():
 
     lines = []
     for fam in [f.strip() for f in args.families.split(",") if f.strip()]:
+        AGENTS = AGENTS_BY_FAM[fam]     # 各族官方档位不同，别用同一套
         lb = leaderboard(fam, args.metric)
         ours = {}
         for spec in args.ours:
@@ -59,6 +64,16 @@ def main():
             label = label or j.get("tag") or os.path.basename(path)[:-5]
             res = j["results"].get(fam, {})
             ours[label] = {int(k): v[args.metric] for k, v in res.items()}
+
+        extra = {}
+        for spec in args.extra:
+            path, _, label = spec.partition(":")
+            if not os.path.exists(path):
+                print(f"[warn] 缺 {path}，跳过"); continue
+            j = json.load(open(path))
+            label = label or j.get("tag") or os.path.basename(path)[:-5]
+            res = j["results"].get(fam, {})
+            extra[label] = {int(k): v[args.metric] for k, v in res.items()}
 
         lines.append(f"\n### {fam} — {args.metric}（POGEMA benchmark 协议：nothing / 128 步 / "
                      f"128 图 / 同实例）\n")
@@ -81,18 +96,22 @@ def main():
         for name in sorted(lb):
             if name not in CEILING:
                 lines.append(row(name, lb[name], "去中心化 PO"))
+        for label, vals in extra.items():
+            lines.append(row(label, vals, "foundation model（本地复现）"))
 
         # 判决：对每个"真对手"，我们是否每档都 ≥
         if ours:
             best_label = list(ours)[-1]
             mine = ours[best_label]
             lines.append("")
-            for name in sorted(lb):
+            for name, vals in list(lb.items()) + list(extra.items()):
                 if name in CEILING:
                     continue
                 wins = sum(1 for a in AGENTS
-                           if a in mine and a in lb[name] and mine[a] >= lb[name][a] - 1e-9)
-                tot = sum(1 for a in AGENTS if a in mine and a in lb[name])
+                           if a in mine and a in vals and mine[a] >= vals[a] - 1e-9)
+                tot = sum(1 for a in AGENTS if a in mine and a in vals)
+                if tot == 0:
+                    continue
                 mark = "✅ 全档胜" if wins == tot else f"❌ {wins}/{tot} 档胜"
                 lines.append(f"- vs **{name}**: {mark}")
     text = "\n".join(lines)

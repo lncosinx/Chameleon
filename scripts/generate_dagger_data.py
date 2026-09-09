@@ -38,7 +38,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # phase = collect（策略 rollout，找卡死状态）
 # ===========================================================================
 def phase_collect(args):
-    import torch, yaml
+    """批量 rollout：一次开 E 个同 agent 数的 env，合成一次 (E,1,N,...) 前向。
+    单 episode 逐个跑在本机（25 核被数据生成占满时）实测慢到不可用，故与 eval_bench 一样批量化。"""
+    import torch, yaml, tempfile as _tf
     from envs.pogema_env_wrapper import PogemaWrapper
     from envs.observation_builder import ObservationBuilder, build_observations
     from envs.action_mask import build_action_mask_batch
@@ -49,98 +51,103 @@ def phase_collect(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     nc = yaml.safe_load(open(args.network_config))
     use_c2g = int(nc.get("patch_channels", 4)) >= 5
+    c2g_clip = float(nc.get("cost2go_clip", 10.0))
     net = build_net(nc)
     ck = torch.load(args.ckpt, map_location="cpu")
     net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in ck["net"].items()})
     net.to(device).eval()
-    print(f"[collect] {args.ckpt} (iter={ck.get('meta_iter','?')}) | device={device}", flush=True)
+    print(f"[collect] {args.ckpt} (iter={ck.get('meta_iter','?')}) | device={device} | "
+          f"batch={args.batch_envs}", flush=True)
 
     cfgs = [c.strip() for c in args.env_configs.split(",") if c.strip()]
     agent_counts = [int(a) for a in args.agent_counts.split(",")]
-    snaps = {"maps": [], "positions": [], "goals": [], "num_agents": [], "kind": []}
+    snaps = {"maps": [], "positions": [], "goals": [], "num_agents": []}
     rng = np.random.default_rng(args.seed)
-    t0 = time.time()
+    t0, done_eps = time.time(), 0
 
-    ep_i = 0
-    while ep_i < args.episodes:
-        cfg_path = cfgs[ep_i % len(cfgs)]
+    while done_eps < args.episodes:
+        cfg_path = cfgs[done_eps // max(1, args.batch_envs) % len(cfgs)]
         na = int(agent_counts[rng.integers(0, len(agent_counts))])
+        E = min(args.batch_envs, args.episodes - done_eps)
         base_cfg = yaml.safe_load(open(cfg_path))
-        base_cfg["num_agents"] = na
-        base_cfg["max_episode_steps"] = args.max_steps
-        base_cfg["on_target"] = "nothing"
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        base_cfg.update(num_agents=na, max_episode_steps=args.max_steps, on_target="nothing")
+        with _tf.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             yaml.dump(base_cfg, f); tmp = f.name
-        try:
-            w = PogemaWrapper(tmp, split="train")     # 训练 seed 段，不碰评估地图
-        finally:
-            os.unlink(tmp)
-        obs_list, _ = w.reset(seed=int(rng.integers(0, 900_000)))
-        grid = w.global_grid
-        goals = np.array(w.get_targets_xy(), dtype=np.int32)
-        ob = ObservationBuilder(num_agents=na, obs_radius=5, use_cost2go=use_c2g,
-                                cost2go_clip=float(nc.get("cost2go_clip", 10.0)))
-        ob.reset()
-        dist_fields = [ob._c2g_cache.get(grid, tuple(goals[i])) for i in range(na)]
-        best_d = np.full(na, np.inf, dtype=np.float32)
-        no_improve = np.zeros(na, dtype=np.int32)
-        prev = np.zeros(na, dtype=np.int64)
+
+        envs, obs_l, builders, grids, goals, maps_s, dfields = [], [], [], [], [], [], []
+        for _ in range(E):
+            w = PogemaWrapper(tmp, split="train")     # 训练 seed 段，绝不碰评估地图
+            o, _ = w.reset(seed=int(rng.integers(0, 900_000)))
+            ob = ObservationBuilder(num_agents=na, obs_radius=5, use_cost2go=use_c2g,
+                                    cost2go_clip=c2g_clip)
+            ob.reset()
+            g = np.array(w.get_targets_xy(), dtype=np.int32)
+            envs.append(w); obs_l.append(o); builders.append(ob)
+            grids.append(w.global_grid); goals.append(g)
+            maps_s.append(_grid_to_str(w.global_grid, pad=5))
+            dfields.append([ob._c2g_cache.get(w.global_grid, tuple(g[i])) for i in range(na)])
+        os.unlink(tmp)
+
+        best_d = np.full((E, na), np.inf, dtype=np.float32)
+        no_improve = np.zeros((E, na), dtype=np.int32)
+        taken = np.zeros(E, dtype=np.int32)
+        prev = np.zeros((E, na), dtype=np.int64)
         net.reset_comm_state()
-        map_str = _grid_to_str(grid, pad=5)   # 去掉 pogema 的 obs_radius 边框，见函数注释
-        taken = 0
 
         with torch.no_grad():
             for t in range(args.max_steps):
-                axy = np.array(w.get_agents_xy(), dtype=np.int32)
-                H, W = grid.shape
-                for i in range(na):
-                    r, c = int(axy[i, 0]), int(axy[i, 1])
-                    d = float(dist_fields[i][r, c]) if (0 <= r < H and 0 <= c < W) else np.inf
-                    if d <= 0.0:
-                        best_d[i] = 0.0; no_improve[i] = 0
-                    elif d < best_d[i]:
-                        best_d[i] = d; no_improve[i] = 0
-                    else:
-                        no_improve[i] += 1
+                C = 5 if use_c2g else 4
+                patches = np.empty((E, na, C, 11, 11), dtype=np.float32)
+                scalars = np.empty((E, na, 8), dtype=np.float32)
+                masks = np.ones((E, na, 5), dtype=bool)
+                pos = np.zeros((E, na, 2), dtype=np.float32)
+                for e, w in enumerate(envs):
+                    axy = np.array(w.get_agents_xy(), dtype=np.int32)
+                    patches[e], scalars[e] = build_observations(w, obs_l[e], prev[e], builders[e])
+                    pos[e] = axy
+                    masks[e] = build_action_mask_batch(axy[np.newaxis], grids[e])[0]
+                    H, W = grids[e].shape
+                    ok = (axy[:, 0] >= 0) & (axy[:, 0] < H) & (axy[:, 1] >= 0) & (axy[:, 1] < W)
+                    d = np.full(na, np.inf, dtype=np.float32)
+                    idx = np.nonzero(ok)[0]
+                    for i in idx:
+                        d[i] = dfields[e][i][axy[i, 0], axy[i, 1]]
+                    at_goal = d <= 0.0
+                    improved = d < best_d[e]
+                    best_d[e] = np.where(at_goal, 0.0, np.minimum(best_d[e], d))
+                    no_improve[e] = np.where(at_goal | improved, 0, no_improve[e] + 1)
 
-                # 卡死判据：有 ≥stuck_min 个体连续 stuck_k 步无进展且不在目标上
-                stuck = (no_improve >= args.stuck_k) & (best_d > 0)
-                if taken < args.snaps_per_episode and int(stuck.sum()) >= args.stuck_min \
-                        and t >= args.min_step:
-                    snaps["maps"].append(map_str)
-                    snaps["positions"].append(axy.copy())
-                    snaps["goals"].append(goals.copy())
-                    snaps["num_agents"].append(na)
-                    snaps["kind"].append("stuck")
-                    taken += 1
-                    no_improve[:] = 0      # 避免同一僵局连拍多张几乎相同的快照
+                    stuck = (no_improve[e] >= args.stuck_k) & (best_d[e] > 0)
+                    if (taken[e] < args.snaps_per_episode and t >= args.min_step
+                            and int(stuck.sum()) >= args.stuck_min):
+                        snaps["maps"].append(maps_s[e])
+                        snaps["positions"].append(axy.copy())
+                        snaps["goals"].append(goals[e].copy())
+                        snaps["num_agents"].append(na)
+                        taken[e] += 1
+                        no_improve[e] = 0     # 同一僵局不重复取样
 
-                p_, s_ = build_observations(w, obs_list, prev, ob)
-                mask = build_action_mask_batch(axy[np.newaxis], grid)[0]
-                pt = torch.from_numpy(p_).to(device)[None, None]
-                st = torch.from_numpy(s_).to(device)[None, None]
-                po = torch.from_numpy(axy.astype(np.float32)).to(device)[None, None]
-                mt = torch.from_numpy(mask).to(device)[None, None]
+                pt = torch.from_numpy(patches).unsqueeze(1).to(device)
+                st = torch.from_numpy(scalars).unsqueeze(1).to(device)
+                po = torch.from_numpy(pos).unsqueeze(1).to(device)
+                mt = torch.from_numpy(masks).unsqueeze(1).to(device)
                 logits, _ = net(pt, st, po, action_masks=mt, reset_comm=False, stateful=True)
-                probs = torch.softmax(logits[0, 0], dim=-1)
-                acts = torch.multinomial(probs, 1).squeeze(-1).cpu().numpy()
-                obs_list, _, _, _ = w.step(acts.tolist())
+                probs = torch.softmax(logits[:, 0], dim=-1)
+                acts = torch.multinomial(probs.reshape(-1, 5), 1).reshape(E, na).cpu().numpy()
+                for e, w in enumerate(envs):
+                    obs_l[e], _, _, _ = w.step(acts[e].tolist())
                 prev = acts.astype(np.int64)
 
-        ep_i += 1
-        if ep_i % 50 == 0:
-            print(f"  [collect] ep {ep_i}/{args.episodes}  snapshots={len(snaps['maps'])}  "
-                  f"({time.time()-t0:.0f}s)", flush=True)
+        done_eps += E
+        print(f"  [collect] {done_eps}/{args.episodes} eps  snapshots={len(snaps['maps'])}  "
+              f"({time.time()-t0:.0f}s)", flush=True)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    np.savez_compressed(
-        args.out,
-        maps=np.array(snaps["maps"], dtype=object),
-        positions=np.array(snaps["positions"], dtype=object),
-        goals=np.array(snaps["goals"], dtype=object),
-        num_agents=np.array(snaps["num_agents"], dtype=np.int32),
-        allow_pickle=True,
-    )
+    np.savez_compressed(args.out,
+                        maps=np.array(snaps["maps"], dtype=object),
+                        positions=np.array(snaps["positions"], dtype=object),
+                        goals=np.array(snaps["goals"], dtype=object),
+                        num_agents=np.array(snaps["num_agents"], dtype=np.int32))
     print(f"[collect] {len(snaps['maps'])} 个卡死状态快照 → {args.out}  "
           f"({time.time()-t0:.0f}s)", flush=True)
 
@@ -286,6 +293,7 @@ def main():
     p.add_argument("--stuck-min", type=int, default=2, help="至少几个体同时卡住才拍快照")
     p.add_argument("--min-step", type=int, default=8, help="episode 前多少步不拍（还没成形）")
     p.add_argument("--snaps-per-episode", type=int, default=2)
+    p.add_argument("--batch-envs", type=int, default=24, help="一次并行 rollout 的 episode 数")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out", default="/root/autodl-tmp/dagger/snapshots.npz")
     # label
