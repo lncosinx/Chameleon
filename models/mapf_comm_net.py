@@ -17,6 +17,7 @@ from typing import Optional, Tuple, Dict
 
 from models.spatial_encoder import ResidualCNNEncoder
 from models.communication import BiIntentAttention
+from models.comm_baselines import build_comm_baseline
 from models.temporal_core import TemporalCore
 
 
@@ -54,6 +55,9 @@ class MAPFCommNet(nn.Module):
         head_hidden: int = 128,
         # 空间池化：0=全展平（保留空间布局，默认）；n>0=AdaptiveAvgPool2d(n)
         spatial_pool: int = 0,
+        # SQ3 通信消融轴："madcl"=本文的软稀疏entmax+迟滞；其余见 models/comm_baselines.py
+        # （commnet/ic3net/tarmac/dial/atoc/dgn）。**只换通信模块，其它一切不变**。
+        comm_type: str = "madcl",
     ):
         super().__init__()
         self.spatial = ResidualCNNEncoder(patch_channels, scalar_feat_dim, d_model,
@@ -62,12 +66,18 @@ class MAPFCommNet(nn.Module):
         self.comm_rounds = comm_rounds
         self.comm_in = nn.Linear(d_model, intent_dim)
         self.comm_out = nn.Linear(intent_dim, d_model)
-        self.communication = BiIntentAttention(
-            intent_dim=intent_dim, comm_dim=comm_dim, comm_radius=comm_radius,
-            comm_topk_cap=comm_topk_cap, num_heads=num_attention_heads,
-            entmax_alpha=entmax_alpha, tau_in=tau_in, tau_out=tau_out,
-            stickiness_bonus=stickiness_bonus, ema_decay=ema_decay,
-        )
+        self.comm_type = comm_type
+        if comm_type == "madcl":
+            self.communication = BiIntentAttention(
+                intent_dim=intent_dim, comm_dim=comm_dim, comm_radius=comm_radius,
+                comm_topk_cap=comm_topk_cap, num_heads=num_attention_heads,
+                entmax_alpha=entmax_alpha, tau_in=tau_in, tau_out=tau_out,
+                stickiness_bonus=stickiness_bonus, ema_decay=ema_decay,
+            )
+        else:
+            self.communication = build_comm_baseline(
+                comm_type, intent_dim=intent_dim, comm_dim=comm_dim,
+                comm_radius=comm_radius, num_heads=num_attention_heads)
         self.temporal = TemporalCore(d_model, backend=temporal_backend,
                                      n_layers=temporal_layers, d_state=d_state,
                                      d_conv=d_conv, expand=mamba_expand)
@@ -108,9 +118,10 @@ class MAPFCommNet(nn.Module):
         # 每轮（除最后）跑完恢复 snapshot，只留最后一轮写入。comm_rounds=1 时无影响。
         info: Dict = {}
         c = self.communication
-        snap = (c._active_mask, c._prev_edge_set, c._ema_c)
+        has_hyst = hasattr(c, "_active_mask")     # 只有 madcl 的 BiIntentAttention 有迟滞态
+        snap = (c._active_mask, c._prev_edge_set, c._ema_c) if has_hyst else None
         for r in range(self.comm_rounds):
-            if r > 0:
+            if r > 0 and has_hyst:
                 c._active_mask, c._prev_edge_set, c._ema_c = snap
             intent = self.comm_in(e)
             comm_feat, info = c.forward_sequence(intent, positions)

@@ -33,10 +33,19 @@ def main():
     p.add_argument("--config-tpl", type=str, default="configs/env_{fam}.yaml")
     p.add_argument("--skip-existing", action="store_true",
                    help="若 data/expert_{族}.npz 已存在则跳过该族")
+    p.add_argument("--store-next", action="store_true",
+                   help="同时存 next_obs/next_* 字段（只有已废弃的 DQfD/TD 损失需要；"
+                        "默认不存，省约一半磁盘）")
     p.add_argument("--cost2go", action="store_true",
                    help="观测追加 cost2go 通道（patch 4→5 通道，T2）；输出到 --output-dir")
     p.add_argument("--cost2go-clip", type=float, default=10.0, help="cost2go 相对距离 clip 半径")
     args = p.parse_args()
+
+    # spawn 出来的 worker 会重新 import 模块，靠环境变量把开关传下去（模块级赋值传不到子进程）
+    os.environ["CHAMELEON_STORE_NEXT"] = "1" if args.store_next else "0"
+    import scripts.generate_lacam_data as _gld
+    _gld.STORE_NEXT = bool(args.store_next)
+    print(f"[storage] next_* 字段: {'存' if args.store_next else '不存（纯 IL 用不到，省一半磁盘）'}")
 
     fams = [f.strip() for f in args.families.split(",") if f.strip()]
     print(f"[generate_expert_data] families={fams} | num_agents={args.num_agents} "

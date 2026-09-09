@@ -33,6 +33,7 @@ def build_net(nc: dict) -> MAPFCommNet:
         d_conv=nc.get("d_conv", 4), mamba_expand=nc.get("mamba_expand", 2),
         head_hidden=nc.get("head_hidden", 128),
         spatial_pool=nc.get("spatial_pool", 0),   # 0=全展平（保留空间布局）
+        comm_type=nc.get("comm_type", "madcl"),   # SQ3：只换通信模块的消融轴
     )
 
 

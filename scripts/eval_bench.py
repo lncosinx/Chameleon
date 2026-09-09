@@ -54,7 +54,11 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
     cfg = dict(map_type="random", fixed_map=map_str, fixed_map_name=name,
                map_size=max(len(rows), len(rows[0])), num_agents=num_agents, obs_radius=5,
                max_episode_steps=max_steps, collision_system="soft",
-               on_target=on_target, split="test")
+               # split="all"：不做 train/test seed 重映射，直接用原始 seed —— 这样起终点
+               # 布局与 pogema-benchmark leaderboard（seed: 0）**逐实例一致**，我们的数字
+               # 与 SCRIMP/DCC/LaCAM 是配对可比的，而不是"同图不同实例"。
+               # 地图本身是外部固定的 validation-* 集，训练用的是在线 generator，无泄漏风险。
+               on_target=on_target, split="all")
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
         yaml.dump(cfg, f); p = f.name
     try:
@@ -189,7 +193,9 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                 arrive_t[i] = float(notat[-1] + 1) if len(notat) else 0.0
         out.append(dict(
             CSR=float(at_goal.all()), ISR=float(at_goal.mean()),
-            SoC=float(arrive_t.sum() / N), makespan=float(arrive_t.max()),
+            # SoC 用**总和**（对齐 pogema-benchmark 的 SoC 口径：8体 ep_length=22 → SoC=84），
+            # makespan = 最后一个到达时刻（= 它们的 ep_length）
+            SoC=float(arrive_t.sum()), makespan=float(arrive_t.max()),
             escape_frac=float(n_escape) / max(1, E * N * max_steps),
             avg_neighbors=float(np.mean(comm_neighbors)) if comm_neighbors else 0.0,
             edge_flip=float(np.mean(comm_flips)) if comm_flips else 0.0,

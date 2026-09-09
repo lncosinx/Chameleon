@@ -28,6 +28,16 @@ _STORAGE_KEYS = [
     "margin_excluded", "margin_weights",
 ]
 
+# next_* 字段（next_obs_patches 等）只有已废弃的 DQfD/TD 损失要用；v3+ 的纯 IL 主线
+# 从不读取，而 next_obs_patches 单项就占每族约一半磁盘（15k-ep 规模 39GB）。默认**不生成**，
+# 需要时用 generate_expert_data.py --store-next 打开（同时 buffers 侧见 attach_disk_dir）。
+STORE_NEXT = os.environ.get("CHAMELEON_STORE_NEXT", "0") == "1"
+
+
+def storage_keys():
+    return [k for k in _STORAGE_KEYS if STORE_NEXT or not k.startswith("next_")]
+
+
 # 单 worker 攒够这么多 episode 就落一次盘（而不是攒完分给它的全部 episode 才写）。
 # 2026-08-10 事故：15000-ep 那次每 worker 攒 ~1875 episode 全程不落盘，8 worker
 # 一起把 62GB 内存限额打穿、连 sshd 都被 OOM 牵连。见 memory feedback_nohup_long_running。
@@ -35,9 +45,10 @@ _FLUSH_EVERY_EPISODES = 300
 
 
 def _episode_to_storage(ep: dict, ep_id: int) -> dict:
-    """将 build_dataset_from_rollout 的 episode dict 转为压缩存储数组 + episode_ids。"""
+    """将 build_dataset_from_rollout 的 episode dict 转为压缩存储数组 + episode_ids。
+    STORE_NEXT=False（默认）时不构建 next_* 字段（省一半磁盘与写入时间）。"""
     T = ep["actions_expert"].shape[0]
-    return {
+    out = {
         "obs_patches":       (np.asarray(ep["obs_patches"]) * 255).clip(0, 255).astype(np.uint8),
         "next_obs_patches":  (np.asarray(ep["next_obs_patches"]) * 255).clip(0, 255).astype(np.uint8),
         "obs_scalars":       np.asarray(ep["obs_scalars"]).astype(np.float16),
@@ -54,6 +65,10 @@ def _episode_to_storage(ep: dict, ep_id: int) -> dict:
         "margin_weights":    np.asarray(ep["margin_weights"]).astype(np.float16),
         "episode_ids":       np.full(T, ep_id, dtype=np.int32),
     }
+    if not STORE_NEXT:
+        for k in [k for k in out if k.startswith("next_")]:
+            del out[k]
+    return out
 
 
 def expert_data_exists(base_path: str) -> bool:
@@ -90,6 +105,8 @@ def save_buffer_to_disk(buffer, base_path: str):
         "margin_weights":    buffer._margin_weights[:n],
         "episode_ids":       buffer._episode_ids[:n],
     }
+    arrays = {k: v for k, v in arrays.items() if v is not None
+              and (STORE_NEXT or not k.startswith("next_"))}
     os.makedirs(base_path, exist_ok=True)
     total_bytes = 0
     for k, v in arrays.items():
@@ -114,7 +131,7 @@ def load_buffer_from_disk(base_path: str, buffer):
 
     检测旧版（per-agent，无 positions/episode_ids）格式并明确报错，要求重新生成。
     """
-    keys = _STORAGE_KEYS + ["episode_ids"]
+    keys = storage_keys() + ["episode_ids"]
     npz_path = base_path + ".npz"
     dir_ready = os.path.isdir(base_path) and os.path.exists(os.path.join(base_path, "episode_ids.npy"))
 
@@ -291,7 +308,7 @@ def _worker_generate(args: tuple):
         if not chunk_arrays:
             return
         steps = sum(v["episode_ids"].shape[0] for v in chunk_arrays)
-        all_keys = _STORAGE_KEYS + ["episode_ids"]
+        all_keys = storage_keys() + ["episode_ids"]
         merged = {
             k: np.concatenate([d[k] for d in chunk_arrays], axis=0)
             for k in all_keys
@@ -375,7 +392,7 @@ def _merge_tmp_parts(worker_tmp_paths: list, output_dir: str, max_samples: int) 
     这个 worker 的最后一个 part 处理完后才推进一次）；按 max_samples（时间步）
     截断（保留最后 max_samples 步，语义与旧实现一致）。
     """
-    keys = _STORAGE_KEYS + ["episode_ids"]
+    keys = storage_keys() + ["episode_ids"]
     # (path, is_last_part_of_this_worker) 展平，保留 worker 边界信息
     flat = []
     for paths in worker_tmp_paths:
@@ -437,7 +454,7 @@ def _merge_tmp_parts(worker_tmp_paths: list, output_dir: str, max_samples: int) 
                 n_write = e - s
                 out_arrays["episode_ids"][write_cursor:write_cursor + n_write] = \
                     ids_raw[s:e].astype(np.int64) + ep_offset
-                for k in _STORAGE_KEYS:
+                for k in storage_keys():
                     if k in out_arrays:
                         out_arrays[k][write_cursor:write_cursor + n_write] = data[k][s:e]
                 write_cursor += n_write

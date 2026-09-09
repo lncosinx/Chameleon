@@ -171,6 +171,10 @@ class PogemaWrapper:
         # 跳过 registry/generator，直接用给定 map string 建 GridConfig。
         self.fixed_map_str: Optional[str] = self._raw_cfg.get("fixed_map")
         self.fixed_map_name: Optional[str] = self._raw_cfg.get("fixed_map_name")
+        # 显式起终点（DAgger 用：从策略访问过的任意状态重启专家）。给定时跳过 pogema
+        # 的随机放置，直接把这批 (agents_xy, targets_xy) 交给 GridConfig。
+        self.fixed_agents_xy = self._raw_cfg.get("fixed_agents_xy")
+        self.fixed_targets_xy = self._raw_cfg.get("fixed_targets_xy")
 
         self.map_type: str = self._raw_cfg["map_type"]
         self.map_size: int = self._raw_cfg.get("map_size", 64)
@@ -361,6 +365,16 @@ class PogemaWrapper:
         else:
             # random 地图：传入 obstacle_density（Pogema GridConfig 对应参数名 density）
             gc_kwargs["density"] = self.obstacle_density
+
+        if self.fixed_agents_xy is not None and self.fixed_targets_xy is not None:
+            # ★ 坐标系陷阱：pogema 内部把地图四周 pad 了 obs_radius 圈，`get_agents_xy()` /
+            # `global_grid` 都是 **padded** 坐标，而 GridConfig 的 agents_xy 收的是
+            # **unpadded** 原图坐标。本项目其它地方一律用 padded 系，故这里接受 padded
+            # 输入、减去 obs_radius 再交给 GridConfig（否则每个 agent 会被平移 5 格且不报错）。
+            off = self.obs_radius
+            gc_kwargs["agents_xy"] = [[int(p[0]) - off, int(p[1]) - off] for p in self.fixed_agents_xy]
+            gc_kwargs["targets_xy"] = [[int(p[0]) - off, int(p[1]) - off] for p in self.fixed_targets_xy]
+            gc_kwargs["num_agents"] = len(gc_kwargs["agents_xy"])
 
         gc = GridConfig(**gc_kwargs)
         return pogema_v0(grid_config=gc)
