@@ -361,6 +361,25 @@ class ExpertDemoBuffer:
     # 采样
     # ------------------------------------------------------------------
 
+    def _valid_starts(self, sequence_len: int) -> np.ndarray:
+        """所有"起点 s 起 sequence_len 步不跨 episode"的 s，按 sequence_len 缓存。
+
+        判据与原逻辑一致：首尾 episode_id 相同即可 —— episode_ids 沿写入顺序单调递增
+        且按 episode 连续写入，首尾相同 ⟹ 中间全相同。
+        """
+        cached = getattr(self, "_valid_starts_cache", None)
+        if cached is not None and cached[0] == sequence_len and cached[1] == self._size:
+            return cached[2]
+        ep = np.asarray(self._episode_ids[:self._size])
+        n = self._size - sequence_len + 1
+        if n <= 0:
+            starts = np.empty(0, dtype=np.int64)
+        else:
+            ok = (ep[:n] == ep[sequence_len - 1:sequence_len - 1 + n]) & (ep[:n] >= 0)
+            starts = np.nonzero(ok)[0].astype(np.int64)
+        self._valid_starts_cache = (sequence_len, self._size, starts)
+        return starts
+
     def sample(
         self,
         batch_size: int,
@@ -403,22 +422,18 @@ class ExpertDemoBuffer:
                 f"sequence_len={sequence_len}"
             )
 
-        max_start = self._size - sequence_len
-        starts = []
-        for _ in range(batch_size):
-            chosen = None
-            for _try in range(max_retries):
-                s = int(rng.integers(0, max_start + 1))
-                # 端点同 episode（不跨边界、不跨 circular 写头）
-                if self._episode_ids[s] == self._episode_ids[s + sequence_len - 1] \
-                        and self._episode_ids[s] >= 0:
-                    chosen = s
-                    break
-            if chosen is None:
-                # 退化：接受任意起点（极少发生，仅当 episode 普遍短于 sequence_len）
-                chosen = int(rng.integers(0, max_start + 1))
-            starts.append(chosen)
-        start_indices = np.array(starts, dtype=np.int64)
+        # 合法起点 = 该位置起 sequence_len 步不跨 episode 边界。预计算一次（向量化），
+        # 之后直接从中均匀取样。
+        # ★ 2026-09-10 修：原实现是"随机试 20 次，都失败就**接受任意起点**"——那个退化分支
+        # 会静默产出**跨 episode 边界**的序列（把上一局的结尾和下一局的开头拼成一条轨迹训练）。
+        # 小图数据 episode 中位数只有 35 步、22% 短于 32 步，实测约 3% 的采样会掉进这个分支。
+        # 现在按构造保证合法，退化分支彻底删掉。
+        starts_pool = self._valid_starts(sequence_len)
+        if starts_pool.size == 0:
+            raise ValueError(
+                f"没有任何长度 ≥ {sequence_len} 的 episode（数据 episode 太短）。"
+                f"请降低 sequence_len 或重新生成数据。")
+        start_indices = starts_pool[rng.integers(0, starts_pool.size, size=batch_size)]
 
         # (B, T) 连续索引（已保证不跨 episode，无需取模，但安全起见取模）
         idx_mat = (start_indices[:, None] + np.arange(sequence_len)[None, :]) % self.capacity
