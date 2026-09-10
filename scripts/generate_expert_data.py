@@ -26,7 +26,13 @@ def main():
                    help="逗号分隔的族列表，对应 configs/env_{族}.yaml")
     p.add_argument("--num-episodes", type=int, default=3000, help="每族 episode 数")
     p.add_argument("--num-agents", type=int, default=96, help="智能体数（所有族必须一致）")
-    p.add_argument("--map-size", type=int, default=64, help="仅元数据；实际尺寸由 registry 地图决定")
+    p.add_argument("--map-size", type=int, default=None,
+                   help="覆盖配置里的 map_size。**不给就用配置值**（默认行为）。"
+                        "★2026-09-10 修：原来默认 64 会**静默覆盖** env_*_small.yaml 的 "
+                        "map_size:20 —— 于是'小图高密度'配置从未生效，random 专家数据一直是 "
+                        "64x64 大图(64 体密度 2%)，而评测是 20x21(密度 18%)，9 倍失配。"
+                        "help 原文写'仅元数据'是错的：generate_lacam_data.py 里 "
+                        "`wrapper.map_size = map_size` 真的会改地图生成尺寸。")
     p.add_argument("--num-workers", type=int, default=40, help="每族并行进程数（-1=auto）")
     p.add_argument("--backend", type=str, default="auto", help="LaCAM 后端：auto/native/prioritized")
     p.add_argument("--output-dir", type=str, default="data")
@@ -65,7 +71,7 @@ def main():
             config_path=cfg,
             num_episodes=args.num_episodes,
             num_agents=args.num_agents,
-            map_size=args.map_size,
+            map_size=args.map_size,   # None = 用配置里的值
             backend=args.backend,
             output_dir=args.output_dir,
             save_to_disk=True,

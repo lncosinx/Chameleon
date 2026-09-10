@@ -252,6 +252,26 @@ v4 模型 + 采样（未开 TTA）：1.000 / 0.969 / 0.883 / 0.438 / 0.086 / 0.0
 注意各族协议不同（warehouse 是 1 图 128 seed、movingai 是 256 步），`eval_bench.py --auto-protocol`
 已内置官方网格表，避免产出不可比的数字。
 
+### ★ 已定论 6（2026-09-10，**影响最大的一次发现**）：random 专家数据密度一直是错的
+`scripts/generate_expert_data.py --map-size` 默认 64，而 `generate_lacam_data.py` 里
+`wrapper.map_size = map_size` **会真的改地图生成尺寸**（该参数 help 写的"仅元数据"是错的）。
+后果：`env_random_small.yaml` 里 `map_size: 20` 从未生效，**random 专家数据一直生成在 64×64 大图上**：
+
+| | 训练数据密度 | 评测密度 | |
+|---|---|---|---|
+| random | **2.0%**（64 体 / 64×64） | **18%**（64 体 / 20×21） | ❌ 9 倍失配 |
+| mazes | 20.7%（64 体 / 21×21） | 21% | ✅ 一直是对的 |
+
+**这解释了一个一直没解释的现象**：我们 mazes 追平/超过 SCRIMP，random 却明显落后——
+而 random 本该是所有方法最容易的一族。maze 生成器走 `maze:` 配置块（width 20-22），
+不受 map_size 影响，所以只有 random 中招。
+
+**已修**：`--map-size` 默认改 None = 尊重配置；两处 `wrapper.map_size` 加 None 判断。
+**已重新生成**：random@{64,48,32} 各 20000 ep（20×20，密度 20%）。小图 LaCAM 快 4 倍，
+20k ep 约 45 分钟/档（旧 64×64 要 3.5 小时）。
+**教训**：数据生成的 CLI 默认值会静默覆盖配置文件 —— 每个新数据集都要**从落盘数据反查**
+实际地图尺寸/密度（`positions.npy` 的 max 减 obs_radius），不能只信配置和 help 文本。
+
 ### ★ 已定论 4：评测台口径与 pogema 官方**逐 episode 完全一致**
 用真实模型跑 12 张图 × 32 体，把我们自己算的 CSR/ISR 与 pogema 自带 `info['metrics']` 对拍：
 `ours CSR=0.750 ISR=0.966` vs `pogema CSR=0.750 ISR=0.966`，**逐 episode 完全相同**。

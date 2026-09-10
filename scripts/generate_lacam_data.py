@@ -41,7 +41,7 @@ def storage_keys():
 # 单 worker 攒够这么多 episode 就落一次盘（而不是攒完分给它的全部 episode 才写）。
 # 2026-08-10 事故：15000-ep 那次每 worker 攒 ~1875 episode 全程不落盘，8 worker
 # 一起把 62GB 内存限额打穿、连 sshd 都被 OOM 牵连。见 memory feedback_nohup_long_running。
-_FLUSH_EVERY_EPISODES = 300
+_FLUSH_EVERY_EPISODES = 150   # 64 体数据每 episode 更大，300 会让单分片达 1.7GB（见 _flush 注释）
 
 
 def _episode_to_storage(ep: dict, ep_id: int) -> dict:
@@ -282,7 +282,8 @@ def _worker_generate(args: tuple):
     from lacam.lacam_dataset_builder import build_dataset_from_rollout
 
     wrapper = PogemaWrapper(config_path)
-    wrapper.map_size = map_size
+    if map_size is not None:      # None = 尊重配置文件里的 map_size（见 generate_expert_data 的 --map-size 注释）
+        wrapper.map_size = map_size
     wrapper.num_agents = num_agents
     obs_builder = ObservationBuilder(num_agents=num_agents, obs_radius=5,
                                      use_cost2go=use_cost2go, cost2go_clip=cost2go_clip)
@@ -315,6 +316,19 @@ def _worker_generate(args: tuple):
         }
         tmp_path = os.path.join(tmp_dir, f".tmp_worker_{worker_id:04d}_{part_idx:04d}.npz")
         np.savez(tmp_path, **merged)
+        # ★ 2026-09-10 事故：16 个 worker 各自不停写 ~1.7GB 未压缩 npz，写入速率远超磁盘
+        # 回写能力 → 脏页无界堆积（表现为"内存 84GB 占满、CPU/GPU 全闲、机器像死机"），
+        # 最终 maze@64 生成被迫中断。这里写完立刻 fsync 落盘、再把该文件从页缓存丢弃：
+        # 分片之后只会被合并阶段顺序读一次，留在缓存里没有价值，只会挤占内存。
+        try:
+            fd = os.open(tmp_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass    # fadvise 不支持时退化为普通行为，不影响正确性
         tmp_paths.append(tmp_path)
         total_steps += steps
         part_idx += 1
@@ -480,7 +494,7 @@ def generate_data(
     config_path: str,
     num_episodes: int = 100,
     num_agents: int = 8,
-    map_size: int = 16,
+    map_size: int = None,     # None = 用配置文件的 map_size，不覆盖
     backend: str = "prioritized",
     output_dir: str = "data",
     max_buffer_samples: int = 2_000_000,
@@ -526,7 +540,8 @@ def generate_data(
         from lacam.lacam_dataset_builder import build_dataset_from_rollout
 
         wrapper = PogemaWrapper(config_path)
-        wrapper.map_size = map_size
+        if map_size is not None:
+            wrapper.map_size = map_size
         wrapper.num_agents = num_agents
         obs_builder    = ObservationBuilder(num_agents=num_agents, obs_radius=5,
                                             use_cost2go=use_cost2go, cost2go_clip=cost2go_clip)
