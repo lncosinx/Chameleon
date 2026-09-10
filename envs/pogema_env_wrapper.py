@@ -39,14 +39,26 @@ def _generate_warehouse_map(cfg: dict, seed: Optional[int] = None) -> str:
         generate_warehouse,
     )
     wh_cfg = cfg.get("warehouse", {})
+    # ★ pogema-toolbox 的 warehouse 生成器是**确定性**的（同参数永远同一张图）。
+    # 若直接用固定参数生成训练数据，整族只有一个布局，模型会把那个布局背下来。
+    # 故与 maze 一致：配置里给 *_min/*_max 时按 episode seed 采样结构参数，
+    # 得到一族"仓库式"布局（货架尺寸/过道宽度/行列数不同），而非一张图。
+    rng = np.random.default_rng(seed)
+
+    def _pick(key, default):
+        lo, hi = wh_cfg.get(f"{key}_min"), wh_cfg.get(f"{key}_max")
+        if lo is None or hi is None:
+            return wh_cfg.get(key, default)
+        return int(rng.integers(int(lo), int(hi) + 1))
+
     wc = WarehouseConfig(
-        wall_width=wh_cfg.get("wall_width", 5),
-        wall_height=wh_cfg.get("wall_height", 2),
-        walls_in_row=wh_cfg.get("walls_in_row", 5),
-        walls_rows=wh_cfg.get("walls_rows", 5),
-        bottom_gap=wh_cfg.get("bottom_gap", 5),
-        horizontal_gap=wh_cfg.get("horizontal_gap", 1),
-        vertical_gap=wh_cfg.get("vertical_gap", 3),
+        wall_width=_pick("wall_width", 5),
+        wall_height=_pick("wall_height", 2),
+        walls_in_row=_pick("walls_in_row", 5),
+        walls_rows=_pick("walls_rows", 5),
+        bottom_gap=_pick("bottom_gap", 5),
+        horizontal_gap=_pick("horizontal_gap", 1),
+        vertical_gap=_pick("vertical_gap", 3),
     )
     map_str = generate_warehouse(wc)
     # warehouse generator 用 '!' 表示空闲，转换为 Pogema 期望的 '.'
