@@ -191,7 +191,17 @@ class ExpertDemoBuffer:
             if key.startswith("next_") and not load_next:
                 setattr(self, f"_{key}", None); missing.append(key); continue
             try:
-                setattr(self, f"_{key}", np.asarray(_src(key)).astype(self._TARGET_DTYPES[key]))
+                # ★ 2026-09-11 OOM 事故修复：原来这里把 float16/int8 的小字段**整族读进内存
+                # 并升格成 float32/int64**，单进程 6 族就常驻 ~17GB（obs_scalars 一项 1.6GB/族）。
+                # 两个训练并行 + mmap 页缓存 → 撞穿 90GB cgroup 上限，v5main 被 OOM-kill。
+                # 现在同样只开只读 mmap，dtype 保持磁盘上的窄类型；真正的升格在 sample() 里
+                # 对**一个 batch**（几万行）做，代价可忽略。消费端（trainer._to_gpu）本来就会
+                # .float()/.long()，语义不变。
+                if key == "episode_ids":
+                    # 例外：episode_ids 全程被 _valid_starts 扫描，且只有几 MB，留在内存里更快
+                    setattr(self, f"_{key}", np.asarray(_src(key)).astype(np.int64))
+                else:
+                    setattr(self, f"_{key}", _src(key))
             except FileNotFoundError:
                 setattr(self, f"_{key}", None); missing.append(key)
         if missing:
@@ -444,15 +454,16 @@ class ExpertDemoBuffer:
         # 消费方（trainer）负责 GPU 端归一化（见 _patch_to_gpu）。
         obs_p  = self._obs_patches[idx_mat]        # (B,T,N,C,K,K) uint8
 
+        # 小字段现在是磁盘上的窄 dtype（见 attach_disk_dir 的 OOM 注释），在这里按 batch 升格
         out = {
             "obs_patches":       obs_p,
-            "obs_scalars":       self._obs_scalars[idx_mat].copy(),
-            "positions":         self._positions[idx_mat].copy(),
-            "actions_expert":    self._actions_expert[idx_mat].copy(),
+            "obs_scalars":       self._obs_scalars[idx_mat].astype(np.float32),
+            "positions":         self._positions[idx_mat].astype(np.float32),
+            "actions_expert":    self._actions_expert[idx_mat].astype(np.int64),
             "valid":             self._valid[idx_mat].copy(),
             "action_masks":      self._action_masks[idx_mat].copy(),
             "margin_excluded":   self._margin_excluded[idx_mat].copy(),
-            "margin_weights":    self._margin_weights[idx_mat].copy(),
+            "margin_weights":    self._margin_weights[idx_mat].astype(np.float32),
         }
         # next_obs/rewards/dones 仅 DQfD 的 TD 项需要；纯 IL 用不到 → 默认可跳过，
         # 省掉 ~一半 CPU gather/copy（next_obs_patches 单项即 ~148MB/步）。

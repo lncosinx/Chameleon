@@ -62,6 +62,9 @@ def main():
                    help="覆盖 network config 键（消融用，可多次），如 --set-net tau_in=0 --set-net entmax_alpha=1.0")
     p.add_argument("--tag", default="il", help="ckpt 前缀，区分不同 run（里程碑存 checkpoints/{tag}_iter_N.pt）")
     p.add_argument("--init", default=None, help="热启动 ckpt 路径（训练前 load_state_dict，strict=False）")
+    p.add_argument("--resume", default=None,
+                   help="从 ckpt 断点续训：载入权重**并从它的 meta_iter 继续计数**（里程碑对齐）。"
+                        "与 --init 的区别：--init 总是从 0 开始计数。长训练被 OOM/重启打断时用这个。")
     p.add_argument("--reinit-comm", action="store_true",
                    help="载入 --init 后**重新随机初始化通信模块**。SQ3 必须开：否则本文的"
                         "消融臂（参数名相同）会继承已训练好的通信权重，而外部通信基线"
@@ -154,9 +157,20 @@ def main():
                else ILReptileTrainer(net, cfg, device=device))
     os.makedirs("checkpoints", exist_ok=True)
     import time as _time
-    print(f"\nStart: 0 → {args.meta_iters}\n")
+    start_iter = 0
+    if args.resume:
+        rck = torch.load(args.resume, map_location="cpu")
+        rstate = {k.replace("_orig_mod.", ""): v for k, v in rck["net"].items()}
+        net.load_state_dict(rstate)
+        start_iter = int(rck.get("meta_iter", 0))
+        trainer.meta_iter = start_iter
+        if hasattr(trainer, "_meta_state"):
+            trainer._meta_state = {k: v.cpu() for k, v in rstate.items()}
+        print(f"[resume] 从 {args.resume} 续训，已完成 {start_iter} iter")
+
+    print(f"\nStart: {start_iter} → {args.meta_iters}\n")
     _last = _time.perf_counter()
-    for i in range(args.meta_iters):
+    for i in range(start_iter, args.meta_iters):
         m = trainer.meta_step(family_buffers, seed=args.seed + i)
         if (i + 1) % args.log_interval == 0:
             _now = _time.perf_counter(); _spi = (_now - _last) / args.log_interval; _last = _now
