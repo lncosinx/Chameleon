@@ -49,8 +49,11 @@ FAMILY_PROTOCOL = {
 # ---------------------------------------------------------------------------
 # 地图
 # ---------------------------------------------------------------------------
-def load_maps(family: str, num_maps: int):
-    maps = yaml.safe_load(open(os.path.join(MARLGPT, FAMILY_DIR[family], "maps.yaml")))
+def load_maps(family: str, num_maps: int, maps_file: str = None):
+    # maps_file：调参用的独立 dev 地图集（scripts/make_dev_maps.py 生成）。
+    # 推断期超参必须在 dev 上调，报告只用 validation-*，否则是拟合测试集。
+    src = maps_file or os.path.join(MARLGPT, FAMILY_DIR[family], "maps.yaml")
+    maps = yaml.safe_load(open(src))
     names = sorted(maps.keys())
     if 0 < num_maps < len(names):
         idx = sorted(set(np.linspace(0, len(names) - 1, num_maps).round().astype(int).tolist()))
@@ -84,7 +87,7 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
 @torch.no_grad()
 def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                   on_target="nothing", action_mode="argmax", escape_k=3, escape_temp=1.0,
-                  escape_no_wait_after=8, goal_hold="none", tta=False, rng=None):
+                  escape_no_wait_after=8, base_temp=0.3, goal_hold="none", tta=False, rng=None):
     """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。"""
     E, N = len(specs), num_agents
     rng = rng or np.random.default_rng(0)
@@ -189,6 +192,24 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                 hold = (np.zeros_like(acts) if goal_hold == "wait"
                         else lg.argmax(dim=-1).cpu().numpy())
                 acts = np.where(at_goal_now, hold, acts)
+        elif action_mode == "escape2":
+            # 分层温度：没卡住的体用**低温**采样（近贪心，保住路径质量，但仍能打破对称并列），
+            # 卡住的体用**高温**采样（真正跳出僵局）。动机：纯采样(T=1)虽然破死锁，但给所有体
+            # 都加了噪声 → 路径变长（实测 SoC 比 MAPF-GPT-2M 高 50%）；纯 argmax 又会死锁。
+            stuck = torch.from_numpy(no_improve >= escape_k).to(device)
+            temp = torch.where(stuck, escape_temp, base_temp).unsqueeze(-1)
+            lg2 = lg.clone()
+            hard = torch.from_numpy(no_improve >= escape_no_wait_after).to(device)
+            legal_move = torch.from_numpy(masks[:, :, 1:].any(-1)).to(device)
+            lg2[:, :, 0] = torch.where(hard & legal_move,
+                                       torch.full_like(lg2[:, :, 0], float("-inf")),
+                                       lg2[:, :, 0])
+            probs = torch.nan_to_num(torch.softmax(lg2 / temp, dim=-1), nan=0.0)
+            bad = probs.sum(-1) <= 0
+            if bad.any():
+                probs = torch.where(bad.unsqueeze(-1), torch.from_numpy(masks).to(device).float(), probs)
+            acts = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).reshape(E, N).cpu().numpy()
+            n_escape += int(stuck.sum())
         else:  # escape：仅对卡住的体采样
             acts = lg.argmax(dim=-1).cpu().numpy()
             stuck = no_improve >= escape_k                          # (E,N)
@@ -246,11 +267,16 @@ def main():
     ap.add_argument("--set-net", action="append", default=[], metavar="K=V")
     ap.add_argument("--families", default="random,mazes")
     ap.add_argument("--agent-counts", default="8,16,24,32,48,64")
+    ap.add_argument("--maps-file", default=None,
+                    help="用独立 dev 地图集调参（见 scripts/make_dev_maps.py）；不给则用 validation-*")
     ap.add_argument("--num-maps", type=int, default=128, help="每族地图数，0/128=全部")
     ap.add_argument("--max-steps", type=int, default=128)
     ap.add_argument("--on-target", default="nothing", choices=["nothing", "finish"])
     ap.add_argument("--batch-envs", type=int, default=16, help="一次批量 rollout 的 episode 数")
-    ap.add_argument("--action-mode", default="argmax", choices=["argmax", "sample", "escape"])
+    ap.add_argument("--action-mode", default="argmax",
+                    choices=["argmax", "sample", "escape", "escape2"])
+    ap.add_argument("--base-temp", type=float, default=0.3,
+                    help="escape2：未卡住的体的采样温度（低温=近贪心，保路径质量）")
     ap.add_argument("--escape-k", type=int, default=3)
     ap.add_argument("--escape-temp", type=float, default=1.0)
     ap.add_argument("--escape-no-wait-after", type=int, default=8)
@@ -329,6 +355,7 @@ def main():
                                       on_target=args.on_target, action_mode=args.action_mode,
                                       escape_k=args.escape_k, escape_temp=args.escape_temp,
                                       escape_no_wait_after=args.escape_no_wait_after,
+                                      base_temp=args.base_temp,
                                       goal_hold=args.goal_hold, tta=args.tta,
                                       rng=np.random.default_rng(1234 + i))
             agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
