@@ -34,6 +34,7 @@ def build_net(nc: dict) -> MAPFCommNet:
         head_hidden=nc.get("head_hidden", 128),
         spatial_pool=nc.get("spatial_pool", 0),   # 0=全展平（保留空间布局）
         comm_type=nc.get("comm_type", "madcl"),   # SQ3：只换通信模块的消融轴
+        intent_mode=nc.get("intent_mode", "feature"),  # SQ3：消息内容（特征 vs 显式动作意图）
         hard_topk_select=nc.get("hard_topk_select", False),
     )
 
@@ -135,7 +136,12 @@ def main():
         ck = torch.load(args.init, map_location="cpu")
         state = {k.replace("_orig_mod.", ""): v for k, v in ck["net"].items()}
         if args.reinit_comm:
-            state = {k: v for k, v in state.items() if not k.startswith("communication.")}
+            # 同时丢掉 comm_in / comm_out（消息的入口/出口投影）。只丢 communication.* 是不够的：
+            # 比较不同"消息内容"（intent_mode）时，feature 臂会带着训练好的 comm_in 出发、
+            # action 臂因为输入维度变了只能随机初始化 —— 那就不是唯一变量了。两臂都从
+            # 全新的通信通路出发，差异才只剩"消息里装什么"。
+            state = {k: v for k, v in state.items()
+                     if not k.startswith(("communication.", "comm_in.", "comm_out.", "pre_head."))}
         missing, unexpected = net.load_state_dict(state, strict=False)
         print(f"[init] warm-start from {args.init} "
               f"(missing={len(missing)} unexpected={len(unexpected)})"

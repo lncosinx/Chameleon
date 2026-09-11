@@ -56,6 +56,8 @@ class MAPFCommNet(nn.Module):
         head_hidden: int = 128,
         # 空间池化：0=全展平（保留空间布局，默认）；n>0=AdaptiveAvgPool2d(n)
         spatial_pool: int = 0,
+        # 通信消息内容："feature"=观测特征（原）；"action"=特征+通信前动作分布（显式意图）
+        intent_mode: str = "feature",
         # SQ3 通信消融轴："madcl"=本文的软稀疏entmax+迟滞；其余见 models/comm_baselines.py
         # （commnet/ic3net/tarmac/dial/atoc/dgn）。**只换通信模块，其它一切不变**。
         comm_type: str = "madcl",
@@ -65,7 +67,19 @@ class MAPFCommNet(nn.Module):
                                           cnn_channels, d_scalar, n_res_blocks,
                                           obs_radius=obs_radius, spatial_pool=spatial_pool)
         self.comm_rounds = comm_rounds
-        self.comm_in = nn.Linear(d_model, intent_dim)
+        # intent_mode：通信里"意图"到底是什么。
+        #   "feature"（原实现）= 编码后的观测特征，邻居收到的是对方的**观测摘要**；
+        #   "action"          = 观测特征 **+ 通信前的初步动作分布**，邻居收到的是对方
+        #                       "下一步想往哪走"——这才是字面意义上的意图。
+        # 动机：窄走廊里决定性的信息就是对面那个体的行进方向；让它显式出现在消息里，
+        # 而不是指望网络从观测摘要里自己解码出来（我们只有 ~600 万步数据，不是 10 亿）。
+        self.intent_mode = intent_mode
+        if intent_mode == "action":
+            self.pre_head = nn.Linear(d_model, num_actions)
+            self.comm_in = nn.Linear(d_model + num_actions, intent_dim)
+        else:
+            self.pre_head = None
+            self.comm_in = nn.Linear(d_model, intent_dim)
         self.comm_out = nn.Linear(intent_dim, d_model)
         self.comm_type = comm_type
         if comm_type == "madcl":
@@ -125,7 +139,16 @@ class MAPFCommNet(nn.Module):
         for r in range(self.comm_rounds):
             if r > 0 and has_hyst:
                 c._active_mask, c._prev_edge_set, c._ema_c = snap
-            intent = self.comm_in(e)
+            if self.pre_head is not None:
+                # 通信前的初步动作分布（对非法动作屏蔽后 softmax），与特征拼接成消息。
+                pre = self.pre_head(e)
+                if action_masks is not None:
+                    pre = pre.masked_fill(~action_masks, float("-inf"))
+                pre = torch.softmax(pre, dim=-1)
+                pre = torch.nan_to_num(pre, nan=0.0)
+                intent = self.comm_in(torch.cat([e, pre], dim=-1))
+            else:
+                intent = self.comm_in(e)
             comm_feat, info = c.forward_sequence(intent, positions)
             e = e + self.comm_out(comm_feat)
 
