@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--steps", default="0,10,50,200")
     ap.add_argument("--agent-counts", default="16,32,48,64")
     ap.add_argument("--num-maps", type=int, default=128)
+    ap.add_argument("--no-auto-protocol", dest="auto_protocol", action="store_false",
+                    default=True, help="不套用各族官方协议（调试用；出表必须用官方协议）")
     ap.add_argument("--ckpt-dir", default="/root/autodl-tmp/sq2")
     ap.add_argument("--out", default="/root/autodl-tmp/eval_v5/sq2_adaptation.json")
     ap.add_argument("--device", default="cuda:0")
@@ -86,11 +88,15 @@ def main():
             t0 = time.time()
             adapt(init, buf, cfg, nc, k, device, seed=0, out=ck)
             ev = os.path.join(args.ckpt_dir, f"eval_{arm}_k{k}.json")
-            subprocess.run([sys.executable, "scripts/eval_bench.py", "--ckpt", ck,
-                            "--network-config", args.network_config,
-                            "--families", args.family, "--agent-counts", args.agent_counts,
-                            "--num-maps", str(args.num_maps), "--batch-envs", "16",
-                            "--action-mode", "sample", "--out", ev], check=True)
+            # ★ --auto-protocol：各族的官方协议并不相同（warehouse 是 **1 张图 × 128 个 seed**，
+            # 不是 128 张图；agent 档位也是 32..192 而非 8..64）。不传这个开关会退化成
+            # "1 张图 × 1 个 seed"，n=1 的 CSR 只是噪声，且与 leaderboard 不可比。
+            cmd = [sys.executable, "scripts/eval_bench.py", "--ckpt", ck,
+                   "--network-config", args.network_config, "--families", args.family,
+                   "--batch-envs", "16", "--action-mode", "sample", "--out", ev]
+            cmd += ["--auto-protocol"] if args.auto_protocol else [
+                "--agent-counts", args.agent_counts, "--num-maps", str(args.num_maps)]
+            subprocess.run(cmd, check=True)
             r = json.load(open(ev))["results"][args.family]
             results[arm][k] = {a: v["CSR"] for a, v in r.items()}
             print(f"[SQ2] {arm} k={k}: " +
