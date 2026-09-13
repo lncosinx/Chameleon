@@ -252,6 +252,26 @@ v4 模型 + 采样（未开 TTA）：1.000 / 0.969 / 0.883 / 0.438 / 0.086 / 0.0
 注意各族协议不同（warehouse 是 1 图 128 seed、movingai 是 256 步），`eval_bench.py --auto-protocol`
 已内置官方网格表，避免产出不可比的数字。
 
+### ★★★ 最终结果（2026-09-14，全部实验完成）★★★
+
+**最终模型 = `ckpt_il/it_act_iter_8000.pt`**（2.16M，intent_mode=action，sample+TTA 推断）。
+**选模在独立 dev 地图集上做**（dev 合计：it_act 3.594 > v5main40k 3.578 > v5final/DAgger 3.438），
+绝不在测试集上挑模型。主表报 seed 0（与 leaderboard 逐实例配对）+ 3 seed（降方差）。
+
+**SQ1**：vs DCC/MAMBA/QMIX/VDN/IQL/QPLEX 全面压制；vs SCRIMP 互有胜负
+（mazes 16/48/64 胜、random 高密度输）；vs MAPF-GPT-2M 全面落后。
+**SQ2**：Reptile-init 的 zero-shot 更强（0.559 vs 0.510），但**适应不升反降**（k=200 两臂都掉到 0.49）
+→ 少量专家数据上的微调在这个设置里帮不上忙，Reptile 的价值只体现在初始化本身。
+**SQ3（头条）**：**无通信直接崩到 0**（random 0.023/0.000/0.000）——通信是必需品，这条最强；
+我们稳定压过 CommNet/IC3Net/DGN/ATOC/DIAL；**但与 TarMAC、dense-softmax 打平**
+（合计 3.462 / 3.421 / 3.428，差异远小于 CI）→ **"软稀疏优于稠密"这个论点不成立**，
+不要写进论文。迟滞降低了 EdgeFlip（0.268 vs 0.289）但没转化成 CSR。
+**SQ4**：madcl 0.570 / replay 0.574 / naive 0.543 / joint 上界 0.586，遗忘率三臂都 ~0.035
+→ **replay+meta-update 相对朴素顺序微调的增益很小**，且 replay 单独就够，meta-update 没加成。
+
+**诚实结论**：能立住的是「通信必需性 + 对同类通信方法的优势 + 对 DCC 等纯 PO 基线的压制」；
+**立不住的是「软稀疏/迟滞优于稠密注意力」和「DAgger/元学习/持续学习组件的增益」**。
+
 ### ★ 已定论 7（2026-09-12）：v5main 40k 训练曲线与当前站位
 密度修复后的 6 族混合数据（614 万步）训练 40k，里程碑（128 图、sample+TTA、nothing/128 步）：
 
