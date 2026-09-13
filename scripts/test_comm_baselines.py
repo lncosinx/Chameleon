@@ -83,7 +83,24 @@ def main():
         print(f"  {arm:<9} ok | 通信参数 {ncp:>6,} | 邻居影响 {changed:.3e} | "
               f"FOV外泄漏 {leak:.1e} | nbr={info.get('avg_neighbors', 0):.2f}")
 
-    print(f"✅ {len(ARMS)} 个通信臂全部通过（FOV 约束 + 确实通信 + 骨干唯一变量）")
+    test_entmax_no_nan()
+    print(f"✅ {len(ARMS)} 个通信臂全部通过（FOV 约束 + 确实通信 + 骨干唯一变量 + entmax 无 NaN）")
+
+
+
+def test_entmax_no_nan():
+    """回归测试：α∈{1.0,1.5,2.0} 在"整行全 -inf"（FOV 内无邻居）时都不能出 NaN。
+
+    2026-09-13：α=1.0 的 softmax 分支漏了这个处理，训出 loss=nan，把 SQ3 的
+    dense-softmax 消融臂整条废掉——而那正是"软稀疏 vs 稠密"的关键对照臂。
+    """
+    from models.communication import entmax
+    x = torch.tensor([[1.0, 2.0, float("-inf")], [float("-inf")] * 3])
+    for a in (1.0, 1.5, 2.0):
+        r = entmax(x, alpha=a)
+        assert torch.isfinite(r).all(), f"alpha={a} 在无邻居行上出了 NaN"
+        assert abs(float(r[0].sum()) - 1.0) < 1e-4, f"alpha={a} 未归一化"
+    print("  entmax α∈{1.0,1.5,2.0} 无邻居行不出 NaN ✓")
 
 
 if __name__ == "__main__":

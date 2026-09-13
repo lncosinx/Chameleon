@@ -44,7 +44,14 @@ def entmax(logits: torch.Tensor, alpha: float = 1.5, dim: int = -1,
     logits = logits.float()
 
     if alpha == 1.0:
-        return F.softmax(logits, dim=dim)
+        # ★ 2026-09-13 bug 修复：softmax 分支原来直接 F.softmax，**没处理"整行全 -inf"**
+        # （FOV 内一个邻居都没有的体）。那种行 softmax 出来是 NaN，一路污染到 loss=nan，
+        # 把 SQ3 的 dense-softmax 消融臂整条训废（而它正是"软稀疏 vs 稠密"的关键对照）。
+        # α≠1 的 bisection 路径本来就显式做了均匀兜底，这里补齐同样的语义：
+        # 无候选行给均匀分布，下游 has_any_cand 掩码会把它清零。
+        all_neg = torch.all(torch.isneginf(logits), dim=dim, keepdim=True)
+        safe = torch.where(all_neg, torch.zeros_like(logits), logits)
+        return F.softmax(safe, dim=dim)
 
     if alpha == 2.0:
         return _sparsemax(logits, dim=dim)
@@ -107,6 +114,14 @@ def _sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     shape = logits.shape
     logits_flat = logits.reshape(-1, shape[dim])
     B, N = logits_flat.shape
+
+    # 与 α=1 / α∈(1,2) 两条路径同样的 -inf 处理（见 entmax 里的 bug 注释）：
+    # -inf 换成大负数参与排序/cumsum（否则 cumsum 出 -inf/NaN），整行全 -inf 的
+    # （FOV 内无邻居）给均匀分布，下游掩码会清零。
+    all_neg = torch.all(torch.isneginf(logits_flat), dim=1, keepdim=True)
+    logits_flat = torch.where(torch.isneginf(logits_flat),
+                              torch.full_like(logits_flat, -1e10), logits_flat)
+    logits_flat = torch.where(all_neg, torch.zeros_like(logits_flat), logits_flat)
 
     # Sort descending
     z_sorted, _ = torch.sort(logits_flat, dim=1, descending=True)
