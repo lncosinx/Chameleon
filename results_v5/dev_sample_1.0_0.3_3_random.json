@@ -1,0 +1,54 @@
+{
+  "ckpt": "ckpt_il/v5main_iter_10000.pt",
+  "tag": "",
+  "args": {
+    "ckpt": "ckpt_il/v5main_iter_10000.pt",
+    "network_config": "configs/network_gru_c2g.yaml",
+    "set_net": [],
+    "families": "random",
+    "agent_counts": "48,64",
+    "maps_file": "/root/autodl-tmp/dev_maps/random.yaml",
+    "num_maps": 64,
+    "max_steps": 128,
+    "on_target": "nothing",
+    "batch_envs": 32,
+    "action_mode": "sample",
+    "base_temp": 0.3,
+    "escape_k": 3,
+    "escape_temp": 1.0,
+    "escape_no_wait_after": 8,
+    "auto_protocol": false,
+    "tta": true,
+    "goal_hold": "none",
+    "seeds": "0",
+    "device": "cuda:0",
+    "out": "/root/autodl-tmp/eval_v5/dev_sample_1.0_0.3_3_random.json",
+    "tag": ""
+  },
+  "results": {
+    "random": {
+      "48": {
+        "CSR": 0.78125,
+        "ISR": 0.9475911458333333,
+        "SoC": 1892.953125,
+        "makespan": 83.78125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.909817548468709,
+        "edge_flip": 0.1109172105207108,
+        "n": 64,
+        "CSR_ci95": 0.10128266737669135
+      },
+      "64": {
+        "CSR": 0.609375,
+        "ISR": 0.91748046875,
+        "SoC": 3352.734375,
+        "makespan": 100.03125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.9412806034088135,
+        "edge_flip": 0.16838875526445918,
+        "n": 64,
+        "CSR_ci95": 0.11953316481309434
+      }
+    }
+  }
+}

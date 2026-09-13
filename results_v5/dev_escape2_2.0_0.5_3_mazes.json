@@ -1,0 +1,54 @@
+{
+  "ckpt": "ckpt_il/v5main_iter_10000.pt",
+  "tag": "",
+  "args": {
+    "ckpt": "ckpt_il/v5main_iter_10000.pt",
+    "network_config": "configs/network_gru_c2g.yaml",
+    "set_net": [],
+    "families": "mazes",
+    "agent_counts": "48,64",
+    "maps_file": "/root/autodl-tmp/dev_maps/mazes.yaml",
+    "num_maps": 64,
+    "max_steps": 128,
+    "on_target": "nothing",
+    "batch_envs": 32,
+    "action_mode": "escape2",
+    "base_temp": 0.5,
+    "escape_k": 3,
+    "escape_temp": 2.0,
+    "escape_no_wait_after": 8,
+    "auto_protocol": false,
+    "tta": true,
+    "goal_hold": "none",
+    "seeds": "0",
+    "device": "cuda:0",
+    "out": "/root/autodl-tmp/eval_v5/dev_escape2_2.0_0.5_3_mazes.json",
+    "tag": ""
+  },
+  "results": {
+    "mazes": {
+      "48": {
+        "CSR": 0.265625,
+        "ISR": 0.8880208333333334,
+        "SoC": 3089.640625,
+        "makespan": 114.171875,
+        "escape_frac": 0.2158660888671875,
+        "avg_neighbors": 5.909122571349144,
+        "edge_flip": 0.17901555509888567,
+        "n": 64,
+        "CSR_ci95": 0.10820803237969155
+      },
+      "64": {
+        "CSR": 0.140625,
+        "ISR": 0.75390625,
+        "SoC": 5338.890625,
+        "makespan": 121.046875,
+        "escape_frac": 0.3313484191894531,
+        "avg_neighbors": 5.9448957443237305,
+        "edge_flip": 0.2654143965919502,
+        "n": 64,
+        "CSR_ci95": 0.08517040450023926
+      }
+    }
+  }
+}

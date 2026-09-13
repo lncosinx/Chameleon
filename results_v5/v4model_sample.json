@@ -1,0 +1,162 @@
+{
+  "ckpt": "ckpt_il/il_smallwarm100k_iter_100000.pt",
+  "tag": "",
+  "args": {
+    "ckpt": "ckpt_il/il_smallwarm100k_iter_100000.pt",
+    "network_config": "configs/network_gru_c2g.yaml",
+    "set_net": [],
+    "families": "random,mazes",
+    "agent_counts": "8,16,24,32,48,64",
+    "num_maps": 128,
+    "max_steps": 128,
+    "on_target": "nothing",
+    "batch_envs": 32,
+    "action_mode": "sample",
+    "escape_k": 3,
+    "escape_temp": 1.0,
+    "escape_no_wait_after": 8,
+    "goal_hold": "none",
+    "seeds": "0",
+    "device": "cuda:0",
+    "out": "/root/autodl-tmp/eval_v5/v4model_sample.json",
+    "tag": ""
+  },
+  "results": {
+    "random": {
+      "8": {
+        "CSR": 1.0,
+        "ISR": 1.0,
+        "SoC": 135.296875,
+        "makespan": 29.640625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 3.234100341796875,
+        "edge_flip": 0.01204958019411606,
+        "n": 128,
+        "CSR_ci95": 5.478366544874485e-06
+      },
+      "16": {
+        "CSR": 0.9765625,
+        "ISR": 0.99755859375,
+        "SoC": 319.8203125,
+        "makespan": 42.7265625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 6.74481201171875,
+        "edge_flip": 0.020589149502598048,
+        "n": 128,
+        "CSR_ci95": 0.0262093801931183
+      },
+      "24": {
+        "CSR": 0.953125,
+        "ISR": 0.9912109375,
+        "SoC": 570.8125,
+        "makespan": 49.5390625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 9.69981164042838,
+        "edge_flip": 0.03999674947061749,
+        "n": 128,
+        "CSR_ci95": 0.03661817175842737
+      },
+      "32": {
+        "CSR": 0.8828125,
+        "ISR": 0.982421875,
+        "SoC": 941.2734375,
+        "makespan": 61.7734375,
+        "escape_frac": 0.0,
+        "avg_neighbors": 12.420272827148438,
+        "edge_flip": 0.06624908300216248,
+        "n": 128,
+        "CSR_ci95": 0.05572190662284939
+      },
+      "48": {
+        "CSR": 0.6171875,
+        "ISR": 0.9375,
+        "SoC": 2128.515625,
+        "makespan": 95.5859375,
+        "escape_frac": 0.0,
+        "avg_neighbors": 16.90372011018917,
+        "edge_flip": 0.13832303800154477,
+        "n": 128,
+        "CSR_ci95": 0.08420787394261624
+      },
+      "64": {
+        "CSR": 0.40625,
+        "ISR": 0.87548828125,
+        "SoC": 3842.734375,
+        "makespan": 110.6171875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 20.690319061279297,
+        "edge_flip": 0.22261444848845713,
+        "n": 128,
+        "CSR_ci95": 0.08508433029482426
+      }
+    },
+    "mazes": {
+      "8": {
+        "CSR": 0.984375,
+        "ISR": 0.9970703125,
+        "SoC": 161.8359375,
+        "makespan": 36.078125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 2.9447402954101562,
+        "edge_flip": 0.011263491564363903,
+        "n": 128,
+        "CSR_ci95": 0.02148529827561599
+      },
+      "16": {
+        "CSR": 0.8515625,
+        "ISR": 0.98388671875,
+        "SoC": 466.4453125,
+        "makespan": 66.0625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 6.479900360107422,
+        "edge_flip": 0.023346077576434254,
+        "n": 128,
+        "CSR_ci95": 0.06159297285746096
+      },
+      "24": {
+        "CSR": 0.703125,
+        "ISR": 0.970703125,
+        "SoC": 849.546875,
+        "makespan": 80.640625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 9.369634269038215,
+        "edge_flip": 0.04712547242547771,
+        "n": 128,
+        "CSR_ci95": 0.07915059244364307
+      },
+      "32": {
+        "CSR": 0.515625,
+        "ISR": 0.953857421875,
+        "SoC": 1439.53125,
+        "makespan": 100.53125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 12.159345626831055,
+        "edge_flip": 0.08494392518878158,
+        "n": 128,
+        "CSR_ci95": 0.08657827515891148
+      },
+      "48": {
+        "CSR": 0.2421875,
+        "ISR": 0.85693359375,
+        "SoC": 3310.78125,
+        "makespan": 115.0703125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 16.622912620659918,
+        "edge_flip": 0.1885058750049211,
+        "n": 128,
+        "CSR_ci95": 0.07421775801146277
+      },
+      "64": {
+        "CSR": 0.1328125,
+        "ISR": 0.6865234375,
+        "SoC": 5603.6328125,
+        "makespan": 120.5859375,
+        "escape_frac": 0.0,
+        "avg_neighbors": 19.246082305908203,
+        "edge_flip": 0.2689326618274208,
+        "n": 128,
+        "CSR_ci95": 0.058793195712263734
+      }
+    }
+  }
+}
