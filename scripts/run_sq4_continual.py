@@ -33,9 +33,22 @@ from trainers.train_il_reptile import ILReptileTrainer
 from utils.seed import set_seed
 from utils.checkpoint import save_checkpoint
 
-FAM_EVAL = {"random48": "random", "random64": "random",
-            "maze48": "mazes", "maze64": "mazes"}
-FAM_AGENTS = {"random48": "48", "random64": "64", "maze48": "48", "maze64": "64"}
+# 训练族名 → (评测族名, agent 档位)。族名形如 "random32"/"maze64"：前缀是地图族、
+# 后缀是该族数据的 agent 数。写死枚举会漏（2026-09-13 传 random32 直接 KeyError），
+# 故改为按前缀/数字解析，新增密度档不用再改这里。
+import re as _re
+_FAM_ALIAS = {"random": "random", "maze": "mazes", "mazes": "mazes",
+              "warehouse": "warehouse", "wh": "warehouse"}
+
+
+def fam_eval(f: str):
+    m = _re.match(r"^([a-z]+?)(\d+)$", f)
+    if not m:
+        return _FAM_ALIAS.get(f, f), None
+    base, agents = m.group(1), m.group(2)
+    if base not in _FAM_ALIAS:
+        raise KeyError(f"未知族前缀 {base!r}（来自 {f!r}），可选 {sorted(_FAM_ALIAS)}")
+    return _FAM_ALIAS[base], agents
 
 
 def load_buffers(data_dir, fams):
@@ -64,17 +77,25 @@ def train_segment(tr, cfg, buffers, cur_fam, seen, steps, replay_ratio, rng):
         tr._inner_step(batch)
 
 
-def evaluate(ckpt, fams, nc_path, num_maps, tag_dir):
-    """在给定族集合上评测，返回 {fam: CSR}。"""
+def evaluate(ckpt, fams, nc_path, num_maps, tag_dir, set_net=()):
+    """在给定族集合上评测，返回 {fam: CSR}。
+
+    ★ set_net 必须**原样透传给子进程**：ckpt 的架构由这些覆盖决定（如 intent_mode=action
+    会多出 pre_head、comm_in 输入维度 192→197）。不传，子进程就按默认配置建网，
+    load_state_dict 维度不匹配直接失败。2026-09-13 连着踩了三次同一类问题（SQ4 主进程、
+    SQ4 子进程、SQ3 评测），凡是"另起一个进程加载这个 ckpt"的地方都要带上它。
+    """
     out = {}
     for f in fams:
         ev = os.path.join(tag_dir, f"eval_{os.path.basename(ckpt)[:-3]}_{f}.json")
-        subprocess.run([sys.executable, "scripts/eval_bench.py", "--ckpt", ckpt,
-                        "--network-config", nc_path, "--families", FAM_EVAL[f],
-                        "--agent-counts", FAM_AGENTS[f], "--num-maps", str(num_maps),
-                        "--batch-envs", "16", "--action-mode", "sample", "--out", ev],
-                       check=True, stdout=subprocess.DEVNULL)
-        r = json.load(open(ev))["results"][FAM_EVAL[f]]
+        cmd = [sys.executable, "scripts/eval_bench.py", "--ckpt", ckpt,
+               "--network-config", nc_path, "--families", fam_eval(f)[0],
+               "--agent-counts", fam_eval(f)[1], "--num-maps", str(num_maps),
+               "--batch-envs", "16", "--action-mode", "sample", "--out", ev]
+        for kv in set_net:
+            cmd += ["--set-net", kv]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        r = json.load(open(ev))["results"][fam_eval(f)[0]]
         out[f] = float(list(r.values())[0]["CSR"])
     return out
 
@@ -90,6 +111,10 @@ def main():
     ap.add_argument("--meta-lr", type=float, default=0.5, help="段末 Reptile 式外层步长")
     ap.add_argument("--config", default="configs/train_il_v5.yaml")
     ap.add_argument("--network-config", default="configs/network_gru_c2g.yaml")
+    ap.add_argument("--set-net", action="append", default=[], metavar="K=V",
+                    help="覆盖 network config 键。★ 必须与 --init 的 ckpt 架构一致："
+                         "例如 init 是 intent_mode=action 训出来的，这里不传就会 load_state_dict "
+                         "维度不匹配（comm_in 197 vs 192、多出 pre_head）——2026-09-13 踩过。")
     ap.add_argument("--num-maps", type=int, default=64)
     ap.add_argument("--ckpt-dir", default="/root/autodl-tmp/sq4")
     ap.add_argument("--out", default="/root/autodl-tmp/eval_v5/sq4_continual.json")
@@ -97,6 +122,9 @@ def main():
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config)); nc = yaml.safe_load(open(args.network_config))
+    for kv in args.set_net:
+        k, _, v = kv.partition("="); nc[k.strip()] = yaml.safe_load(v)
+        print(f"[set-net] {k.strip()} = {nc[k.strip()]}")
     seq = [f.strip() for f in args.sequence.split(",")]
     os.makedirs(args.ckpt_dir, exist_ok=True)
     buffers = load_buffers(args.data_dir, seq)
@@ -130,7 +158,8 @@ def main():
                 tr._inner_step(b)
             ck = os.path.join(args.ckpt_dir, f"{arm}_final.pt")
             save_checkpoint(tr.state_dict(), ck, "meta")
-            final = evaluate(ck, seq, args.network_config, args.num_maps, args.ckpt_dir)
+            final = evaluate(ck, seq, args.network_config, args.num_maps, args.ckpt_dir,
+                             set_net=args.set_net)
             results[arm] = {"final": final, "curve": [], "forgetting": 0.0, "bwt": 0.0}
             print(f"[SQ4] {arm}: final={final} ({time.time()-t0:.0f}s)", flush=True)
             continue
@@ -148,7 +177,8 @@ def main():
             seen.append(fam)
             ck = os.path.join(args.ckpt_dir, f"{arm}_seg{si}.pt")
             save_checkpoint(tr.state_dict(), ck, "meta")
-            scores = evaluate(ck, seen, args.network_config, args.num_maps, args.ckpt_dir)
+            scores = evaluate(ck, seen, args.network_config, args.num_maps, args.ckpt_dir,
+                          set_net=args.set_net)
             curve.append({"segment": si, "trained": fam, "scores": scores})
             print(f"[SQ4] {arm} seg{si}({fam}): {scores}", flush=True)
 
