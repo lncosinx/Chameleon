@@ -50,6 +50,9 @@ def phase_collect(args):
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     nc = yaml.safe_load(open(args.network_config))
+    for kv in args.set_net:
+        k, _, v = kv.partition("="); nc[k.strip()] = yaml.safe_load(v)
+        print(f"[set-net] {k.strip()} = {nc[k.strip()]}")
     use_c2g = int(nc.get("patch_channels", 4)) >= 5
     c2g_clip = float(nc.get("cost2go_clip", 10.0))
     net = build_net(nc)
@@ -285,6 +288,10 @@ def main():
     # collect
     p.add_argument("--ckpt", default=None)
     p.add_argument("--network-config", default="configs/network_gru_c2g.yaml")
+    p.add_argument("--set-net", action="append", default=[], metavar="K=V",
+                   help="覆盖 network config 键。★ 必须与 --ckpt 的架构一致（如 "
+                        "intent_mode=action 会多出 pre_head、comm_in 192→197）。"
+                        "凡是'另起进程加载某个 ckpt'的地方都要带上它——这是第 4 次踩。")
     p.add_argument("--env-configs", default="configs/env_random_small.yaml,configs/env_maze_small.yaml")
     p.add_argument("--agent-counts", default="32,48,64")
     p.add_argument("--episodes", type=int, default=1000)
