@@ -1,0 +1,25 @@
+batch_size: 32
+d4_augment: false
+debug: false
+excluded_weight: 0.3
+families:
+- random32
+- random48
+- random64
+- maze32
+- maze48
+- maze64
+grad_clip: 10.0
+held_out_family: null
+il_wait_weight: 1.0
+inner_lr: 0.0005
+inner_steps: 5
+label_smoothing: 0.0
+meta_iterations: 30000
+meta_lr_end: 0.01
+meta_lr_start: 0.1
+profile_interval: 200
+reptile: false
+sequence_len: 32
+tasks_per_meta: 2
+use_amp: true
