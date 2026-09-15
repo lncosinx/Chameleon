@@ -255,7 +255,18 @@ class BiIntentAttention(nn.Module):
         K_raw = self.k_proj(intents)
         comm_dim = Q_raw.shape[-1]
         scale = comm_dim ** -0.5
-        attn_logits = torch.matmul(Q_raw, K_raw.transpose(-1, -2)) * scale  # (B,T,N,N)
+        # ★ 2026-09-15 bug 修复：注意力分数必须 **先缩放、再在 fp32 里做 matmul**。
+        # 原写法 `matmul(Q, K^T) * scale` 在 AMP 下让 fp16 矩阵乘先累加 comm_dim 个未缩放
+        # 乘积：训练几步后激活幅度到 ~155，单项乘积 ~1.2e4，累加 192 项直接越过 fp16 上限
+        # 65504 → +inf（实测 absmax 4728、29,626 个 inf）。+inf 进 entmax 后 inf-inf=NaN
+        # （实测 133,008 个），污染整张图，loss 变 nan、GradScaler 一路把 scale 砍到 8 也
+        # 救不回来——因为坏的是前向不是梯度。容量放大臂（comm_dim 128→192）第一次踩到，
+        # 但小网只是侥幸没越界，属同一个潜伏 bug。
+        # ★ 必须显式 enabled=False：autocast 会拦截 matmul 并把 fp32 入参**强制降回 fp16**，
+        #   只写 .float() 是无效的（实测 attn_logits 仍是 fp16、仍溢出到 65504）。
+        with torch.autocast(device_type=Q_raw.device.type, enabled=False):
+            attn_logits = torch.matmul(Q_raw.float() * scale,
+                                       K_raw.float().transpose(-1, -2))      # (B,T,N,N) fp32
         attn_logits = attn_logits.masked_fill(~is_candidate, float('-inf'))
 
         # entmax 一次性批量（最大热点：逐 t 67ms → 批量 3ms）
