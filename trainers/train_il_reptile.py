@@ -22,6 +22,23 @@ from envs.d4_augment import d4_augment_batch
 _SENTINEL = object()  # 预取队列结束标记
 
 
+def _pick_families(fams, rng, n, weights=None):
+    """按族抽 n 个 task。weights=None 时与历史实现**逐位一致**（同一 rng 消耗），保证旧 run 可复现。
+
+    weights: {族名: 非负权重}。追加新数据批次（新族名）时用它保持「地图类型 × 体数」组级混合比例不变，
+    否则均匀抽族会让批次多的组权重变大，和对照臂不再是唯一变量。所有族都必须显式给权重（防漏写成 0）。
+    """
+    if weights is None:
+        return [fams[i] for i in rng.integers(0, len(fams), size=n)]
+    missing = [f for f in fams if f not in weights]
+    if missing:
+        raise KeyError(f"family_weights 缺少这些族的权重：{missing}")
+    w = np.asarray([float(weights[f]) for f in fams], dtype=np.float64)
+    if (w < 0).any() or w.sum() <= 0:
+        raise ValueError(f"family_weights 必须非负且和 > 0：{dict(zip(fams, w))}")
+    return [fams[i] for i in rng.choice(len(fams), size=n, p=w / w.sum())]
+
+
 def _prefetch_batches(buf, n_batches, sample_kwargs, q):
     """后台线程：预采 n_batches 个 batch 入队。CPU gather 与主线程 GPU 计算重叠
     （_inner_step 里的 CUDA kernel 释放 GIL，采样线程得以并行推进）。"""
@@ -57,6 +74,7 @@ class ILReptileTrainer:
         # **保留优化器动量**（Reptile 路径每 task 清动量；joint 若也清会被不公平削弱）。
         self.use_reptile = bool(cfg.get("reptile", True))
         self.total_meta_iters = cfg.get("meta_iterations", 20000)
+        self.family_weights = cfg.get("family_weights")   # None = 均匀抽族（历史行为）
 
         self.use_amp = bool(cfg.get("use_amp", False)) and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
@@ -149,7 +167,7 @@ class ILReptileTrainer:
         theta_meta = {k: v.detach().cpu().clone() for k, v in self.net.state_dict().items()}
         fams = list(family_buffers.keys())
         rng = np.random.default_rng(seed or (10_000 + self.meta_iter))
-        tasks = [fams[i] for i in rng.integers(0, len(fams), size=self.tasks_per_meta)]
+        tasks = _pick_families(fams, rng, self.tasks_per_meta, self.family_weights)
 
         results = []
         for j, fam in enumerate(tasks):
@@ -180,7 +198,7 @@ class ILReptileTrainer:
         无 θ_meta 保存/恢复、无外层平均、动量不清。tasks_per_meta 只决定每次采几个族的批。"""
         fams = list(family_buffers.keys())
         rng = np.random.default_rng(seed or (10_000 + self.meta_iter))
-        tasks = [fams[i] for i in rng.integers(0, len(fams), size=self.tasks_per_meta)]
+        tasks = _pick_families(fams, rng, self.tasks_per_meta, self.family_weights)
         res = [self.run_inner_loop(family_buffers[fam], None,
                                    seed=(seed or self.meta_iter * 1000) + j * 99991)
                for j, fam in enumerate(tasks)]
@@ -218,6 +236,7 @@ class DualGPUILReptileTrainer:
         self.meta_lr_end = cfg.get("meta_lr_end", 0.01)
         self.tasks_per_gpu = cfg.get("tasks_per_gpu", 1)
         self.total_meta_iters = cfg.get("meta_iterations", 20000)
+        self.family_weights = cfg.get("family_weights")
         self.meta_iter = 0
 
     @property
@@ -233,7 +252,7 @@ class DualGPUILReptileTrainer:
         fams = list(family_buffers.keys())
         rng = np.random.default_rng(seed or (10_000 + self.meta_iter))
         n_gpus, tpg = len(self.devices), self.tasks_per_gpu
-        task_fams = [fams[i] for i in rng.integers(0, len(fams), size=n_gpus * tpg)]
+        task_fams = _pick_families(fams, rng, n_gpus * tpg, self.family_weights)
 
         results: Dict[int, list] = {g: [] for g in range(n_gpus)}
         errors: Dict[int, Exception] = {g: None for g in range(n_gpus)}
