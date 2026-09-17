@@ -30,7 +30,7 @@ def main():
                    help="覆盖配置里的 map_size。**不给就用配置值**（默认行为）。"
                         "★2026-09-10 修：原来默认 64 会**静默覆盖** env_*_small.yaml 的 "
                         "map_size:20 —— 于是'小图高密度'配置从未生效，random 专家数据一直是 "
-                        "64x64 大图(64 体密度 2%)，而评测是 20x21(密度 18%)，9 倍失配。"
+                        "64x64 大图(64 体密度 2%%)，而评测是 20x21(密度 18%%)，9 倍失配。"
                         "help 原文写'仅元数据'是错的：generate_lacam_data.py 里 "
                         "`wrapper.map_size = map_size` 真的会改地图生成尺寸。")
     p.add_argument("--num-workers", type=int, default=40, help="每族并行进程数（-1=auto）")
@@ -45,6 +45,10 @@ def main():
     p.add_argument("--cost2go", action="store_true",
                    help="观测追加 cost2go 通道（patch 4→5 通道，T2）；输出到 --output-dir")
     p.add_argument("--cost2go-clip", type=float, default=10.0, help="cost2go 相对距离 clip 半径")
+    p.add_argument("--seed-start", type=int, default=10000,
+                   help="episode seed 起点（区间 [seed_start, seed_start+num_episodes)）。"
+                        "★ 追加新数据时必须给与已有批次不相交的区间：默认 10000 与历史所有批次相同，"
+                        "会逐 episode 重复生成旧数据（2026-09-17 查实 gen2 批 66~98%% 重复）。")
     args = p.parse_args()
 
     # spawn 出来的 worker 会重新 import 模块，靠环境变量把开关传下去（模块级赋值传不到子进程）
@@ -78,6 +82,7 @@ def main():
             num_workers=args.num_workers,
             use_cost2go=args.cost2go,
             cost2go_clip=args.cost2go_clip,
+            seed_start=args.seed_start,
         )
         summary[fam] = time.time() - ft
         print(f"===== 族 '{fam}' 完成，用时 {summary[fam]/60:.1f} min =====", flush=True)

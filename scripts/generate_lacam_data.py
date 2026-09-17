@@ -502,6 +502,7 @@ def generate_data(
     num_workers: int = 1,
     use_cost2go: bool = False,
     cost2go_clip: float = 10.0,
+    seed_start: int = 10000,
 ):
     """
     对一种地图族生成专家数据，支持多进程并行。
@@ -529,7 +530,16 @@ def generate_data(
           f"{num_episodes} episodes, {num_agents} agents, size={map_size}, "
           f"workers={num_workers}")
 
-    all_seeds = [10000 + ep for ep in range(num_episodes)]
+    # ★ 2026-09-17 bug 修复：seed 原来写死为 10000+ep —— 同配置同体数**每次生成都是同一批 episode**。
+    # 当年的 "gen2" 扩充批与原批逐 episode 哈希比对：random 重复 66%、maze 重复 89~98%，
+    # "数据 2.3×" 实际只多了 1.31× 不重复 episode（mazes 几乎为 0）。新数据必须给不相交的 seed_start。
+    # 训练 seed 经 resolve_seed(raw, 'train') = raw % TEST_SEED_BASE 折叠，越界会绕回低位造成重复。
+    from envs.dataset_split import TEST_SEED_BASE
+    if seed_start < 0 or seed_start + num_episodes > TEST_SEED_BASE:
+        raise ValueError(f"seed 区间 [{seed_start}, {seed_start + num_episodes}) 越出 train 段 "
+                         f"[0, {TEST_SEED_BASE})，折叠后会与其他批次重复")
+    all_seeds = [seed_start + ep for ep in range(num_episodes)]
+    print(f"  seed 区间: [{seed_start}, {seed_start + num_episodes})")
     t_start = time.time()
 
     if num_workers <= 1:
@@ -597,6 +607,7 @@ def generate_data(
                       f"timesteps={total_samples} rate={rate:.1f} ep/s")
 
         stats = dict(map_type=map_type, num_episodes=num_episodes,
+                     seed_start=seed_start, seed_end=seed_start + num_episodes,
                      num_agents=num_agents, map_size=map_size, backend=backend,
                      success_count=success_count, fail_count=fail_count,
                      total_samples=total_samples, buffer_size=len(expert_buffer),
@@ -650,6 +661,7 @@ def generate_data(
         hard_case_mgr = HardCaseManager()
 
         stats = dict(map_type=map_type, num_episodes=num_episodes,
+                     seed_start=seed_start, seed_end=seed_start + num_episodes,
                      num_agents=num_agents, map_size=map_size, backend=backend,
                      num_workers=num_workers,
                      success_count=success_count, fail_count=fail_count,
