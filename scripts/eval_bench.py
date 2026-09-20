@@ -87,7 +87,8 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
 @torch.no_grad()
 def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                   on_target="nothing", action_mode="argmax", escape_k=3, escape_temp=1.0,
-                  escape_no_wait_after=8, base_temp=0.3, goal_hold="none", tta=False, rng=None):
+                  escape_no_wait_after=8, base_temp=0.3, goal_hold="none", tta=False, rng=None,
+                  reset_hidden_every=0, zero_channels=()):
     """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。"""
     E, N = len(specs), num_agents
     rng = rng or np.random.default_rng(0)
@@ -143,6 +144,16 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                 else:
                     no_improve[e, i] += 1
             at_goal_hist[e, :, t] = np.all(a_arr == goals[e], axis=1)
+
+        # 通道消融探针：把指定观测通道置零（3=时间衰减足迹，4=cost2go），
+        # 用来看空间编码到底依赖哪些输入、以及它们与 GRU 记忆的分工。
+        if zero_channels:
+            patches[:, :, list(zero_channels)] = 0
+
+        # 记忆消融探针：每 reset_hidden_every 步清零时间核状态（=1 相当于无记忆逐帧决策）。
+        # 用来分离「瓶颈在空间编码还是在时序记忆」——通信迟滞状态不动，只砍 GRU 记忆。
+        if reset_hidden_every and t % reset_hidden_every == 0:
+            net.temporal.reset_state()
 
         pt = torch.from_numpy(patches).unsqueeze(1).to(device)      # (E,1,N,C,K,K)
         st = torch.from_numpy(scalars).unsqueeze(1).to(device)
@@ -283,6 +294,11 @@ def main():
     ap.add_argument("--auto-protocol", action="store_true",
                     help="按各族官方协议跑（见 FAMILY_PROTOCOL），覆盖 --agent-counts/"
                          "--num-maps/--seeds/--max-steps")
+    ap.add_argument("--zero-channels", type=str, default="",
+                    help="观测通道消融：逗号分隔的通道号置零（3=足迹，4=cost2go）。")
+    ap.add_argument("--reset-hidden-every", type=int, default=0,
+                    help="记忆消融探针：推断时每 N 步清零时间核(GRU)状态；1=完全无记忆，0=不清（默认）。"
+                         "用于分离瓶颈在空间编码还是时序记忆。")
     ap.add_argument("--tta", action="store_true",
                     help="测试期 D4 对称集成（8 视角平均动作分布）")
     ap.add_argument("--goal-hold", default="none", choices=["none", "greedy", "wait"],
@@ -357,6 +373,8 @@ def main():
                                       escape_no_wait_after=args.escape_no_wait_after,
                                       base_temp=args.base_temp,
                                       goal_hold=args.goal_hold, tta=args.tta,
+                                      reset_hidden_every=args.reset_hidden_every,
+                                      zero_channels=tuple(int(x) for x in args.zero_channels.split(",") if x.strip()),
                                       rng=np.random.default_rng(1234 + i))
             agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
             agg["n"] = len(rows)

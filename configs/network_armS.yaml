@@ -1,0 +1,30 @@
+# 归因臂 S（只放大空间）：cnn_channels 128→152，时序一字不动（d_model 保持 320，
+# 因为改 d_model 会连带改 GRU 隐维，就不是单一变量了）。与 T 臂 8.68M 配对（差 0.7%）。
+cnn_channels: 152
+comm_dim: 192
+comm_radius: 4
+comm_rounds: 1
+comm_topk_cap: 6
+cost2go_clip: 10.0
+d_conv: 4
+d_model: 320
+d_scalar: 32
+d_state: 16
+ema_decay: 0.0
+entmax_alpha: 1.5
+head_hidden: 256
+intent_dim: 192
+intent_mode: action
+mamba_expand: 2
+n_res_blocks: 3
+num_actions: 5
+num_attention_heads: 4
+obs_radius: 5
+patch_channels: 5
+scalar_feat_dim: 8
+spatial_pool: 0
+stickiness_bonus: 0.1
+tau_in: 0.05
+tau_out: 0.02
+temporal_backend: gru
+temporal_layers: 2

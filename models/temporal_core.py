@@ -88,10 +88,16 @@ class MambaBlock(nn.Module):
 
 class TemporalCore(nn.Module):
     def __init__(self, d_model: int, backend: str = "mamba", n_layers: int = 2,
-                 d_state: int = 16, d_conv: int = 4, expand: int = 2):
+                 d_state: int = 16, d_conv: int = 4, expand: int = 2,
+                 checkpoint: bool = False):
         super().__init__()
         self.backend = backend
         self.n_layers = n_layers
+        # 梯度检查点：纯 PyTorch 的选择性扫描会把每个时间步的 (BN,d_inner,d_state) 中间量
+        # 全部留给反向（d_model=320/T=32/N=64 下实测需 >29GB，31.4GB 卡直接 OOM）。
+        # 开启后反向时重算该段，显存大降、算力约 +30%，语义不变——这样 batch/seq 不用改，
+        # 才能与已有 GRU 结果（同 batch/seq/数据/步数）直接对比。
+        self.checkpoint = checkpoint
         if backend == "mamba":
             self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
             self.blocks = nn.ModuleList([MambaBlock(d_model, d_state, d_conv, expand)
@@ -113,7 +119,11 @@ class TemporalCore(nn.Module):
         if self.backend == "mamba":
             for i, (norm, blk) in enumerate(zip(self.norms, self.blocks)):
                 cs, ss = self._mamba_state[i] if stateful else (None, None)
-                out, cs, ss = blk(norm(x), cs, ss)
+                if self.checkpoint and self.training and not stateful and x.requires_grad:
+                    out, cs, ss = torch.utils.checkpoint.checkpoint(
+                        blk, norm(x), cs, ss, use_reentrant=False)
+                else:
+                    out, cs, ss = blk(norm(x), cs, ss)
                 if stateful:
                     self._mamba_state[i] = (cs, ss)
                 x = x + out                                  # pre-norm 残差

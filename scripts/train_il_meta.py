@@ -29,6 +29,7 @@ def build_net(nc: dict) -> MAPFCommNet:
         stickiness_bonus=nc.get("stickiness_bonus", 0.1), ema_decay=nc.get("ema_decay", 0.0),
         num_attention_heads=nc.get("num_attention_heads", 4),
         temporal_backend=nc.get("temporal_backend", "mamba"),
+        temporal_checkpoint=nc.get("temporal_checkpoint", False),
         temporal_layers=nc.get("temporal_layers", 2), d_state=nc.get("d_state", 16),
         d_conv=nc.get("d_conv", 4), mamba_expand=nc.get("mamba_expand", 2),
         head_hidden=nc.get("head_hidden", 128),

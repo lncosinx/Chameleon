@@ -48,6 +48,7 @@ class MAPFCommNet(nn.Module):
         hard_topk_select: bool = False,   # SQ3 消融：hard top-k 做选择（预期引起边闪烁）
         # 时间核
         temporal_backend: str = "mamba",
+        temporal_checkpoint: bool = False,
         temporal_layers: int = 2,
         d_state: int = 16,
         d_conv: int = 4,
@@ -96,7 +97,8 @@ class MAPFCommNet(nn.Module):
                 comm_radius=comm_radius, num_heads=num_attention_heads)
         self.temporal = TemporalCore(d_model, backend=temporal_backend,
                                      n_layers=temporal_layers, d_state=d_state,
-                                     d_conv=d_conv, expand=mamba_expand)
+                                     d_conv=d_conv, expand=mamba_expand,
+                                     checkpoint=temporal_checkpoint)
         self.head = nn.Sequential(
             nn.Linear(d_model, head_hidden), nn.GELU(),
             nn.Linear(head_hidden, num_actions),
