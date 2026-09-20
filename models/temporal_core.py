@@ -20,6 +20,44 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 
 
+def _load_selective_scan():
+    """加载 mamba-ssm 的官方 CUDA 选择性扫描核；不可用则返回 None（回落到纯 PyTorch 实现）。
+
+    ★ 为什么要绕过 `import mamba_ssm`：该包的 __init__ 会连带导入 transformers / huggingface_hub
+      等重依赖（只为它的 LM 封装用），而我们只需要最内层的 selective_scan_fn。这里给父包塞桩，
+      只加载 ops.selective_scan_interface，避免为一个 kernel 把整套 LM 依赖拖进环境。
+    ★ 历史：旧服务器 torch cu130 + nvcc12.6 装不上官方扩展，故本文件先写了纯 PyTorch 版；
+      现机器 torch 2.8.0+cu128 与 nvcc 12.8 匹配，官方预编译 wheel 可直接安装（2026-09-20）。
+      纯 PyTorch 版保留：既是无扩展环境的兜底，也是 kernel 的数值对拍基准
+      （scripts/test_mamba_kernel.py）。
+    """
+    import os, sys, types, importlib
+    try:
+        import mamba_ssm as _m
+        base = os.path.dirname(_m.__file__)
+    except Exception:
+        try:
+            import importlib.util as _u
+            spec = _u.find_spec("mamba_ssm")
+            base = os.path.dirname(spec.origin) if spec and spec.origin else None
+        except Exception:
+            base = None
+        if not base:
+            return None
+    try:
+        for name, path in [("mamba_ssm", base), ("mamba_ssm.ops", base + "/ops"),
+                           ("mamba_ssm.utils", base + "/utils"),
+                           ("mamba_ssm.ops.triton", base + "/ops/triton")]:
+            if name not in sys.modules or not hasattr(sys.modules[name], "__path__"):
+                m = types.ModuleType(name); m.__path__ = [path]; sys.modules[name] = m
+        return importlib.import_module("mamba_ssm.ops.selective_scan_interface").selective_scan_fn
+    except Exception:
+        return None
+
+
+_SELECTIVE_SCAN = _load_selective_scan()
+
+
 class MambaBlock(nn.Module):
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
@@ -38,6 +76,7 @@ class MambaBlock(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.out_proj = nn.Linear(self.d_inner, d_model)
+        self.use_kernel = True      # False = 强制走纯 PyTorch 参考实现（对拍/无扩展环境）
 
     def forward(self, x: torch.Tensor,
                 conv_state: Optional[torch.Tensor] = None,
@@ -69,6 +108,25 @@ class MambaBlock(nn.Module):
         dt, Bp, Cp = torch.split(dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = F.softplus(self.dt_proj(dt))                  # (B,L,d_inner)
         A = -torch.exp(self.A_log.float())                 # (d_inner,d_state)
+
+        # ---- 快路径：官方 CUDA 选择性扫描（仅训练用）----
+        # 官方核**不接受非零初始状态**，故只在 ssm_state is None（训练整段，h0=0）时启用；
+        # 推断逐步（L=1 且需跨步带状态）仍走下面的参考实现——那条本来就只有一步，不是热点。
+        # 参数化逐项对应：u=xc, delta=dt(已 softplus), A=-exp(A_log), B=Bp, C=Cp, D, z 门控，
+        # 融合后同为 y=(scan + u·D)·silu(z)。数值对拍见 scripts/test_mamba_kernel.py。
+        if (_SELECTIVE_SCAN is not None and ssm_state is None
+                and x.is_cuda and self.use_kernel):
+            y = _SELECTIVE_SCAN(
+                xc.transpose(1, 2).contiguous().float(),      # u     (B,d_inner,L)
+                dt.transpose(1, 2).contiguous().float(),      # delta (B,d_inner,L)
+                A,                                            # A     (d_inner,d_state)
+                Bp.transpose(1, 2).contiguous().float(),      # B     (B,d_state,L)
+                Cp.transpose(1, 2).contiguous().float(),      # C     (B,d_state,L)
+                self.D.float(), z.transpose(1, 2).contiguous().float(),
+                None, False, True)
+            y, last_state = y
+            y = y.transpose(1, 2).to(x.dtype)
+            return self.out_proj(y), new_conv_state, last_state.detach()
 
         if ssm_state is None:
             h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=torch.float32)

@@ -1,10 +1,9 @@
 # 大规模骨干臂（2026-09-20）：7.45M GRU → 7.57M Mamba，唯一变量 = 时间核。
-# 依据：小规模 A/B（2.16M GRU vs 2.22M Mamba，同数据/lr/seed/8k）正式协议 12 档全胜、
-#       合计 +0.333，相当于参数 ×3.45 才能换到的收益，而参数只多 3%。
-# d_state 保持 16：它是 SSM 循环状态容量（状态量 = d_inner × d_state），降到 8 会把
-#   记忆容量砍半——而记忆消融显示时序通路正是收益来源（抽掉记忆 dev 掉 0.640）。
-#   代价：峰值 29.7/31.4 GiB、14.68 s/it，评测不能与训练并行。
-# temporal_checkpoint=true：纯 PyTorch 扫描会保留每步中间量，不开检查点直接 OOM。
+# 依据：小规模 A/B 正式协议 12 档全胜、合计 +0.333（参数仅 +3%）。
+# d_state=16 不可降：状态量 = d_inner × d_state 是 Mamba 记忆容量载体，而记忆正是收益来源。
+# temporal_checkpoint=false：接入官方 CUDA 选择性扫描核后，峰值显存 29.7→19.6GiB、
+#   速度 14.68→5.94 s/it，检查点已无必要且反而拖慢 47%。两条路径数值等价（1e-6），
+#   见 scripts/test_mamba_kernel.py。
 cnn_channels: 128
 comm_dim: 192
 comm_radius: 4
@@ -32,5 +31,5 @@ stickiness_bonus: 0.1
 tau_in: 0.05
 tau_out: 0.02
 temporal_backend: mamba
-temporal_checkpoint: true
+temporal_checkpoint: false
 temporal_layers: 2
