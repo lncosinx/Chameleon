@@ -88,7 +88,7 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
 def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                   on_target="nothing", action_mode="argmax", escape_k=3, escape_temp=1.0,
                   escape_no_wait_after=8, base_temp=0.3, goal_hold="none", tta=False, rng=None,
-                  reset_hidden_every=0, zero_channels=()):
+                  reset_hidden_every=0, zero_channels=(), wait_bias=0.0):
     """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。"""
     E, N = len(specs), num_agents
     rng = rng or np.random.default_rng(0)
@@ -188,6 +188,14 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
         else:
             logits, info = net(pt, st, po, action_masks=mt, reset_comm=False, stateful=True)
             lg = logits[:, 0]                                        # (E,N,A)
+        # 等待抑制：给 wait(动作0) 的 logit 减偏置 b，等价于把等待概率 ×exp(-b) 再归一化。
+        # 依据（2026-09-21 诊断）：384 步上限下 ISR→0.999，失败不是僵局而是**慢**——
+        # makespan 比 LaCAM 专家慢 2.0~3.7×，而专家 wait 比例 0.48~0.51、我们 wait_pred 0.6~0.78。
+        # 交叉熵偏好"最安全的 wait"是模仿学习的系统性偏差，这里在推断端直接纠偏。
+        if wait_bias != 0.0:
+            lg = lg.clone()
+            lg[..., 0] = lg[..., 0] - wait_bias
+
         comm_neighbors.append(info.get("avg_neighbors", 0.0))
         comm_flips.append(info.get("edge_flip_rate", 0.0))
 
@@ -294,6 +302,9 @@ def main():
     ap.add_argument("--auto-protocol", action="store_true",
                     help="按各族官方协议跑（见 FAMILY_PROTOCOL），覆盖 --agent-counts/"
                          "--num-maps/--seeds/--max-steps")
+    ap.add_argument("--wait-bias", type=float, default=0.0,
+                    help="等待抑制：wait(动作0) 的 logit 减去该值（>0 抑制等待）。针对"
+                         "「策略比专家慢 2~3.7×、等待过多」的诊断结果。")
     ap.add_argument("--zero-channels", type=str, default="",
                     help="观测通道消融：逗号分隔的通道号置零（3=足迹，4=cost2go）。")
     ap.add_argument("--reset-hidden-every", type=int, default=0,
@@ -375,6 +386,7 @@ def main():
                                       goal_hold=args.goal_hold, tta=args.tta,
                                       reset_hidden_every=args.reset_hidden_every,
                                       zero_channels=tuple(int(x) for x in args.zero_channels.split(",") if x.strip()),
+                                      wait_bias=args.wait_bias,
                                       rng=np.random.default_rng(1234 + i))
             agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
             agg["n"] = len(rows)
