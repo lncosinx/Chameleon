@@ -87,7 +87,7 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
 @torch.no_grad()
 def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                   on_target="nothing", action_mode="argmax", escape_k=3, escape_temp=1.0,
-                  escape_no_wait_after=8, base_temp=0.3, goal_hold="none", tta=False, rng=None,
+                  escape_no_wait_after=8, base_temp=1.0, goal_hold="none", tta=False, rng=None,
                   reset_hidden_every=0, zero_channels=(), wait_bias=0.0):
     """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。"""
     E, N = len(specs), num_agents
@@ -202,7 +202,12 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
         if action_mode == "argmax":
             acts = lg.argmax(dim=-1).cpu().numpy()
         elif action_mode == "sample":
-            probs = torch.softmax(lg / escape_temp, dim=-1)
+            # ★ 2026-09-21 bug 修复：这里原本用 escape_temp（默认 1.0），而不是 base_temp。
+            # 于是所有标注"sample T=0.3"的历史评测**实际都是 T=1.0 全熵采样**，温度旋钮从未生效。
+            # 结果本身仍可比（所有模型同一套推断），但协议描述需更正；且温度未被调过，
+            # 而本文件 escape2 的注释早就指出"纯采样(T=1) 给所有体加噪声 → 路径变长"，
+            # 与 2026-09-21 诊断（失败源于 makespan 比专家慢 2~3.7×）直接相关。
+            probs = torch.softmax(lg / base_temp, dim=-1)
             acts = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1
                                      ).reshape(E, N).cpu().numpy()
             if goal_hold != "none":
@@ -294,8 +299,12 @@ def main():
     ap.add_argument("--batch-envs", type=int, default=16, help="一次批量 rollout 的 episode 数")
     ap.add_argument("--action-mode", default="argmax",
                     choices=["argmax", "sample", "escape", "escape2"])
-    ap.add_argument("--base-temp", type=float, default=0.3,
-                    help="escape2：未卡住的体的采样温度（低温=近贪心，保路径质量）")
+    ap.add_argument("--base-temp", type=float, default=1.0,
+                    help="采样温度（sample 模式全体；escape2 模式仅未卡住的体）。"
+                         "★ 默认 1.0 = 全部历史结果的实际口径：2026-09-21 前 sample 分支误用 "
+                         "escape_temp(1.0)，标注的 T=0.3 从未生效。修 bug 后若把默认设回 0.3，"
+                         "所有未显式传温度的脚本都会与历史结果不可比（实测 T=0.3 会使 dev 合计 "
+                         "从 2.094 崩到 0.656——低温丧失打破对称僵局的能力）。故默认保持 1.0。")
     ap.add_argument("--escape-k", type=int, default=3)
     ap.add_argument("--escape-temp", type=float, default=1.0)
     ap.add_argument("--escape-no-wait-after", type=int, default=8)
