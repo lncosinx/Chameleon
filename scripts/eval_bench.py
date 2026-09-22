@@ -88,7 +88,7 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
 def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                   on_target="nothing", action_mode="argmax", escape_k=3, escape_temp=1.0,
                   escape_no_wait_after=8, base_temp=1.0, goal_hold="none", tta=False, rng=None,
-                  reset_hidden_every=0, zero_channels=(), wait_bias=0.0):
+                  reset_hidden_every=0, zero_channels=(), wait_bias=0.0, momentum_bias=0.0):
     """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。"""
     E, N = len(specs), num_agents
     rng = rng or np.random.default_rng(0)
@@ -195,6 +195,19 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
         if wait_bias != 0.0:
             lg = lg.clone()
             lg[..., 0] = lg[..., 0] - wait_bias
+
+        # 动作惯性：给"上一步的动作"加 logit 偏置。
+        # 依据（2026-09-23 探针，7 万次两体争用）：专家破对称规则是**动量优先**——
+        # 正在朝该方向移动者获胜 74.8%(z=+95.7)、刚移动者胜 71.3%(z=+62.8)，
+        # 而智能体编号完全无关(0.483, z≈0)。我们每步重采样等于不断打断自己的动量，
+        # 既慢又难解冲突；这里在解码端复现该规则。wait(0) 不加成，避免与 wait_bias 冲突。
+        if momentum_bias != 0.0:
+            lg = lg.clone()
+            pv = torch.from_numpy(prev).to(lg.device)                  # (E,N) 上一步动作
+            bonus = torch.zeros_like(lg).scatter_(
+                -1, pv.unsqueeze(-1), momentum_bias)
+            bonus[..., 0] = 0.0
+            lg = lg + bonus
 
         comm_neighbors.append(info.get("avg_neighbors", 0.0))
         comm_flips.append(info.get("edge_flip_rate", 0.0))
@@ -314,6 +327,9 @@ def main():
     ap.add_argument("--wait-bias", type=float, default=0.0,
                     help="等待抑制：wait(动作0) 的 logit 减去该值（>0 抑制等待）。针对"
                          "「策略比专家慢 2~3.7×、等待过多」的诊断结果。")
+    ap.add_argument("--momentum-bias", type=float, default=0.0,
+                    help="动作惯性：给上一步动作的 logit 加该值（wait 除外）。依据：专家破对称"
+                         "规则是动量优先（争用中有动量者胜 74.8%%，而体序无关）。")
     ap.add_argument("--zero-channels", type=str, default="",
                     help="观测通道消融：逗号分隔的通道号置零（3=足迹，4=cost2go）。")
     ap.add_argument("--reset-hidden-every", type=int, default=0,
@@ -396,6 +412,7 @@ def main():
                                       reset_hidden_every=args.reset_hidden_every,
                                       zero_channels=tuple(int(x) for x in args.zero_channels.split(",") if x.strip()),
                                       wait_bias=args.wait_bias,
+                                      momentum_bias=args.momentum_bias,
                                       rng=np.random.default_rng(1234 + i))
             agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
             agg["n"] = len(rows)
