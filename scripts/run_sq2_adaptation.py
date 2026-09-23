@@ -54,7 +54,11 @@ def main():
     ap.add_argument("--init-reptile", required=True)
     ap.add_argument("--init-joint", required=True)
     ap.add_argument("--family", default="warehouse", help="held-out 族（评测台家族名）")
-    ap.add_argument("--data-family", default=None, help="适应数据的 expert_{name} 名（默认同 --family）")
+    ap.add_argument("--data-family", default=None,
+                    help="适应数据的 expert_{name} 名；**可逗号分隔多个**（默认同 --family）。"
+                         "★ 2026-09-23：原先只给 wh96 单一体数，而评测覆盖 32~192 六档，"
+                         "适应把策略拉向 96 体行为、高密度档因此退化——那是适应集与评测分布"
+                         "不匹配，不能据此说'快速适应无效'。分层适应集用 wh96,wh192。")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--config", default="configs/train_il_v5.yaml")
     ap.add_argument("--network-config", default="configs/network_gru_c2g.yaml")
@@ -74,10 +78,27 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
     fam_data = args.data_family or args.family
-    base = os.path.join(args.data_dir, f"expert_{fam_data}")
+    fams_data = [f.strip() for f in fam_data.split(",") if f.strip()]
+    base = os.path.join(args.data_dir, f"expert_{fams_data[0]}")
     n = int(np.load(os.path.join(base, "episode_ids.npy"), mmap_mode="r").shape[0])
     buf = ExpertDemoBuffer(capacity=n)
     load_buffer_from_disk(base, buf)
+    if len(fams_data) > 1:
+        # 分层适应集：每次 sample 随机选一个体数档，使适应分布覆盖评测的高低密度两端。
+        class _MixBuffer:
+            def __init__(self, bufs): self.bufs = bufs
+            def __len__(self): return sum(len(b) for b in self.bufs)
+            def sample(self, **kw):
+                rng = kw.get("rng")
+                i = int(rng.integers(0, len(self.bufs))) if rng is not None else 0
+                return self.bufs[i].sample(**kw)
+        extra = []
+        for f in fams_data[1:]:
+            b2 = os.path.join(args.data_dir, f"expert_{f}")
+            n2 = int(np.load(os.path.join(b2, "episode_ids.npy"), mmap_mode="r").shape[0])
+            bb = ExpertDemoBuffer(capacity=n2); load_buffer_from_disk(b2, bb); extra.append(bb)
+            print(f"[SQ2] 追加适应数据 {len(bb):,} steps ← {b2}", flush=True)
+        buf = _MixBuffer([buf] + extra)
     print(f"[SQ2] 适应数据 {len(buf):,} steps ← {base}", flush=True)
 
     results = {}
