@@ -81,6 +81,7 @@ class ILReptileTrainer:
         # 这里取 lr_out = meta_lr × inner_steps × inner_lr。
         # （教训来源：7.45M Reptile 臂曾因"等梯度步数≠等优化预算"而被误判，见 SCHEDULE 已定论 17。）
         self.use_maml = bool(cfg.get("maml", False))
+        self.cfg_maml_outer_lr = cfg.get("maml_outer_lr")
         if self.use_maml:
             self.use_reptile = False
         self.total_meta_iters = cfg.get("meta_iterations", 20000)
@@ -258,7 +259,11 @@ class ILReptileTrainer:
         # 数量级。改为外层 Adam 后内外层经过同样的归一化，步长才真正可比。
         if not hasattr(self, "_outer_opt"):
             self._outer_opt = torch.optim.Adam(list(self.net.parameters()), lr=self.inner_lr)
-        lr_out = self.inner_lr * (self._current_meta_lr() / max(self.meta_lr_start, 1e-12))
+        # maml_outer_lr：显式指定外层 Adam 学习率（不给则按 inner_lr × meta_lr 衰减比例）。
+        # 2026-09-24 实测：默认值 5e-4 会发散（loss 500→2000 步 1.52→4.10，而同 seed 的
+        # Reptile 是 0.17→0.10），故该项需按实际扫描结果设定。
+        base_out = self.cfg_maml_outer_lr if self.cfg_maml_outer_lr else self.inner_lr
+        lr_out = base_out * (self._current_meta_lr() / max(self.meta_lr_start, 1e-12))
         with torch.no_grad():
             for name, param in self.net.named_parameters():
                 param.copy_(theta_meta[name].to(self.device))

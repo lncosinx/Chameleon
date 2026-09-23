@@ -52,7 +52,15 @@ FAMILY_PROTOCOL = {
 def load_maps(family: str, num_maps: int, maps_file: str = None):
     # maps_file：调参用的独立 dev 地图集（scripts/make_dev_maps.py 生成）。
     # 推断期超参必须在 dev 上调，报告只用 validation-*，否则是拟合测试集。
-    src = maps_file or os.path.join(MARLGPT, FAMILY_DIR[family], "maps.yaml")
+    # maps_file 可给**目录**（内含 <family>.yaml，make_dev_maps.py 的默认产物布局）
+    # 或含 {family} 的路径模板，或单个文件（仅单族时）。
+    if maps_file:
+        if os.path.isdir(maps_file):
+            src = os.path.join(maps_file, f"{family}.yaml")
+        else:
+            src = maps_file.format(family=family) if "{family}" in maps_file else maps_file
+    else:
+        src = os.path.join(MARLGPT, FAMILY_DIR[family], "maps.yaml")
     maps = yaml.safe_load(open(src))
     names = sorted(maps.keys())
     if 0 < num_maps < len(names):
@@ -392,7 +400,9 @@ def main():
                                                _parse_seeds(pr["seeds"]), pr["steps"])
         else:
             f_acs, f_maps, f_seeds, f_steps = acs, args.num_maps, seeds, args.max_steps
-        maps = load_maps(fam, f_maps)
+        # ★ 2026-09-23 修：--maps-file 自 5bf5042 引入起从未接到此处，所有标注 "dev" 的
+        #   历史数字实际跑在 validation-* 测试集上（= 在测试集上调超参）。
+        maps = load_maps(fam, f_maps, args.maps_file)
         print(f"\n===== {fam}: {len(maps)} maps × {len(f_seeds)} seed(s) "
               f"× {f_steps} steps | agents={f_acs} =====", flush=True)
         results[fam] = {}

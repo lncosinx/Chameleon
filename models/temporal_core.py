@@ -163,6 +163,16 @@ class TemporalCore(nn.Module):
         elif backend in ("gru", "lstm"):
             rnn = nn.GRU if backend == "gru" else nn.LSTM
             self.rnn = rnn(d_model, d_model, num_layers=n_layers, batch_first=True)
+        elif backend in ("gru_prenorm", "lstm_prenorm"):
+            # 归因臂（2026-09-24）：把 mamba 分支的**块结构**（pre-norm + 逐层残差）原样套到
+            # RNN 上，唯一变量 = 递归核是 SSM 还是 GRU。动机见 SCHEDULE 已定论 18：
+            # 此前所有 Mamba-vs-GRU 对比里，mamba 分支带 LayerNorm+残差而 gru 分支是裸 nn.GRU，
+            # "SSM 优于 GRU" 与 "pre-norm 残差优于无" 两个变量混在一起。
+            # 参数量与裸 nn.GRU(num_layers=n) 相同（堆 n 个单层 GRU），只多 n 个 LayerNorm。
+            rnn = nn.GRU if backend.startswith("gru") else nn.LSTM
+            self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
+            self.rnns = nn.ModuleList([rnn(d_model, d_model, num_layers=1, batch_first=True)
+                                       for _ in range(n_layers)])
         else:
             raise ValueError(f"unknown temporal backend: {backend}")
         self.reset_state()
@@ -171,6 +181,7 @@ class TemporalCore(nn.Module):
         """清推断态（下次 stateful forward 从 0 起）。每 episode 起点调。"""
         self._mamba_state = [(None, None)] * self.n_layers   # (conv_state, ssm_state) per layer
         self._rnn_state = None
+        self._rnn_states = [None] * self.n_layers            # gru_prenorm/lstm_prenorm 逐层状态
 
     def forward(self, x: torch.Tensor, stateful: bool = False) -> torch.Tensor:
         """(BN, T, D) → (BN, T, D)。stateful=True 时跨调用携带状态（推断逐步用）。"""
@@ -185,6 +196,15 @@ class TemporalCore(nn.Module):
                 if stateful:
                     self._mamba_state[i] = (cs, ss)
                 x = x + out                                  # pre-norm 残差
+            return x
+        if self.backend in ("gru_prenorm", "lstm_prenorm"):
+            for i, (norm, rnn) in enumerate(zip(self.norms, self.rnns)):
+                st = self._rnn_states[i] if stateful else None
+                out, st = rnn(norm(x), st)
+                if stateful:
+                    self._rnn_states[i] = ((st[0].detach(), st[1].detach())
+                                           if isinstance(st, tuple) else st.detach())
+                x = x + out                                  # pre-norm 残差（与 mamba 分支一致）
             return x
         # gru/lstm
         st = self._rnn_state if stateful else None
