@@ -1,0 +1,30 @@
+# Q2 的 MAML 臂（一阶 FOMAML，2026-09-23）。路线图图里写明'若可实现则加 MAML'。
+# 与 v5reptile/v5main 两臂逐项对齐：同数据、同 seed、同 40000 步、同 inner_lr/inner_steps/tasks_per_meta。
+# 唯一变量 = 外层更新规则（Reptile 位移平均 vs FOMAML query 梯度）。
+# 外层学习率取 meta_lr × inner_steps × inner_lr，使与 Reptile 的有效步长同量级（见 trainers 注释）。
+batch_size: 32
+d4_augment: false
+debug: false
+excluded_weight: 0.3
+families:
+- random32
+- random48
+- random64
+- maze32
+- maze48
+- maze64
+grad_clip: 10.0
+held_out_family: null
+il_wait_weight: 1.0
+inner_lr: 0.0005
+inner_steps: 5
+label_smoothing: 0.0
+meta_iterations: 40000
+meta_lr_end: 0.01
+meta_lr_start: 0.1
+profile_interval: 200
+reptile: false
+sequence_len: 32
+tasks_per_meta: 2
+use_amp: true
+maml: true
