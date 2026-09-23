@@ -101,9 +101,13 @@ def main():
 
         # 判决：对每个"真对手"，我们是否每档都 ≥
         if ours:
+            # 判决只针对**一臂**：默认最后一个 --ours。多臂对照时必须标清楚是哪一臂，
+            # 否则会把 A 臂的表配 B 臂的判决行读（2026-09-24 实际踩过）。
             best_label = list(ours)[-1]
             mine = ours[best_label]
             lines.append("")
+            lines.append(f"判决对象：**{best_label}**" +
+                         ("（共 %d 臂，判决只算这一臂）" % len(ours) if len(ours) > 1 else ""))
             for name, vals in list(lb.items()) + list(extra.items()):
                 if name in CEILING:
                     continue
