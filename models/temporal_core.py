@@ -13,6 +13,7 @@ backend 'gru'/'lstm' 作零依赖兜底/对照。
 """
 from __future__ import annotations
 
+import os
 import math
 import torch
 import torch.nn as nn
@@ -32,6 +33,14 @@ def _load_selective_scan():
       （scripts/test_mamba_kernel.py）。
     """
     import os, sys, types, importlib
+    # ★ 幂等性：本函数第一次成功后会在 sys.modules 留下**桩** mamba_ssm（只有 __path__、
+    #   没有 __file__）。若第二次调用仍走 `import mamba_ssm` 分支，会拿到那个桩 →
+    #   os.path.dirname(_m.__file__) 抛 AttributeError → 回退 find_spec，而已导入模块的
+    #   __spec__ 是 None → base=None → **误报"内核不可用"**。2026-09-24 据此误判过一次
+    #   （当时训练其实正在走内核）。故先直接复用已加载好的子模块。
+    _done = sys.modules.get("mamba_ssm.ops.selective_scan_interface")
+    if _done is not None and hasattr(_done, "selective_scan_fn"):
+        return _done.selective_scan_fn
     try:
         import mamba_ssm as _m
         base = os.path.dirname(_m.__file__)
@@ -59,8 +68,19 @@ _SELECTIVE_SCAN = _load_selective_scan()
 
 
 class MambaBlock(nn.Module):
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2,
+                 dt_init: str = "torch_default"):
+        """dt_init: 'torch_default'（**默认，保持历史行为**，`dt_proj` 用 nn.Linear 默认初始化）
+        | 'official'（官方 Mamba 初始化）。
+
+        ★ 背景（SCHEDULE 已定论 18，2026-09-24）：默认初始化下 softplus(dt_proj(·)) ≈ 0.70，
+          最慢通道 dA≈0.50（半衰期 1 步），训练 12000 步后 dt_base 仍为 0.70 纹丝不动 ⇒
+          选择性扫描坍缩成 `y_i ≈ dt_i·conv4(x)_i·⟨B,C⟩`（⟨B,C⟩ 是跨通道共享的单标量），
+          SSM 实际无记忆、d_state 形同虚设。官方初始化把 dt 放到 log-uniform[1e-3,1e-1]
+          （半衰期 ≈35 步）。**不改默认值**：改了会让全部历史 Mamba 结果不可比（见已定论 19）。
+        """
         super().__init__()
+        self.dt_init = dt_init
         self.d_inner = expand * d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -76,7 +96,22 @@ class MambaBlock(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
         self.out_proj = nn.Linear(self.d_inner, d_model)
-        self.use_kernel = True      # False = 强制走纯 PyTorch 参考实现（对拍/无扩展环境）
+        # False = 强制走纯 PyTorch 参考实现。环境变量 MADCL_NO_SSM_KERNEL=1 可全局关闭，
+        # 用途：与**内核安装之前**训练/评测的臂做同实现对拍（内核装于 2026-09-20 20:54，
+        # 早于此的臂如 smamba 全部走参考实现）。
+        self.use_kernel = os.environ.get("MADCL_NO_SSM_KERNEL") != "1"
+        if dt_init == "official":
+            # 官方 Mamba：weight 按 dt_rank**-0.5 均匀初始化；bias 置为 inverse-softplus(dt)，
+            # dt ~ log-uniform[dt_min, dt_max]，使初始时间常数覆盖 1~1000 步量级。
+            dt_min, dt_max, dt_floor = 1e-3, 1e-1, 1e-4
+            std = self.dt_rank ** -0.5
+            nn.init.uniform_(self.dt_proj.weight, -std, std)
+            dt = torch.exp(torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+                           + math.log(dt_min)).clamp(min=dt_floor)
+            with torch.no_grad():
+                self.dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))  # inverse softplus
+        elif dt_init != "torch_default":
+            raise ValueError(f"unknown dt_init: {dt_init}")
 
     def forward(self, x: torch.Tensor,
                 conv_state: Optional[torch.Tensor] = None,
@@ -147,7 +182,8 @@ class MambaBlock(nn.Module):
 class TemporalCore(nn.Module):
     def __init__(self, d_model: int, backend: str = "mamba", n_layers: int = 2,
                  d_state: int = 16, d_conv: int = 4, expand: int = 2,
-                 checkpoint: bool = False):
+                 checkpoint: bool = False, dt_init: str = "torch_default",
+                 final_norm: bool = False):
         super().__init__()
         self.backend = backend
         self.n_layers = n_layers
@@ -156,9 +192,13 @@ class TemporalCore(nn.Module):
         # 开启后反向时重算该段，显存大降、算力约 +30%，语义不变——这样 batch/seq 不用改，
         # 才能与已有 GRU 结果（同 batch/seq/数据/步数）直接对比。
         self.checkpoint = checkpoint
+        # final_norm（已定论 18 §4 的修法臂，2026-09-24）：pre-norm 残差栈出口本无归一化，
+        # 两层 `x = x + out` 无界累加使时间核增益随训练单调上涨（2k:1.30 → 8k:1.53 → 12k:2.05），
+        # 掉分窗口与增益加速窗口重合。默认 False = 保持历史行为。
+        self.final_norm = nn.LayerNorm(d_model) if (final_norm and backend == "mamba") else None
         if backend == "mamba":
             self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
-            self.blocks = nn.ModuleList([MambaBlock(d_model, d_state, d_conv, expand)
+            self.blocks = nn.ModuleList([MambaBlock(d_model, d_state, d_conv, expand, dt_init)
                                          for _ in range(n_layers)])
         elif backend in ("gru", "lstm"):
             rnn = nn.GRU if backend == "gru" else nn.LSTM
@@ -196,7 +236,7 @@ class TemporalCore(nn.Module):
                 if stateful:
                     self._mamba_state[i] = (cs, ss)
                 x = x + out                                  # pre-norm 残差
-            return x
+            return self.final_norm(x) if self.final_norm is not None else x
         if self.backend in ("gru_prenorm", "lstm_prenorm"):
             for i, (norm, rnn) in enumerate(zip(self.norms, self.rnns)):
                 st = self._rnn_states[i] if stateful else None
