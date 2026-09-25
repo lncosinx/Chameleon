@@ -62,7 +62,8 @@ class LaCAMRunner:
         result = runner.solve(obstacles, starts, goals, map_type="maze")
     """
 
-    def __init__(self, backend: str = "auto", time_limit: float = 10.0):
+    def __init__(self, backend: str = "auto", time_limit: float = 10.0,
+                 solver_seed: int | None = None):
         self.backend = backend
         self.time_limit = time_limit
         self._solver = None
@@ -70,7 +71,7 @@ class LaCAMRunner:
         if backend == "auto":
             # 自动检测真实 LaCAM 可用性
             try:
-                self._solver = _LacamNativeSolver(time_limit)
+                self._solver = _LacamNativeSolver(time_limit, solver_seed)
                 self.backend = "lacam"
             except ImportError as exc:
                 # ★ 必须大声报警：静默回退会产出**质量差得多的"专家"**数据
@@ -86,7 +87,7 @@ class LaCAMRunner:
                 self._solver = _PrioritizedSolver(time_limit)
                 self.backend = "prioritized"
         elif backend == "lacam":
-            self._solver = _LacamNativeSolver(time_limit)
+            self._solver = _LacamNativeSolver(time_limit, solver_seed)
         elif backend == "prioritized":
             self._solver = _PrioritizedSolver(time_limit)
         else:
@@ -317,8 +318,16 @@ class _PrioritizedSolver:
 class _LacamNativeSolver:
     """原生 LaCAM C++ 绑定 solver。"""
 
-    def __init__(self, time_limit: float = 10.0):
+    def __init__(self, time_limit: float = 10.0, solver_seed: int | None = None):
         self.time_limit = time_limit
+        # ★ 2026-09-25：solver_seed=None 时沿用历史行为（从 numpy 全局 RNG 现抽），
+        #   给定整数则**确定性**求解 —— 用于让重新生成的专家数据可复现。
+        #   背景：专家数据被删除后需重生成，而同一实例在不同求解种子下会得到
+        #   **同样合法但不同的**最优解（专家动作不唯一，见设计文档 INVARIANT 11），
+        #   导致监督标签不同、新臂无法与历史臂做唯一变量对比。
+        #   ⚠️ 即便固定种子，`time_limit` 仍使 LaCAM 是 anytime 搜索：换机器或负载不同
+        #   仍可能返回不同质量的解。要完全可复现需同时固定种子**并**保证求解不触顶时限。
+        self.solver_seed = solver_seed
         try:
             from lacam import _lacam as _lacam_mod
             self._lacam = _lacam_mod
@@ -350,7 +359,8 @@ class _LacamNativeSolver:
         result = self._lacam.solve(
             obs, s_arr, g_arr,
             time_limit_ms=time_limit_ms,
-            seed=np.random.randint(0, 2**31 - 1),
+            seed=(np.random.randint(0, 2**31 - 1) if self.solver_seed is None
+                  else int(self.solver_seed) % (2**31 - 1)),
             verbose=0,
         )
 

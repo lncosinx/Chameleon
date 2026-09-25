@@ -1,0 +1,24 @@
+backend: auto
+buffer_size: 62915
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/c2g_heldout/r32/expert_random
+elapsed: 104.63248181343079
+fail_count: 51
+hard_case_stats: {}
+map_size: null
+map_type: random
+num_agents: 32
+num_episodes: 2000
+num_workers: 15
+quality:
+  episodes_measured: 1949
+  makespan_mean: 32.2807
+  margin_excluded_ratio_mean: 0.0
+  mean_reward_mean: 1.7428
+  soc_mean: 550.1975
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.4601
+seed_end: 102000
+seed_start: 100000
+success_count: 1949
+total_samples: 62915

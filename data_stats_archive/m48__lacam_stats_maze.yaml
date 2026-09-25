@@ -1,0 +1,24 @@
+backend: auto
+buffer_size: 122255
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/_smoke/m48/expert_maze
+elapsed: 363.2589325904846
+fail_count: 248
+hard_case_stats: {}
+map_size: null
+map_type: maze
+num_agents: 48
+num_episodes: 1500
+num_workers: 15
+quality:
+  episodes_measured: 1252
+  makespan_mean: 102.734
+  margin_excluded_ratio_mean: 0.0026
+  mean_reward_mean: 2.2613
+  soc_mean: 1503.5471
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.6397
+seed_end: 501500
+seed_start: 500000
+success_count: 1252
+total_samples: 122255

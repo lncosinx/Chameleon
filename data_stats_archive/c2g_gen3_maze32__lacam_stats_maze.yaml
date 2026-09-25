@@ -1,0 +1,24 @@
+backend: auto
+buffer_size: 1705572
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/c2g_gen3_maze32/expert_maze
+elapsed: 3955.9348378181458
+fail_count: 2443
+hard_case_stats: {}
+map_size: null
+map_type: maze
+num_agents: 32
+num_episodes: 30000
+num_workers: 12
+quality:
+  episodes_measured: 27557
+  makespan_mean: 62.3852
+  margin_excluded_ratio_mean: 0.0009
+  mean_reward_mean: 1.9991
+  soc_mean: 804.4726
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.5527
+seed_end: 440000
+seed_start: 410000
+success_count: 27557
+total_samples: 1705572
