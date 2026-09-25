@@ -69,7 +69,12 @@
 4. ~~**Reward = BFS 势函数 shaping（PBRS）**~~ —— **v5 废弃**：纯 IL 无 reward 项。
    历史约束保留在 §9 供追溯（其中「禁止用曼哈顿距离做势函数」的理由仍有参考价值）。
 5. **观测通道**：POGEMA 原生 `(3,11,11)` = 障碍 / 智能体（自身恒在中心格）/ 目标边界投影；
-   本仓库追加 **ch3 = 时间衰减自身足迹**（[0,0.8]，当前位置 1.0）、**ch4 = cost2go**（[0,1]，0.5=同距）。
+   本仓库追加 **ch3 = 时间衰减自身足迹**、**ch4 = cost2go**（[0,1]，0.5=同距）。足迹通道定义：
+
+   $$\text{ch3}(u)=\max_{\tau\le t}\;\mathbb 1\big[\,p_i^{\tau}\ \text{落在以当前位置为中心的 patch 坐标 } u\,\big]\cdot\rho^{\,t-\tau},
+     \qquad \rho\in(0,1)$$
+
+   取值范围 [0, 0.8]，当前位置恒为 1.0。
    ⇒ `patch_channels=5`。**禁止再加与原生 ch2 重复的"目标投影通道"**；自身位置已由 ch1 中心格表达。
 6. **目标相对方向是合法局部特征**（`get_targets_xy`）——不是全局泄露。
 7. **非法动作掩码 = `-float('inf')`**，不是有限大负常数。须保证每体至少 1 个合法动作（wait 通常恒合法）。
@@ -174,6 +179,27 @@ patch (5,11,11) + scalar (8)
    logits (5)   —— 非法动作置 -inf 后按 §5 的解码规则取动作
 ```
 
+### 3.1.1 策略与解码的形式化
+
+共享参数网络 $f_\theta$ 对每体输出 5 维 logits；非法动作先置 $-\infty$：
+
+$$\ell_i^t = f_\theta\big(o_i^t,\ h_i^{t-1},\ \mathbf c_i^t\big)\in\mathbb R^{5},
+\qquad
+\tilde\ell_{i,a}^t=\begin{cases}\ell_{i,a}^t & a\in\mathcal A_i^{\text{legal}}\\[2pt] -\infty & \text{否则}\end{cases}$$
+
+**v5 的动作选取不是 argmax，而是带 wait 偏置的温度采样**（见 §5.2；argmax 会让共享参数策略
+在对称局面互锁）：
+
+$$a_i^t \sim \mathrm{softmax}\Big(\tfrac{1}{T}\big(\tilde\ell_i^t - b\,\mathbf e_0\big)\Big),
+\qquad T=1.0,\quad b=1.0,\quad \mathbf e_0=\text{wait 的 one-hot}$$
+
+**TTA（D4 测试期集成）**：对 8 个二面体对称 $g\in D_4$ 各前向一次，把 logits 经动作置换
+$\pi_g$ 逆映射回原动作空间后**对概率平均**：
+
+$$p_i^t=\frac{1}{|D_4|}\sum_{g\in D_4}\pi_g^{-1}\!\Big[\mathrm{softmax}\big(f_\theta(g\cdot o_i^t)\big)\Big]$$
+
+> 逆置换的正确性用"人工构造的等变模型"单测验证，误差 1.5e-8（`scripts/test_d4_augment.py`）。
+
 ### 3.2 通信模块（`BiIntentAttention`，头条）
 
 候选邻接：$j \in \mathcal{N}_i^{\text{cand}} \iff \lVert p_i - p_j \rVert \le r_c \wedge j \in \mathrm{FOV}_i$。
@@ -193,6 +219,18 @@ $$\alpha_{ij}=\mathrm{entmax}_{1.5}\big(\mathrm{score}(\mathbf z_i,\mathbf z_j)\
 > 回归测试：`scripts/test_comm_fp16_overflow.py`（comm_dim × 激活幅度 12 组合全过）。
 
 ### 3.3 时间核（`TemporalCore`，可插拔）
+
+通信残差写回后进时间核；记 $x_i^t$ 为进入时间核的特征：
+
+$$x_i^t=\underbrace{e_i^t}_{\text{CNN 编码}}+\ \mathrm{comm\_out}\big(\mathbf c_i^t\big),
+\qquad
+h_i^t=\mathcal T_\theta\big(x_i^t,\ h_i^{t-1}\big),
+\qquad
+\ell_i^t=\mathrm{head}\big(h_i^t\big)$$
+
+其中 $\mathcal T_\theta$ 按 `temporal_backend` 取 GRU / pre-norm GRU / Mamba(S6) / Transformer。
+训练时按 `sequence_len=32` **整段展开**；评测时逐步推进，并在 episode 边界
+`reset_comm_state()`（同时清通信迟滞与 $h$）。
 
 | backend | 说明 |
 |---|---|
@@ -240,7 +278,24 @@ $$\alpha_{ij}=\mathrm{entmax}_{1.5}\big(\mathrm{score}(\mathbf z_i,\mathbf z_j)\
 
 $$\mathcal L = \mathbb E_{(o,a^E)}\big[\, w(a^E)\cdot \mathrm{CE}\big(\text{logits}_\theta(o),\, a^E\big)\,\big]$$
 
-**三种外层模式**（`trainers/train_il_reptile.py::ILReptileTrainer`，同一份 inner loop）：
+设 inner loop 从 $\theta$ 出发做 $K$ 步（`inner_steps=5`）Adam 得到 $\theta_K$，
+$\mathcal B$ 为本 meta-iter 的 task 集合（`tasks_per_meta=2`）。**三种外层模式**
+（`trainers/train_il_reptile.py::ILReptileTrainer`，共用同一份 inner loop）：
+
+$$\textbf{Reptile:}\quad
+  \theta \leftarrow \theta + \varepsilon\cdot\frac{1}{|\mathcal B|}\sum_{j\in\mathcal B}
+  \big(\theta_K^{(j)}-\theta\big),
+  \qquad \varepsilon:\ 0.1 \to 0.01$$
+
+$$\textbf{FOMAML:}\quad
+  \theta \leftarrow \mathrm{Adam}\Big(\theta,\ \frac{1}{|\mathcal B|}\sum_{j\in\mathcal B}
+  \nabla_{\theta}\mathcal L^{(j)}_{\text{query}}\big(\theta_K^{(j)}\big)\Big)$$
+
+$$\textbf{joint:}\quad \text{无外层}\ —\ \text{连续 SGD，保留优化器动量}$$
+
+⚠️ Reptile 的 $\varepsilon$ 作用在**位移**上（已被 inner Adam 归一化到 $\sim$lr 量级），
+FOMAML 的作用在**原始梯度**上 —— 量纲差几个数量级，这是外层必须换 Adam 的原因。
+
 
 | 模式 | 配置 | 外层更新 |
 |---|---|---|
@@ -311,17 +366,89 @@ agents 32~192；movingai 是 256 步。混用会产出不可比数字。
 ## 6. 评价指标（v5 精简，删去 Q 值类）
 
 v2 的八类指标中，**Q 值诊断（原 §5.5）整类废弃**（无 Q 头）；`L_TD/L_n/L_margin` 走势改为单一 CE loss。
-其余保留，且下列几项在 v5 中起了决定性作用：
+其余保留。**先给形式化定义**（v2 的公式在此保留并按 v5 口径更新），再列在 v5 中起决定性作用的几项。
+
+### 6.1 任务效果
+
+记一个 episode 有 $N$ 体，$T_i$ 为第 $i$ 体的到达时刻（未到达则 $T_i=\infty$），$H=128$ 为步数上限。
+
+$$\textbf{ISR}=\frac{1}{N}\sum_{i=1}^{N}\mathbb 1\big[T_i\le H\big],
+\qquad
+\textbf{CSR}=\mathbb 1\Big[\textstyle\bigwedge_{i=1}^{N}\ T_i\le H\Big]$$
+
+**CSR 是主指标**（全体到达才算成功），在 $n$ 个实例上取均值。
+**ISR 高而 CSR 低 ⟹ 失败集中在少数体**——本项目 `ISR@384 = 0.999` 正是由此判出"不是死锁"。
+
+### 6.2 路径质量
+
+$$\textbf{Makespan}=\max_i \hat T_i,\qquad
+\textbf{SoC}=\sum_i \hat T_i,\qquad
+\hat T_i=\min\big(T_i,\ H\big)$$
+
+**★ $\hat T_i=\min(T_i,H)$ 即右删失**：未到达的体按 $H=128$ 计入。
+⇒ **CSR 越高、被删失的 episode 越少，均值本应下降**；若 CSR 升而 makespan 也升，
+说明成功的那些 episode **确实变慢了**（见 §5.2 末对 `wait_bias` 的解读）。
+
+$$\textbf{Inflation}=\frac{\text{len}_{\text{policy}}}{\text{len}_{\text{LaCAM}}}
+\qquad(\gg 1 \Rightarrow \text{绕路/等待过多})$$
+
+本项目实测 makespan 比专家慢 **2.0~3.7×**，这是"失败源于超时"的直接证据（已定论 13）。
+
+### 6.3 冲突与死锁
+
+顶点冲突数、边冲突数（交换位置）、**WaitRate**（未移动步数占比）、
+**NoProgressRate**（★仅用曼哈顿做**事后诊断**，绝不进训练目标）、
+**RepeatRate**（反复经过自身足迹）、**死锁判定**（连续 $W$ 步无新增到达且平均位移极低）。
+
+### 6.4 通信图监控（规模 + 时间稳定性）
+
+在 $r_c$（FOV 内、软稀疏选择）下构建动态图 $G^t=(V,E^t)$，边集取注意力权重非零者：
+
+$$E^t=\big\{(i,j)\ :\ W_{ij}^t>0\big\}$$
+
+$$\textbf{avg\_neighbors}=\frac{1}{N}\sum_i\big|\{j:W_{ij}^t>0\}\big|
+\qquad(\textbf{即带宽/消息量口径，topk 封顶后的真实度数})$$
+
+$$\textbf{EdgeFlipRate}=\frac{\big|E^t\ \triangle\ E^{t+1}\big|}{\big|E^t\ \cup\ E^{t+1}\big|}
+\qquad(\text{高} \Rightarrow \text{通信图闪烁，时间稳定性失控})$$
+
+$$\textbf{Attention 熵}=-\sum_j \alpha_{ij}\log\alpha_{ij}
+\qquad(\approx\log k \Rightarrow \text{无差别关注};\ \text{低熵} \Rightarrow \text{聚焦关键冲突邻居})$$
+
+> **⚠️ EdgeFlipRate 跨臂比较不可比**（已定论 24）：分母是边集并集，而各臂度数相差 30% 以上
+> ⇒ 归一化基数不同。更要紧的是 **dense softmax 的 $W_{ij}>0$ 恒为真**，其 $E^t$ 只随 FOV 进出与
+> topk 排名交换变化，与 entmax 的"注意力驱动通断"**不是同一种量**。
+> 迟滞的稳定作用只能在**同一稀疏机制内部**比较（madcl 0.1458 vs 无迟滞 0.1813 = −19.6%）。
+>
+> **⚠️ 另**：`MaxCC`（最大连通分支规模）在 v2 用于监控"拓扑雪崩"，v5 因 FOV + `topk_cap=6`
+> 已把规模封住，该指标未再作为判据。
+
+### 6.5 统计判据（v5 新增，必须遵守）
+
+差值必须报**合并 95% CI**。设两臂各格的 CI95 为 $c^{(1)}_k,c^{(2)}_k$，在 $m$ 个格上求和后：
+
+$$\mathrm{CI}_{\text{合并}}=1.96\sqrt{\sum_{k=1}^{m}\Big(\tfrac{c^{(1)}_k}{1.96}\Big)^2+\sum_{k=1}^{m}\Big(\tfrac{c^{(2)}_k}{1.96}\Big)^2}$$
+
+- $|d|>\mathrm{CI}_{\text{合并}}$ ⟹ 显著；否则**写"打平"，不得写"反超"**。
+- **阴性要给上界**，不要只说"不显著"：$|\text{效应}|\le |d|+\mathrm{CI}_{\text{合并}}$。
+- **先算功效再花算力**。由 $\mathrm{CI}\propto n^{-1/2}$，令差值 $d$ 达到显著所需样本：
+
+$$n_{\text{需要}}=n_{\text{现有}}\cdot\Big(\frac{\mathrm{CI}_{\text{合并}}}{d}\Big)^{2}$$
+
+> 实例：SQ3 内部消融曾计划 512 图重跑（12× 样本），按上式迟滞那一臂需 **968×** ⇒ 直接判定
+> **阴性是结论本身、不是样本不足**，省下约 20 小时（已定论 24）。
+
+### 6.6 在 v5 中起决定性作用的几项
 
 - **CSR / ISR 联读**：`ISR@384 = 0.999` 而 `CSR` 低 ⇒ 失败集中在少数体、且不是死锁（已定论 13）。
 - **makespan（右censored 于 128）**：与专家比 2.0~3.7×。★注意删失：CSR 越高被记 128 的越少，
   均值本该下降；若 CSR 升而 makespan 也升，说明成功 episode 确实变慢了。
-- **`avg_neighbors`**：= `(W>0)` 的真实度数（topk 封顶后），**即带宽/消息量口径**。
-- **`edge_flip_rate`** = 相邻两步边集对称差 / 并集。
-  ⚠️ **跨臂比较不可比**：分母是并集而各臂度数差 30%+；且 **dense softmax 的 `W>0` 恒为真**，
-  其边集只随 FOV 进出与 topk 排名变化，与 entmax 的注意力驱动通断**不是同一种量**。
-  迟滞的稳定作用只能在**同稀疏机制内部**比（madcl 0.1458 vs 无迟滞 0.1813 = −19.6%）。
+- **`avg_neighbors`**（带宽口径）与 **`edge_flip_rate`**：定义与跨臂比较的陷阱见 §6.4。
+  实测结论：**迟滞把 entmax 的稀疏性抵消了** —— dense 5.911 / entmax 无迟滞 4.118 /
+  出货配置 5.877（仅比 dense 少 0.6%）⇒「软稀疏省带宽」在出货配置下**不成立**（已定论 24）。
 - **单步模仿准确率**：**不是 CSR 的好代理**——四个模型留出集准确率差 ≤0.005，而测试 CSR 差 0.339。
+  机理见 INVARIANT 11 的说明（同一局部观测下专家动作不唯一，准确率天花板在 0.90~0.96，
+  胜负取决于少数关键步）。
 
 ---
 
