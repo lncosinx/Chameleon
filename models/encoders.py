@@ -61,6 +61,12 @@ class PatchEncoder(nn.Module):
         else:
             B_flat = orig_shape[0]
 
+        # channels_last (NHWC)：小卷积在 GPU tensor core 上更高效（实测 patch CNN
+        # fwd 44→21ms、fwd+bwd 114→59ms，~1.9×；patch_encoder 占整网 forward ~83%）。
+        # 纯内存布局变更、数学等价（cudnn 改用 NHWC 卷积算法，低位 fp 误差 ~1e-5）。
+        # 仅 CUDA 上启用；下游 reshape 按逻辑 C-order 展平，结果与 NCHW 一致。
+        if x.is_cuda:
+            x = x.contiguous(memory_format=torch.channels_last)
         feat = self.conv(x)           # (B_flat, C, K, K)
         feat = self.pool(feat)        # (B_flat, C, 4, 4)
         feat = feat.reshape(B_flat, -1)

@@ -137,18 +137,25 @@ class BiIntentGATDRQN(nn.Module):
 
     @staticmethod
     def _try_compile(module: nn.Module) -> nn.Module:
-        """尝试 torch.compile（reduce-overhead→default→eager 逐级回退），不让编译失败中断训练。"""
+        """尝试 torch.compile（仅 default 模式 → eager 回退），不让编译失败中断训练。
+
+        只用 default：它做算子融合（conv+relu）但**不捕获 CUDA graph**，故与 Reptile
+        每轮 load_state_dict 兼容（权重是 copy_ 原地更新，编译图引用同一 tensor 对象、不失效）。
+        reduce-overhead 会启用 CUDA graphs（捕获静态内存/权重快照），与每 task 刷 θ_meta
+        的模式冲突（捕获到陈旧权重、或显存抖动报错），故弃用——见 memory phase2 提速记录。
+        """
         if not hasattr(torch, "compile"):
             return module
-        for mode in ("reduce-overhead", "default"):
-            try:
-                compiled = torch.compile(module, mode=mode)
-                print(f"[torch.compile] patch_encoder compiled (mode={mode})")
-                return compiled
-            except Exception as e:  # noqa: BLE001
-                print(f"[torch.compile] mode={mode} failed ({type(e).__name__}); trying next")
-        print("[torch.compile] all modes failed; running eager")
-        return module
+        try:
+            # dynamic=True：用符号 batch 维编译一份图，覆盖所有 B·T·N（expert-only B=28 起步
+            # 与合并 B=32 稳态、以及 er 衰减下的过渡 shape）→ mid-run 不再按 shape 重编译，
+            # 配合 DualGPU 串行预热（_warmup_compile）彻底消除并发编译竞态。
+            compiled = torch.compile(module, mode="default", dynamic=True)
+            print("[torch.compile] patch_encoder compiled (mode=default, dynamic=True)")
+            return compiled
+        except Exception as e:  # noqa: BLE001
+            print(f"[torch.compile] compile failed ({type(e).__name__}); running eager")
+            return module
 
     def reset_comm_state(self):
         """

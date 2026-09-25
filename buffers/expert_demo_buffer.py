@@ -87,6 +87,9 @@ class ExpertDemoBuffer:
 
         self._rng = np.random.default_rng()
 
+        # 底层存储数组的 torch 零拷贝视图缓存（GIL-free gather 用，见 sample/_torch_views）。
+        self._tv_cache = None
+
     # ------------------------------------------------------------------
     # 数组初始化
     # ------------------------------------------------------------------
@@ -126,6 +129,7 @@ class ExpertDemoBuffer:
         self._episode_ids       = self._alloc("episode_ids",       (cap,),           np.int64, fill=-1)
 
         self._arrays_inited = True
+        self._tv_cache = None   # 数组重建后失效 torch 视图缓存
 
     # ------------------------------------------------------------------
     # 零拷贝挂载（大字段直接只读 mmap 源目录，不重新分配/搬运）
@@ -481,6 +485,32 @@ class ExpertDemoBuffer:
                 "next_action_masks": self._next_action_masks[idx_mat].copy(),
             })
         return out
+
+    def _torch_views(self) -> dict:
+        """底层存储数组的 torch 零拷贝视图（缓存）。供 sample 的 GIL-free gather 用。
+
+        torch.from_numpy 与 numpy 数组共享内存：循环 buffer 的就地写入对视图可见；
+        阶段二专家 buffer 载入后只读，更无失效问题。_init_arrays 重建数组时清缓存。
+        """
+        if self._tv_cache is None:
+            import torch
+            self._tv_cache = {
+                "obs_patches":       torch.from_numpy(self._obs_patches),
+                "next_obs_patches":  torch.from_numpy(self._next_obs_patches),
+                "obs_scalars":       torch.from_numpy(self._obs_scalars),
+                "next_obs_scalars":  torch.from_numpy(self._next_obs_scalars),
+                "positions":         torch.from_numpy(self._positions),
+                "next_positions":    torch.from_numpy(self._next_positions),
+                "actions_expert":    torch.from_numpy(self._actions_expert),
+                "rewards":           torch.from_numpy(self._rewards),
+                "dones":             torch.from_numpy(self._dones),
+                "valid":             torch.from_numpy(self._valid),
+                "action_masks":      torch.from_numpy(self._action_masks),
+                "next_action_masks": torch.from_numpy(self._next_action_masks),
+                "margin_excluded":   torch.from_numpy(self._margin_excluded),
+                "margin_weights":    torch.from_numpy(self._margin_weights),
+            }
+        return self._tv_cache
 
     # ------------------------------------------------------------------
     # 统计与维护

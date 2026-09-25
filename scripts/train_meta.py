@@ -252,6 +252,13 @@ def main():
             if n_sp > 0:
                 print(f"  [selfplay] +{n_sp} segs @ iter {i+1} (sp_buf={len(sp_buf)})", flush=True)
 
+        # 自游走（异步重叠）：每 K 个 meta-iter 非阻塞地把**当前** θ_meta 快照推给后台线程，
+        # 由它在训练 GPU 空泡里 rollout 填 sp_buf（不再阻塞主循环）。BC 期 TD 关、自游走
+        # TD-only loss 贡献为 0，跳过 sync 省算力（sp_buf 空时消费端自然 no-op）。
+        if sp_producer.enabled and not in_bc and (i + 1) % sp_producer.K == 0:
+            theta_meta = trainer._meta_state if hasattr(trainer, "_meta_state") else trainer.net.state_dict()
+            sp_producer.sync_weights(theta_meta)
+
         if (i + 1) % args.log_interval == 0:
             # 兼容单/双 GPU 返回的 map_type vs map_types
             mt = metrics.get("map_types", [metrics.get("map_type", "?")])
@@ -273,6 +280,7 @@ def main():
                   f"[td={w_td:.2f} n={w_n:.2f} mgn={w_mgn:.2f} l2={w_l2:.2f}]  "
                   f"map={mt_str:<20}  "
                   f"er={metrics['expert_ratio']:.2f}  "
+                  f"sp={len(sp_buf)}  {_spi:.2f}s/it  "
                   f"tasks={n_tasks}  meta_lr={meta_lr:.5f}", flush=True)
 
         # 周期性原子存档（断点续跑）
@@ -290,6 +298,9 @@ def main():
     save_checkpoint(trainer.state_dict(), f"checkpoints/{args.tag}_init.pt", "meta")
     _atomic_save(trainer.state_dict(), latest_path)
     print(f"\nCheckpoint saved to checkpoints/{args.tag}_init.pt")
+
+    # 清理自游走 worker 进程（spawn 的 CPU 池）
+    sp_producer.close()
 
     # 清理自游走 worker 进程（spawn 的 CPU 池）
     sp_producer.close()

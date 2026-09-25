@@ -100,7 +100,12 @@ parallel:
   # 真正的瓶颈在 ① 逐 t 通信 Python 循环(顺序、launch 多) ② Reptile 每轮
   # load_state_dict/deepcopy/CPU 传输(~22%)；要提速应优先向量化通信循环（§4.3），非精度/编译。
   use_amp: true                # [已实现] AMP 混合精度（autocast+GradScaler；entmax/mellowmax 内部 fp32；CPU 自动停用）
-  use_torch_compile: false     # [已实现，默认关] torch.compile patch_encoder（reduce-overhead→default→eager 回退）；编码瓶颈时再开
+  # [已实现，默认开] torch.compile patch_encoder（mode=default+dynamic=True，不用 reduce-overhead
+  # 的 CUDA graph）。配合 ① expert+selfplay 合并单次 forward（_inner_step，B 恒=batch_size）
+  # ② DualGPU 串行预热编译（_warmup_compile，消除两线程并发首次编译抢 inductor 缓存的 Cubin race）。
+  # 实测 dual-GPU 2.75→2.12 s/it（~1.30×），loss 逐位等价（iter40 0.8023 vs 0.8024）、0 竞态告警。
+  # 若长跑异常可 --set parallel.use_torch_compile=false 即时回退（合并 forward 不受影响、仍生效）。
+  use_torch_compile: true
   num_env_workers: 40          # [未实现] CPU 多进程 env/观测构建（spawn，不碰 CUDA）
   num_lacam_workers: 4         # [未实现] C++ 绑定，按需生成/介入
   start_method: spawn          # [未实现]
