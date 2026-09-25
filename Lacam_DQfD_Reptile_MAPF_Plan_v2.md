@@ -389,16 +389,50 @@ $$\textbf{Makespan}=\max_i \hat T_i,\qquad
 ⇒ **CSR 越高、被删失的 episode 越少，均值本应下降**；若 CSR 升而 makespan 也升，
 说明成功的那些 episode **确实变慢了**（见 §5.2 末对 `wait_bias` 的解读）。
 
-$$\textbf{Inflation}=\frac{\text{len}_{\text{policy}}}{\text{len}_{\text{LaCAM}}}
-\qquad(\gg 1 \Rightarrow \text{绕路/等待过多})$$
+$$\textbf{Inflation}=\frac{\text{Makespan}_{\text{policy}}}{\text{Makespan}_{\text{LaCAM}}},
+\qquad
+\textbf{StepUtil}=\frac{\text{SoC}}{N\cdot H}$$
 
-本项目实测 makespan 比专家慢 **2.0~3.7×**，这是"失败源于超时"的直接证据（已定论 13）。
+> ⚠️ **与 v2 的差异**：v2 正文把 Inflation 写成 $\text{len}_{\text{policy}}/\text{len}_{\text{LaCAM}}$
+> （路径长度之比），而 `utils/metrics.py:68` 实现的是 **makespan 之比**。**以实现为准。**
+> `StepUtil` 接近 1 且 CSR 低 ⟹ 常耗尽步数上限。
+
+本项目实测 Inflation **2.0~3.7×**，这是"失败源于超时"的直接证据（已定论 13）。
 
 ### 6.3 冲突与死锁
 
-顶点冲突数、边冲突数（交换位置）、**WaitRate**（未移动步数占比）、
-**NoProgressRate**（★仅用曼哈顿做**事后诊断**，绝不进训练目标）、
-**RepeatRate**（反复经过自身足迹）、**死锁判定**（连续 $W$ 步无新增到达且平均位移极低）。
+记 $p_i^t\in\mathbb Z^2$ 为第 $i$ 体在 $t$ 时刻的位置，$a_i^t$ 为其动作，$g_i$ 为目标，
+$\mathcal U^t=\{(t,i)\}$ 为有效统计对。以下四式**严格对应 `utils/metrics.py` 的实现**：
+
+$$\textbf{WaitRate}=\frac{1}{T\,N}\sum_{t=1}^{T}\sum_{i=1}^{N}\mathbb 1\big[a_i^t=0\big]$$
+
+$$\textbf{NoProgressRate}
+=\frac{\big|\{(t,i)\ :\ d_{L_1}(p_i^{t},g_i)\ \ge\ d_{L_1}(p_i^{t-1},g_i)\}\big|}
+       {\big|\{(t,i)\ :\ \text{第 }i\text{ 体在 }t\text{ 时刻尚未到达}\}\big|},
+\qquad d_{L_1}(p,g)=|p_r-g_r|+|p_c-g_c|$$
+
+> ★ **只用曼哈顿距离做事后诊断，绝不进训练目标**（INVARIANT 14）。已到达的体从分母剔除。
+
+$$\textbf{RepeatRate}=\frac{1}{T\,N}\sum_{t=1}^{T}\sum_{i=1}^{N}
+\mathbb 1\Big[p_i^{t}\in\big\{p_i^{0},\dots,p_i^{t-1}\big\}\Big]$$
+
+> ⚠️ 实现中该分母的变量名为 `total_moves`，但**实际是 $T\cdot N$（全部步数，不只是移动步）**。
+> 名字有误导性，语义以本式为准。
+
+$$\textbf{Deadlock}=\mathbb 1\Big[\ T\ge W\ \ \wedge\ \ \exists i:\ T_i>H\ \ \wedge\
+\sum_{t=T-W+2}^{T}\sum_{i=1}^{N}\big\lVert p_i^{t}-p_i^{t-1}\big\rVert_{1}\ <\ \delta\ \Big]$$
+
+默认 $W=32$（`deadlock_window`）、$\delta=1.0$（`deadlock_disp_threshold`）。
+注意 $\delta$ 是**窗口内全体智能体的总位移**阈值，因此这是一个**极严格**的判据
+（几乎要求整窗一步未动）。
+
+> **⚠️ 未实现的项**：v2 正文列出的**顶点冲突数 / 边冲突数（交换位置）**在
+> `utils/metrics.py` 中**并未计算**——协议用 `collision_system=soft`，非法移动由 POGEMA 直接拦下，
+> 不产生"冲突事件"。顶点冲突率只在**专家数据的生成统计**里有
+> （`lacam_stats_*.yaml` 的 `vertex_collision_rate_mean`，实测恒为 0）。引用时勿把两者混为一谈。
+>
+> **⚠️ 判读纪律**：**Deadlock 是二值指标，不可单独解读**，必须与 ISR / WaitRate 联读
+> （见 §8 判决原则 4）。本项目正是靠 `ISR@384=0.999` + Deadlock 判出"失败是超时不是死锁"。
 
 ### 6.4 通信图监控（规模 + 时间稳定性）
 
@@ -424,6 +458,13 @@ $$\textbf{Attention 熵}=-\sum_j \alpha_{ij}\log\alpha_{ij}
 > 已把规模封住，该指标未再作为判据。
 
 ### 6.5 统计判据（v5 新增，必须遵守）
+
+**每格的 CI95** 按二项比例算（`eval_bench.py:431`），$n$ 为该格的 episode 数：
+
+$$c_k=1.96\sqrt{\frac{\hat p_k\,(1-\hat p_k)}{n}},\qquad \hat p_k=\text{该格的 CSR}$$
+
+> ⚠️ **该式把 episode 视为独立 Bernoulli**。实际同一张图的不同 seed 是**相关**的，
+> 故靠加 seed 得到的 CI 偏乐观（反保守）。要真正提高统计功效，**加独立地图优于加 seed**。
 
 差值必须报**合并 95% CI**。设两臂各格的 CI95 为 $c^{(1)}_k,c^{(2)}_k$，在 $m$ 个格上求和后：
 
