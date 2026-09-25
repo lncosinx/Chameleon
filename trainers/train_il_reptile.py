@@ -304,11 +304,20 @@ class ILReptileTrainer:
                 "wait_pred": _avg("wait_pred")}
 
     def state_dict(self) -> dict:
-        return {"net": self.net.state_dict(), "meta_iter": self.meta_iter}
+        # ★ 2026-09-24：加存 optimizer state。此前 ckpt 只有 {type, net, meta_iter}，
+        #   `--resume` 续训时 Adam 一阶/二阶动量从零重启，续训结果与"一口气训完"不严格等价
+        #   （chameleon-0b 指出）。新增键向后兼容：旧 ckpt 无 "opt" 时 load 侧跳过。
+        return {"net": self.net.state_dict(), "meta_iter": self.meta_iter,
+                "opt": self.opt.state_dict()}
 
     def load_state_dict(self, state: dict):
         self.net.load_state_dict(state["net"])
         self.meta_iter = state.get("meta_iter", 0)
+        if "opt" in state:
+            try:
+                self.opt.load_state_dict(state["opt"])
+            except (ValueError, KeyError) as e:   # 参数组形状变了（换网络/换臂）时静默跳过
+                print(f"[resume] optimizer state 不匹配，动量从零起：{e}")
 
 
 # =============================================================================

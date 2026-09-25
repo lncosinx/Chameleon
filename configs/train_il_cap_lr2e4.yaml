@@ -1,0 +1,36 @@
+# 大网 lr 对位跑（2026-09-24，用户批准）。见 SCHEDULE 已定论 22。
+# 筛查结论：7.45M 的塌缩边界在 2e-4 与 3e-4 之间 —— 2e-4 健康、3e-4 第 15 步即钉死全 wait。
+# 但筛查**只证 2e-4 安全、不证 2e-4 更好**（150 步处 0.024 的 loss 差远小于对照臂自身 ~0.2 的轨迹噪声）。
+# 故先只训 4000 步，与 grucurve 已有的 2k/4k 点（8.995 / 8.943；真 dev/12档/3seed/TTA关）同步数对位，
+# 显著赢才续到 20k。与 capbig 唯一变量 = inner_lr 1e-4 → 2e-4。
+batch_size: 32
+d4_augment: false
+debug: false
+excluded_weight: 0.3
+families:
+- maze32
+- maze32b
+- maze48
+- maze48b
+- maze64
+- maze64b
+- random32
+- random32b
+- random48
+- random48b
+- random64
+- random64b
+grad_clip: 10.0
+held_out_family: null
+il_wait_weight: 1.0
+inner_lr: 0.0002
+inner_steps: 5
+label_smoothing: 0.0
+meta_iterations: 30000
+meta_lr_end: 0.01
+meta_lr_start: 0.1
+profile_interval: 200
+reptile: false
+sequence_len: 32
+tasks_per_meta: 2
+use_amp: true

@@ -53,6 +53,9 @@ class MAPFCommNet(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         mamba_expand: int = 2,
+        # 'torch_default'(默认,保持历史行为) | 'official'(官方 Mamba dt 初始化, 见已定论 18)
+        dt_init: str = "torch_default",
+        final_norm: bool = False,   # 时间核出口 LayerNorm（已定论 18 §4），默认 False=历史行为
         # 头
         head_hidden: int = 128,
         # 空间池化：0=全展平（保留空间布局，默认）；n>0=AdaptiveAvgPool2d(n)
@@ -98,7 +101,8 @@ class MAPFCommNet(nn.Module):
         self.temporal = TemporalCore(d_model, backend=temporal_backend,
                                      n_layers=temporal_layers, d_state=d_state,
                                      d_conv=d_conv, expand=mamba_expand,
-                                     checkpoint=temporal_checkpoint)
+                                     checkpoint=temporal_checkpoint, dt_init=dt_init,
+                                     final_norm=final_norm)
         self.head = nn.Sequential(
             nn.Linear(d_model, head_hidden), nn.GELU(),
             nn.Linear(head_hidden, num_actions),

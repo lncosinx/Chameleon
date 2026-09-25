@@ -32,6 +32,8 @@ def build_net(nc: dict) -> MAPFCommNet:
         temporal_checkpoint=nc.get("temporal_checkpoint", False),
         temporal_layers=nc.get("temporal_layers", 2), d_state=nc.get("d_state", 16),
         d_conv=nc.get("d_conv", 4), mamba_expand=nc.get("mamba_expand", 2),
+        dt_init=nc.get("dt_init", "torch_default"),
+        final_norm=nc.get("final_norm", False),
         head_hidden=nc.get("head_hidden", 128),
         spatial_pool=nc.get("spatial_pool", 0),   # 0=全展平（保留空间布局）
         comm_type=nc.get("comm_type", "madcl"),   # SQ3：只换通信模块的消融轴
@@ -167,6 +169,17 @@ def main():
         trainer.meta_iter = start_iter
         if hasattr(trainer, "_meta_state"):
             trainer._meta_state = {k: v.cpu() for k, v in rstate.items()}
+        # ★ 2026-09-24：恢复 optimizer 动量。旧 ckpt（2026-09-24 之前保存的）没有 "opt" 键，
+        #   此时动量从零重启，续训结果与"一口气训完"不严格等价——须在结论里注明。
+        if "opt" in rck and hasattr(trainer, "opt"):
+            try:
+                trainer.opt.load_state_dict(rck["opt"])
+                print("[resume] optimizer 动量已恢复")
+            except (ValueError, KeyError) as e:
+                print(f"[resume] ⚠ optimizer state 不匹配，动量从零起：{e}")
+        else:
+            print("[resume] ⚠ 该 ckpt 无 optimizer state（旧格式）→ Adam 动量从零重启，"
+                  "续训 ≠ 一口气训完，比较时须注明")
         print(f"[resume] 从 {args.resume} 续训，已完成 {start_iter} iter")
 
     print(f"\nStart: {start_iter} → {args.meta_iters}\n")
