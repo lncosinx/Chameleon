@@ -1,0 +1,32 @@
+# 容量放大臂（2026-09-15）。动机：诊断显示训练集/留出集专家动作准确率几乎相同
+# (0.889 vs 0.883)，泛化间隙≈0 ⇒ **欠拟合**，瓶颈是表示能力而非数据量。
+# 2.3x 数据与标准 DAgger 都无增益，正是这个诊断的直接后果。
+# 只放大容量，其余配方（观测/通信/推断）一律不动，保证唯一变量。
+cnn_channels: 128
+comm_dim: 192
+comm_radius: 4
+comm_rounds: 1
+comm_topk_cap: 6
+cost2go_clip: 10.0
+d_conv: 4
+d_model: 320
+d_scalar: 32
+d_state: 16
+ema_decay: 0.0
+entmax_alpha: 1.5
+head_hidden: 256
+intent_dim: 192
+intent_mode: action
+mamba_expand: 2
+n_res_blocks: 3
+num_actions: 5
+num_attention_heads: 4
+obs_radius: 5
+patch_channels: 5
+scalar_feat_dim: 8
+spatial_pool: 0
+stickiness_bonus: 0.1
+tau_in: 0.05
+tau_out: 0.02
+temporal_backend: gru
+temporal_layers: 2

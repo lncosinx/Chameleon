@@ -1,0 +1,32 @@
+# 骨干 A/B（2026-09-20）：与 capsmall（2.16M GRU，mix12/lr1e-4/seed42/从零训/8k）唯一变量 = 时间核。
+# Mamba 为纯 PyTorch 选择性扫描（不依赖 mamba_ssm）。实测 4.43s/it（GRU 1.20），显存 15.6GiB。
+# 先在小规模判定 SSM 骨干是否真优于 GRU，再决定是否投 7.45M 档（8k 需 30h / 14k 需 53h）。
+cnn_channels: 64
+comm_dim: 128
+comm_radius: 4
+comm_rounds: 1
+comm_topk_cap: 6
+cost2go_clip: 10.0
+d_conv: 4
+d_model: 192
+d_scalar: 32
+d_state: 16
+ema_decay: 0.0
+entmax_alpha: 1.5
+head_hidden: 128
+intent_dim: 128
+intent_mode: action
+mamba_expand: 2
+n_res_blocks: 1
+num_actions: 5
+num_attention_heads: 4
+obs_radius: 5
+patch_channels: 5
+scalar_feat_dim: 8
+spatial_pool: 0
+stickiness_bonus: 0.1
+tau_in: 0.05
+tau_out: 0.02
+temporal_backend: mamba
+temporal_checkpoint: false
+temporal_layers: 2

@@ -1,0 +1,42 @@
+# network_gru.yaml + cost2go 观测通道（T2）。patch 4→5：原生3 + 足迹1 + cost2go1。
+# 配套用 cost2go 重生成的数据（scripts/generate_expert_data.py --cost2go）。
+
+obs_radius: 5
+patch_channels: 5        # ★ 原生3 + 足迹1 + cost2go1（对齐 EPH heuri_map / MAPF-GPT cost2go）
+cost2go_clip: 10.0       # cost2go 相对距离 clip 半径（eval 用；须与数据生成一致）
+scalar_feat_dim: 8
+num_actions: 5
+
+# --- 空间编码（轻量残差 CNN）---
+d_model: 192
+cnn_channels: 64
+d_scalar: 32
+n_res_blocks: 1
+
+# --- 通信（INVARIANT 10，头条贡献：软稀疏 entmax + 迟滞）---
+comm_rounds: 1
+intent_dim: 128
+comm_dim: 128
+comm_radius: 4
+comm_topk_cap: 6
+entmax_alpha: 1.5
+tau_in: 0.05
+tau_out: 0.02
+stickiness_bonus: 0.1
+ema_decay: 0.0
+num_attention_heads: 4
+
+# --- 时间核 ---
+temporal_backend: gru
+temporal_layers: 2
+d_state: 16
+d_conv: 4
+mamba_expand: 2
+
+# --- 动作头 ---
+head_hidden: 128
+
+# 空间池化：0=全展平（保留 11×11 完整空间布局）；n>0=AdaptiveAvgPool2d(n)。
+# 原 AdaptiveAvgPool2d(1) 会让编码器对平移近似不变 → 丢失"障碍/邻居在哪个方向"，
+# 并把 cost2go 的空间梯度平均掉。2026-07-22 改为全展平。
+spatial_pool: 0

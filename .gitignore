@@ -27,9 +27,11 @@ Thumbs.db
 
 # Project — checkpoints & logs
 checkpoints/
+ckpt_il/
 logs/
 data/
 data_test/
+data_c2g/
 
 # Project — C++ build artifacts
 lacam/build/
@@ -54,3 +56,18 @@ pogema-benchmark/
 # Misc
 *.log
 tmp/
+*.pdf
+*.svg
+# Cloned baseline repos (独立仓库，各自有 .git，勿纳入本仓库)
+EPH/
+Follower/
+MAPF-GPT/
+MAPF-GPT-DDG/
+ML-MAPF-with-Search/
+SACHA/
+SRMT/
+marl-gpt/
+when-to-switch/
+# 额外数据软链（真实数据在 /data，需重生成）
+data_c2g_nothing
+data_c2g_small

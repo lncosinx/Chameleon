@@ -1,0 +1,67 @@
+{
+  "ckpt": "ckpt_il/it_act_iter_8000.pt",
+  "tag": "",
+  "args": {
+    "ckpt": "ckpt_il/it_act_iter_8000.pt",
+    "network_config": "configs/network_gru_c2g.yaml",
+    "set_net": [
+      "intent_mode=action"
+    ],
+    "families": "mazes",
+    "agent_counts": "32,48,64",
+    "maps_file": "/root/autodl-tmp/dev_maps/mazes.yaml",
+    "num_maps": 64,
+    "max_steps": 128,
+    "on_target": "nothing",
+    "batch_envs": 16,
+    "action_mode": "sample",
+    "base_temp": 0.3,
+    "escape_k": 3,
+    "escape_temp": 1.0,
+    "escape_no_wait_after": 8,
+    "auto_protocol": false,
+    "tta": true,
+    "goal_hold": "none",
+    "seeds": "0",
+    "device": "cuda:0",
+    "out": "/root/autodl-tmp/eval_v5/devsel_it_act_iter_8000_mazes.json",
+    "tag": ""
+  },
+  "results": {
+    "mazes": {
+      "32": {
+        "CSR": 0.6875,
+        "ISR": 0.9658203125,
+        "SoC": 1359.8125,
+        "makespan": 91.859375,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.791088104248047,
+        "edge_flip": 0.0802626817021519,
+        "n": 64,
+        "CSR_ci95": 0.11356053933365234
+      },
+      "48": {
+        "CSR": 0.265625,
+        "ISR": 0.8818359375,
+        "SoC": 2971.53125,
+        "makespan": 114.640625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.895470458548516,
+        "edge_flip": 0.16664799968566513,
+        "n": 64,
+        "CSR_ci95": 0.10820803237969155
+      },
+      "64": {
+        "CSR": 0.171875,
+        "ISR": 0.742919921875,
+        "SoC": 5336.796875,
+        "makespan": 119.28125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.934897422790527,
+        "edge_flip": 0.2577113553415984,
+        "n": 64,
+        "CSR_ci95": 0.09243158233044253
+      }
+    }
+  }
+}

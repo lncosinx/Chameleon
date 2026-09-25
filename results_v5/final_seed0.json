@@ -1,0 +1,168 @@
+{
+  "ckpt": "ckpt_il/it_act_iter_8000.pt",
+  "tag": "MADCL_seed0",
+  "args": {
+    "ckpt": "ckpt_il/it_act_iter_8000.pt",
+    "network_config": "configs/network_gru_c2g.yaml",
+    "set_net": [
+      "intent_mode=action"
+    ],
+    "families": "random,mazes",
+    "agent_counts": "8,16,24,32,48,64",
+    "maps_file": null,
+    "num_maps": 128,
+    "max_steps": 128,
+    "on_target": "nothing",
+    "batch_envs": 32,
+    "action_mode": "sample",
+    "base_temp": 0.3,
+    "escape_k": 3,
+    "escape_temp": 1.0,
+    "escape_no_wait_after": 8,
+    "auto_protocol": false,
+    "tta": true,
+    "goal_hold": "none",
+    "seeds": "0",
+    "device": "cuda:0",
+    "out": "/root/autodl-tmp/eval_v5/final_seed0.json",
+    "tag": "MADCL_seed0"
+  },
+  "results": {
+    "random": {
+      "8": {
+        "CSR": 1.0,
+        "ISR": 1.0,
+        "SoC": 133.0546875,
+        "makespan": 28.1640625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 3.22442626953125,
+        "edge_flip": 0.01197016924710681,
+        "n": 128,
+        "CSR_ci95": 5.478366544874485e-06
+      },
+      "16": {
+        "CSR": 1.0,
+        "ISR": 1.0,
+        "SoC": 302.8671875,
+        "makespan": 38.5,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.218908309936523,
+        "edge_flip": 0.019576564167287813,
+        "n": 128,
+        "CSR_ci95": 5.478366544874485e-06
+      },
+      "24": {
+        "CSR": 0.9921875,
+        "ISR": 0.9996744791666667,
+        "SoC": 517.8203125,
+        "makespan": 46.2578125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.66134339151904,
+        "edge_flip": 0.03443034057928429,
+        "n": 128,
+        "CSR_ci95": 0.015252568263182659
+      },
+      "32": {
+        "CSR": 0.9921875,
+        "ISR": 0.999755859375,
+        "SoC": 816.3359375,
+        "makespan": 54.0703125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.792066812515259,
+        "edge_flip": 0.053364736969115256,
+        "n": 128,
+        "CSR_ci95": 0.015252568263182659
+      },
+      "48": {
+        "CSR": 0.8046875,
+        "ISR": 0.974609375,
+        "SoC": 1772.3125,
+        "makespan": 78.2421875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.890206457581371,
+        "edge_flip": 0.10635617336174619,
+        "n": 128,
+        "CSR_ci95": 0.0686799125611288
+      },
+      "64": {
+        "CSR": 0.5703125,
+        "ISR": 0.931396484375,
+        "SoC": 3401.84375,
+        "makespan": 99.6875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.926314473152161,
+        "edge_flip": 0.17824535781983286,
+        "n": 128,
+        "CSR_ci95": 0.08575982609716974
+      }
+    },
+    "mazes": {
+      "8": {
+        "CSR": 0.9765625,
+        "ISR": 0.99609375,
+        "SoC": 160.265625,
+        "makespan": 36.8671875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 2.9844274520874023,
+        "edge_flip": 0.01124054778496486,
+        "n": 128,
+        "CSR_ci95": 0.0262093801931183
+      },
+      "16": {
+        "CSR": 0.921875,
+        "ISR": 0.990234375,
+        "SoC": 445.1171875,
+        "makespan": 60.4453125,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.14473819732666,
+        "edge_flip": 0.02232333892037275,
+        "n": 128,
+        "CSR_ci95": 0.046492416583833185
+      },
+      "24": {
+        "CSR": 0.7578125,
+        "ISR": 0.978515625,
+        "SoC": 829.0859375,
+        "makespan": 79.8671875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.633070483570918,
+        "edge_flip": 0.04739347707027264,
+        "n": 128,
+        "CSR_ci95": 0.07421775801146277
+      },
+      "32": {
+        "CSR": 0.5625,
+        "ISR": 0.956298828125,
+        "SoC": 1430.109375,
+        "makespan": 96.4921875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.793280601501465,
+        "edge_flip": 0.0838102217639971,
+        "n": 128,
+        "CSR_ci95": 0.08594119310246397
+      },
+      "48": {
+        "CSR": 0.296875,
+        "ISR": 0.8680013020833334,
+        "SoC": 3121.0078125,
+        "makespan": 112.3671875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.898207203485072,
+        "edge_flip": 0.17603432146279374,
+        "n": 128,
+        "CSR_ci95": 0.07915059244364307
+      },
+      "64": {
+        "CSR": 0.171875,
+        "ISR": 0.714111328125,
+        "SoC": 5475.1640625,
+        "makespan": 118.6796875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.934510588645935,
+        "edge_flip": 0.26536438340554014,
+        "n": 128,
+        "CSR_ci95": 0.06535899866165858
+      }
+    }
+  }
+}

@@ -22,6 +22,7 @@ tau_out: 0.02          # 迟滞退出阈值（tau_out < tau_in，活跃邻居踢
 stickiness_bonus: 0.1  # 已活跃邻居在注意力 logit 上的加分（增强时间稳定性）
 ema_decay: 0.0         # 跨步通信特征 EMA 平滑系数（0=不平滑）
 num_attention_heads: 4 # 多头注意力头数
+comm_rounds: 1         # 通信层数（GAT 轮数）：0=无通信, 1/2/3=多轮消息传递（消融轴，可被 --comm-rounds 覆盖）
 
 # --- GRU 记忆 ---
 gru_hidden_dim: 256    # DRQN 隐状态维度（INVARIANT 13 burn-in 依赖此值）

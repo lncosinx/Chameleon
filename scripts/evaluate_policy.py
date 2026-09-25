@@ -29,6 +29,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--no-comm", action="store_true", help="评估 comms-OFF 消融模型（禁用通信）")
+    parser.add_argument("--comm-rounds", type=int, default=None,
+                        help="通信层数，必须与训练时一致（comm2/comm3 有额外层，否则 state_dict 不匹配）")
     parser.add_argument("--held-out", action="store_true",
                         help="Use held-out map family (movingai/puzzles)")
     args = parser.parse_args()
@@ -57,6 +60,9 @@ def main():
         ema_decay=net_cfg.get("ema_decay", 0.0),
         gru_hidden_dim=net_cfg.get("gru_hidden_dim", 256),
         dueling_hidden_dim=net_cfg.get("dueling_hidden_dim", 256),
+        comm_enabled=not args.no_comm,   # 评估 comms-OFF 模型须同样禁用通信
+        comm_rounds=(args.comm_rounds if args.comm_rounds is not None
+                     else net_cfg.get("comm_rounds", 1)),  # 须与训练时一致
     )
 
     # 加载 checkpoint

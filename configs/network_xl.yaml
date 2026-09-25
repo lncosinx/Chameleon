@@ -1,0 +1,35 @@
+# 容量放大第二级（2026-09-18）。依据：2.16M→7.45M 在正式协议 +0.339（唯一变量对照），
+# 而 2.56× 不重复数据无效（−0.156，无显著档）⇒ 继续加容量，不加数据。
+#
+# ★ 放大策略：**不动 cnn_channels**。显存大头是 CNN 在 M=B*T*N=65536 个观测块上的激活
+#   （128 通道 × 121 已占 ~24GB/32GB）；参数大头是 flatten(128×121) → d_model 的线性层。
+#   所以只加宽 d_model / GRU 层数 / 通信维 / 动作头：参数涨 ~3×，激活几乎不涨。
+cnn_channels: 128          # 与 network_big 相同（显存约束）
+n_res_blocks: 4            # 3 → 4
+d_model: 576               # 320 → 576
+d_scalar: 48
+head_hidden: 384           # 256 → 384
+intent_dim: 256            # 192 → 256
+comm_dim: 256              # 192 → 256
+temporal_layers: 3         # 2 → 3
+temporal_backend: gru
+d_state: 16
+d_conv: 4
+mamba_expand: 2
+# --- 以下与 network_big 完全一致（保证唯一变量 = 容量）---
+obs_radius: 5
+patch_channels: 5
+cost2go_clip: 10.0
+scalar_feat_dim: 8
+num_actions: 5
+comm_rounds: 1
+comm_radius: 4
+comm_topk_cap: 6
+entmax_alpha: 1.5
+tau_in: 0.05
+tau_out: 0.02
+stickiness_bonus: 0.1
+ema_decay: 0.0
+num_attention_heads: 4
+spatial_pool: 0
+intent_mode: action

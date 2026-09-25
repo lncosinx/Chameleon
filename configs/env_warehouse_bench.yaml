@@ -1,0 +1,33 @@
+# 仓库族（SQ1 第三族 / SQ2 held-out / SQ4 持续学习序列）。
+# 密度对齐 POGEMA benchmark 的 wfi_warehouse（33x46，自由格 1278）：
+# walls_rows=6 / walls_in_row=7 → 33x51、自由格约 1263，与评测图几乎相同，
+# 因此可直接沿用评测的 agent 档位（64/96/128/192 → 密度 5%/7.6%/10%/15%）。
+# 结构参数按 episode seed 随机化（见 _generate_warehouse_map），避免整族只有一个布局。
+map_type: warehouse
+map_size: 64            # 仅回退用；实际尺寸由 warehouse 生成器决定
+num_agents: 96
+obs_radius: 5
+max_episode_steps: 256
+collision_system: soft
+on_target: nothing      # ★ 标准 MAPF 协议，与评测一致（旧 env_warehouse.yaml 是 finish，不可用）
+warehouse:
+  wall_width: 5
+  wall_height: 2
+  walls_in_row_min: 6
+  walls_in_row_max: 8
+  walls_rows_min: 5
+  walls_rows_max: 7
+  bottom_gap: 5
+  horizontal_gap: 1
+  vertical_gap_min: 2
+  vertical_gap_max: 4
+reward:
+  lambda_f: 1.5
+  shaping_clip: 5.0
+  goal_reward: 3.5
+  step_cost: 0.005
+  collision_cost: 0.3
+  normalize_shaping: true
+  gamma: 0.99
+  stuck_cost: 0.05
+  stuck_patience: 5

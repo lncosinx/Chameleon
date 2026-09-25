@@ -1,0 +1,22 @@
+backend: auto
+buffer_size: 682853
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/c2g_wh192/expert_warehouse
+elapsed: 1213.9446296691895
+fail_count: 0
+hard_case_stats: {}
+map_size: null
+map_type: warehouse
+num_agents: 192
+num_episodes: 8000
+num_workers: 20
+quality:
+  episodes_measured: 8000
+  makespan_mean: 85.3566
+  margin_excluded_ratio_mean: 0.0001
+  mean_reward_mean: 1.7997
+  soc_mean: 7772.2959
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.5154
+success_count: 8000
+total_samples: 682853

@@ -44,7 +44,14 @@ def entmax(logits: torch.Tensor, alpha: float = 1.5, dim: int = -1,
     logits = logits.float()
 
     if alpha == 1.0:
-        return F.softmax(logits, dim=dim)
+        # ★ 2026-09-13 bug 修复：softmax 分支原来直接 F.softmax，**没处理"整行全 -inf"**
+        # （FOV 内一个邻居都没有的体）。那种行 softmax 出来是 NaN，一路污染到 loss=nan，
+        # 把 SQ3 的 dense-softmax 消融臂整条训废（而它正是"软稀疏 vs 稠密"的关键对照）。
+        # α≠1 的 bisection 路径本来就显式做了均匀兜底，这里补齐同样的语义：
+        # 无候选行给均匀分布，下游 has_any_cand 掩码会把它清零。
+        all_neg = torch.all(torch.isneginf(logits), dim=dim, keepdim=True)
+        safe = torch.where(all_neg, torch.zeros_like(logits), logits)
+        return F.softmax(safe, dim=dim)
 
     if alpha == 2.0:
         return _sparsemax(logits, dim=dim)
@@ -108,6 +115,14 @@ def _sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     logits_flat = logits.reshape(-1, shape[dim])
     B, N = logits_flat.shape
 
+    # 与 α=1 / α∈(1,2) 两条路径同样的 -inf 处理（见 entmax 里的 bug 注释）：
+    # -inf 换成大负数参与排序/cumsum（否则 cumsum 出 -inf/NaN），整行全 -inf 的
+    # （FOV 内无邻居）给均匀分布，下游掩码会清零。
+    all_neg = torch.all(torch.isneginf(logits_flat), dim=1, keepdim=True)
+    logits_flat = torch.where(torch.isneginf(logits_flat),
+                              torch.full_like(logits_flat, -1e10), logits_flat)
+    logits_flat = torch.where(all_neg, torch.zeros_like(logits_flat), logits_flat)
+
     # Sort descending
     z_sorted, _ = torch.sort(logits_flat, dim=1, descending=True)
 
@@ -164,6 +179,9 @@ class BiIntentAttention(nn.Module):
         stickiness_bonus: float = 0.1,  # 已活跃邻居的加分
         # 平滑参数
         ema_decay: float = 0.0,       # 跨步 EMA 平滑（0=不平滑）
+        # SQ3 消融：用 **hard top-k 做邻居选择**（而非只作算力上限）。INVARIANT 10 断言这会
+        # 引起通信图闪烁（边界排名交换→边反复通断），本开关就是为了把该断言做成可证伪的实验。
+        hard_topk_select: bool = False,
     ):
         super().__init__()
         self.comm_radius = comm_radius
@@ -174,6 +192,7 @@ class BiIntentAttention(nn.Module):
         self.tau_out = tau_out
         self.stickiness_bonus = stickiness_bonus
         self.ema_decay = ema_decay
+        self.hard_topk_select = hard_topk_select
         self.head_dim = comm_dim // num_heads
 
         # 意图 → query/key/value
@@ -236,7 +255,18 @@ class BiIntentAttention(nn.Module):
         K_raw = self.k_proj(intents)
         comm_dim = Q_raw.shape[-1]
         scale = comm_dim ** -0.5
-        attn_logits = torch.matmul(Q_raw, K_raw.transpose(-1, -2)) * scale  # (B,T,N,N)
+        # ★ 2026-09-15 bug 修复：注意力分数必须 **先缩放、再在 fp32 里做 matmul**。
+        # 原写法 `matmul(Q, K^T) * scale` 在 AMP 下让 fp16 矩阵乘先累加 comm_dim 个未缩放
+        # 乘积：训练几步后激活幅度到 ~155，单项乘积 ~1.2e4，累加 192 项直接越过 fp16 上限
+        # 65504 → +inf（实测 absmax 4728、29,626 个 inf）。+inf 进 entmax 后 inf-inf=NaN
+        # （实测 133,008 个），污染整张图，loss 变 nan、GradScaler 一路把 scale 砍到 8 也
+        # 救不回来——因为坏的是前向不是梯度。容量放大臂（comm_dim 128→192）第一次踩到，
+        # 但小网只是侥幸没越界，属同一个潜伏 bug。
+        # ★ 必须显式 enabled=False：autocast 会拦截 matmul 并把 fp32 入参**强制降回 fp16**，
+        #   只写 .float() 是无效的（实测 attn_logits 仍是 fp16、仍溢出到 65504）。
+        with torch.autocast(device_type=Q_raw.device.type, enabled=False):
+            attn_logits = torch.matmul(Q_raw.float() * scale,
+                                       K_raw.float().transpose(-1, -2))      # (B,T,N,N) fp32
         attn_logits = attn_logits.masked_fill(~is_candidate, float('-inf'))
 
         # entmax 一次性批量（最大热点：逐 t 67ms → 批量 3ms）
@@ -245,6 +275,17 @@ class BiIntentAttention(nn.Module):
         attn_all = attn_all * has_any_cand
 
         # ===== 串行段（仅迟滞 active 递推；廉价 elementwise）=====
+        if self.hard_topk_select:
+            # 消融臂：直接按注意力权重取 top-k 作为邻居集合，不做迟滞、不做软稀疏。
+            # 与主臂的唯一区别就是"选择方式"，其余（候选集、聚合、统计）完全一致。
+            k = min(self.comm_topk_cap, N)
+            topv, topi = torch.topk(attn_all, k=k, dim=-1)
+            W = torch.zeros_like(attn_all).scatter_(-1, topi, topv)
+            W = W * (attn_all > 0).float()          # 候选集外的位置不能被选进来
+            W = W / W.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            self._active_mask = (W[:, -1] > 0).detach()
+            return self._aggregate(W, intents, B, T, N)
+
         prev_active = (self._active_mask
                        if (self._active_mask is not None
                            and self._active_mask.shape == (B, N, N))
@@ -275,6 +316,11 @@ class BiIntentAttention(nn.Module):
         else:
             W = W_thr
 
+        return self._aggregate(W, intents, B, T, N)
+
+    def _aggregate(self, W, intents, B, T, N):
+        """把权重矩阵 W (B,T,N,N) 聚合成通信特征 + 统计量（主臂/消融臂共用，保证口径一致）。"""
+        nonzero_count = (W > 0).sum(dim=-1)
         # ===== 并行段：多头聚合 =====
         V_raw = self.v_proj(intents)                              # (B,T,N,comm_dim)
         V = V_raw.view(B, T, N, self.num_heads, self.head_dim)
@@ -284,6 +330,10 @@ class BiIntentAttention(nn.Module):
 
         has_active = (W > 0).any(dim=-1, keepdim=True).float()    # (B,T,N,1)
         comm_features = comm_features * has_active
+
+        # 实际生效的通信度数（topk 封顶后，W>0），才是真实带宽/消息量口径；
+        # 上面的 nonzero_count 是 topk 前的 FOV 候选数，会高估通信量。
+        active_neighbors = (W > 0).sum(dim=-1)                    # (B,T,N)
 
         # ===== EdgeFlipRate（topk 后；跨调用边界用 _prev_edge_set）=====
         cur_edges = (W > 0).detach()                              # (B,T,N,N)
@@ -301,9 +351,12 @@ class BiIntentAttention(nn.Module):
             edge_flip_rate = 0.0
         self._prev_edge_set = cur_edges[:, -1]
 
+        # 注：avg_neighbors 现在与 avg_active_neighbors 同义，都是**topk 封顶后**的真实度数
+        # （即真实带宽/消息量口径）。封顶前的 FOV 候选数会高估通信量，不再作为主指标上报。
         info = {
             "edge_flip_rate": edge_flip_rate,
             "avg_neighbors": nonzero_count.float().mean().item(),
+            "avg_active_neighbors": active_neighbors.float().mean().item(),  # topk 封顶后的真实度数
             "entmax_alpha": self.entmax_alpha,
         }
         return comm_features, info

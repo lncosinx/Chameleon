@@ -29,9 +29,20 @@ INVARIANT 13: 采样返回 (B, T, N, ...) 定长序列，配合 GRU burn-in。
 """
 from __future__ import annotations
 
+import os
 import numpy as np
+from numpy.lib.format import open_memmap
 from typing import Dict, List, Optional
 
+
+# mmap 模式下每写入这么多 episode 就强制 flush（msync）一次。
+# 2026-08-10 事故：批量 load_from_arrays 把 15000/12000 episode 逐个写进磁盘映射
+# buffer，Python 写入速度远快于磁盘实际写回速度，脏页在页缓存里无节制堆积，
+# 直到把 62GB cgroup 硬限额吃满、被内核 OOM-kill（日志无任何输出/无 traceback，
+# 是 SIGKILL 的典型症状；数据生成阶段没炸是因为 LaCAM 求解天然拖慢了写入节奏，
+# 训练 buffer 加载是纯拷贝循环，没有类似的天然节流）。定期 flush 强制同步落盘，
+# 用阻塞等 IO 换取脏页堆积有上限。
+_MMAP_FLUSH_EVERY_EPISODES = 100
 
 # 远哨兵坐标：finished agent 的 position 置此值，使其与任何 agent 的距离 > comm_radius，
 # 从而被通信模块的距离过滤自然排除（无需改 communication.py）。
@@ -52,12 +63,23 @@ class ExpertDemoBuffer:
     """
 
     def __init__(self, capacity: int = 50_000, num_agents: Optional[int] = None,
-                 obs_channels: int = 4, patch_size: int = 11):
+                 obs_channels: int = 4, patch_size: int = 11,
+                 mmap_dir: Optional[str] = None):
+        """
+        Args:
+            mmap_dir: 若给定，所有列式数组改为磁盘内存映射（`.npy`，落在此目录），
+                不再一次性占用等于 capacity 大小的常驻 RAM——写入/采样时按需由
+                OS 换入换出。用于 62GB 内存装不下整族数据、但磁盘够大的场景
+                （见 CLAUDE.md 服务器迁移记忆）。默认 None = 原地 np.zeros
+                常驻内存（数据量小、追求采样速度时用）。
+        """
         self.capacity = capacity            # 时间步数（每步含 N 体）
         self.num_agents = num_agents
         self.obs_channels = obs_channels
         self.patch_size = patch_size
+        self.mmap_dir = mmap_dir
 
+        self._episodes_since_flush = 0      # mmap 模式下批量写入的节流计数器
         self._size = 0                      # 当前有效时间步数
         self._head = 0                      # 下一次写入位置（循环）
         self._arrays_inited = False
@@ -72,6 +94,17 @@ class ExpertDemoBuffer:
     # 数组初始化
     # ------------------------------------------------------------------
 
+    def _alloc(self, name: str, shape: tuple, dtype, fill=0):
+        """按 mmap_dir 是否设置，分配磁盘映射数组或常驻内存数组。"""
+        if self.mmap_dir is None:
+            arr = np.empty(shape, dtype=dtype)
+        else:
+            os.makedirs(self.mmap_dir, exist_ok=True)
+            path = os.path.join(self.mmap_dir, f"{name}.npy")
+            arr = open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+        arr[...] = fill
+        return arr
+
     def _init_arrays(self, num_agents: int, obs_channels: int, K: int):
         """第一次 add 时初始化所有列式数组。"""
         N, C, cap = num_agents, obs_channels, self.capacity
@@ -79,24 +112,112 @@ class ExpertDemoBuffer:
         self.obs_channels = C
         self.patch_size = K
 
-        self._obs_patches       = np.zeros((cap, N, C, K, K), dtype=np.uint8)
-        self._next_obs_patches  = np.zeros((cap, N, C, K, K), dtype=np.uint8)
-        self._obs_scalars       = np.zeros((cap, N, 8),        dtype=np.float32)
-        self._next_obs_scalars  = np.zeros((cap, N, 8),        dtype=np.float32)
-        self._positions         = np.zeros((cap, N, 2),        dtype=np.float32)
-        self._next_positions    = np.zeros((cap, N, 2),        dtype=np.float32)
-        self._actions_expert    = np.zeros((cap, N),           dtype=np.int64)
-        self._rewards           = np.zeros((cap, N),           dtype=np.float32)
-        self._dones             = np.zeros((cap, N),           dtype=bool)
-        self._valid             = np.zeros((cap, N),           dtype=bool)
-        self._action_masks      = np.ones((cap, N, 5),         dtype=bool)
-        self._next_action_masks = np.ones((cap, N, 5),         dtype=bool)
-        self._margin_excluded   = np.zeros((cap, N),           dtype=bool)
-        self._margin_weights    = np.ones((cap, N),            dtype=np.float32)
-        self._episode_ids       = np.full(cap, -1,             dtype=np.int64)
+        self._obs_patches       = self._alloc("obs_patches",      (cap, N, C, K, K), np.uint8)
+        self._next_obs_patches  = self._alloc("next_obs_patches", (cap, N, C, K, K), np.uint8)
+        self._obs_scalars       = self._alloc("obs_scalars",      (cap, N, 8),       np.float32)
+        self._next_obs_scalars  = self._alloc("next_obs_scalars", (cap, N, 8),       np.float32)
+        self._positions         = self._alloc("positions",        (cap, N, 2),       np.float32)
+        self._next_positions    = self._alloc("next_positions",   (cap, N, 2),       np.float32)
+        self._actions_expert    = self._alloc("actions_expert",   (cap, N),          np.int64)
+        self._rewards           = self._alloc("rewards",          (cap, N),          np.float32)
+        self._dones              = self._alloc("dones",           (cap, N),          bool)
+        self._valid              = self._alloc("valid",           (cap, N),          bool)
+        self._action_masks      = self._alloc("action_masks",     (cap, N, 5),       bool, fill=True)
+        self._next_action_masks = self._alloc("next_action_masks", (cap, N, 5),      bool, fill=True)
+        self._margin_excluded   = self._alloc("margin_excluded",   (cap, N),         bool)
+        self._margin_weights    = self._alloc("margin_weights",    (cap, N),         np.float32, fill=1)
+        self._episode_ids       = self._alloc("episode_ids",       (cap,),           np.int64, fill=-1)
 
         self._arrays_inited = True
         self._tv_cache = None   # 数组重建后失效 torch 视图缓存
+
+    # ------------------------------------------------------------------
+    # 零拷贝挂载（大字段直接只读 mmap 源目录，不重新分配/搬运）
+    # ------------------------------------------------------------------
+
+    # 源目录（scripts/generate_lacam_data.py 落盘格式）里 dtype 与本 buffer 一致的
+    # 字段——可以直接对源 .npy 只读 mmap，不必再拷一份。互不相同的字段（源用更省盘
+    # 的窄 dtype：float16/int8/int32）体积很小（合计约数据总量的 6%），用小的常驻
+    # RAM 数组即可，没必要也 mmap。
+    _ZERO_COPY_KEYS = ("obs_patches", "next_obs_patches", "dones", "valid",
+                       "action_masks", "next_action_masks", "margin_excluded")
+    _SMALL_CAST_KEYS = ("obs_scalars", "next_obs_scalars", "positions", "next_positions",
+                        "actions_expert", "rewards", "margin_weights", "episode_ids")
+    _TARGET_DTYPES = {
+        "obs_scalars": np.float32, "next_obs_scalars": np.float32,
+        "positions": np.float32, "next_positions": np.float32,
+        "actions_expert": np.int64, "rewards": np.float32,
+        "margin_weights": np.float32, "episode_ids": np.int64,
+    }
+
+    def attach_disk_dir(self, base_path: str, load_next: bool = False) -> int:
+        """
+        零拷贝挂载一个 `expert_{fam}/` 目录（每字段一个独立 .npy，见
+        scripts/generate_lacam_data.py 的落盘格式）为这个（空）buffer 的存储。
+
+        2026-08-10 事故：原来的路径是 `_init_arrays` 建一份新的 mmap，再靠
+        `add_episode` 逐 episode 从源目录拷过来——大字段(obs_patches 等)源/目标
+        dtype 本来就相同，这一步拷贝纯属浪费：多占一倍磁盘（148GB 数据在 75GB
+        剩余空间的盘上放不下）、且拷贝速度远超磁盘真实写回速度，脏页无界堆积把
+        62GB 内存硬限额打穿、被内核 OOM-kill。
+        现在：dtype 相同的大字段直接对源文件开只读 mmap，压根不拷贝、不占用额外
+        磁盘、不产生任何脏页；只有窄 dtype 的小字段（合计约数据总量的 6%）才实际
+        读进内存做 dtype 提升。仅适用于"整族一次性只读加载"场景（IL 训练标准用
+        法）——载入后不能再 add_episode（大字段是只读 mmap）。
+        """
+        if self._arrays_inited:
+            raise ValueError("attach_disk_dir 只能在空 buffer 上调用一次")
+
+        def _src(key):
+            return np.load(os.path.join(base_path, f"{key}.npy"), mmap_mode="r")
+
+        obs_patches = _src("obs_patches")
+        T, N, C, K = obs_patches.shape[0], obs_patches.shape[1], obs_patches.shape[2], obs_patches.shape[-1]
+        self.num_agents, self.obs_channels, self.patch_size = N, C, K
+        self.capacity = T
+
+        # next_* 字段只有 DQfD 的 TD 项要用；纯 IL（v3+ 主线）从不读，且 next_obs_patches
+        # 单项就占每族 ~39GB。故这些字段**允许在磁盘上不存在**：缺失时置 None，
+        # sample(need_next=True) 会明确报错，而不是在这里就加载失败。
+        # load_next=False（默认）：连"存在的" next_* 文件也不挂载 —— 纯 IL 不需要，
+        # 而 mmap 住一个 39GB/族 的文件会让它无法被删除释放（被打开的 inode 不释放空间）。
+        missing = []
+        for key in self._ZERO_COPY_KEYS:
+            if key == "obs_patches":
+                setattr(self, f"_{key}", obs_patches); continue
+            if key.startswith("next_") and not load_next:
+                setattr(self, f"_{key}", None); missing.append(key); continue
+            try:
+                setattr(self, f"_{key}", _src(key))
+            except FileNotFoundError:
+                setattr(self, f"_{key}", None); missing.append(key)
+        for key in self._SMALL_CAST_KEYS:
+            if key.startswith("next_") and not load_next:
+                setattr(self, f"_{key}", None); missing.append(key); continue
+            try:
+                # ★ 2026-09-11 OOM 事故修复：原来这里把 float16/int8 的小字段**整族读进内存
+                # 并升格成 float32/int64**，单进程 6 族就常驻 ~17GB（obs_scalars 一项 1.6GB/族）。
+                # 两个训练并行 + mmap 页缓存 → 撞穿 90GB cgroup 上限，v5main 被 OOM-kill。
+                # 现在同样只开只读 mmap，dtype 保持磁盘上的窄类型；真正的升格在 sample() 里
+                # 对**一个 batch**（几万行）做，代价可忽略。消费端（trainer._to_gpu）本来就会
+                # .float()/.long()，语义不变。
+                if key == "episode_ids":
+                    # 例外：episode_ids 全程被 _valid_starts 扫描，且只有几 MB，留在内存里更快
+                    setattr(self, f"_{key}", np.asarray(_src(key)).astype(np.int64))
+                else:
+                    setattr(self, f"_{key}", _src(key))
+            except FileNotFoundError:
+                setattr(self, f"_{key}", None); missing.append(key)
+        if missing:
+            assert all(k.startswith("next_") for k in missing), \
+                f"缺失的必需字段（非 next_*）: {[k for k in missing if not k.startswith('next_')]}"
+            self._next_fields_missing = tuple(missing)
+
+        self._head = 0
+        self._size = T
+        self._episode_counter = int(self._episode_ids[-1]) + 1 if T else 0
+        self._arrays_inited = True
+        return T
 
     # ------------------------------------------------------------------
     # 写入
@@ -199,6 +320,22 @@ class ExpertDemoBuffer:
         self._head = (self._head + T) % cap
         self._size = min(self._size + T, cap)
 
+        if self.mmap_dir is not None:
+            self._episodes_since_flush += 1
+            if self._episodes_since_flush >= _MMAP_FLUSH_EVERY_EPISODES:
+                self._flush_mmap()
+
+    def _flush_mmap(self):
+        """强制把所有磁盘映射数组的脏页同步落盘（msync），节流写入速度，防止脏页无界堆积。"""
+        for name in ("_obs_patches", "_next_obs_patches", "_obs_scalars", "_next_obs_scalars",
+                     "_positions", "_next_positions", "_actions_expert", "_rewards",
+                     "_dones", "_valid", "_action_masks", "_next_action_masks",
+                     "_margin_excluded", "_margin_weights", "_episode_ids"):
+            arr = getattr(self, name, None)
+            if isinstance(arr, np.memmap):
+                arr.flush()
+        self._episodes_since_flush = 0
+
     def load_from_arrays(self, arrays: Dict[str, np.ndarray]):
         """
         从一组拼接的 per-timestep 数组批量载入（按 episode_ids 切分为 episode 逐个 add）。
@@ -224,6 +361,8 @@ class ExpertDemoBuffer:
         for s, e in zip(seg_starts, seg_ends):
             ep = {k: arrays[k][s:e] for k in keys}
             self.add_episode(ep)   # 内部分配新的全局 episode_id，避免跨文件冲突
+        if self.mmap_dir is not None:
+            self._flush_mmap()   # 收尾：确保载入循环结束时脏页已完全落盘
 
     def __len__(self) -> int:
         return self._size
@@ -236,6 +375,25 @@ class ExpertDemoBuffer:
     # 采样
     # ------------------------------------------------------------------
 
+    def _valid_starts(self, sequence_len: int) -> np.ndarray:
+        """所有"起点 s 起 sequence_len 步不跨 episode"的 s，按 sequence_len 缓存。
+
+        判据与原逻辑一致：首尾 episode_id 相同即可 —— episode_ids 沿写入顺序单调递增
+        且按 episode 连续写入，首尾相同 ⟹ 中间全相同。
+        """
+        cached = getattr(self, "_valid_starts_cache", None)
+        if cached is not None and cached[0] == sequence_len and cached[1] == self._size:
+            return cached[2]
+        ep = np.asarray(self._episode_ids[:self._size])
+        n = self._size - sequence_len + 1
+        if n <= 0:
+            starts = np.empty(0, dtype=np.int64)
+        else:
+            ok = (ep[:n] == ep[sequence_len - 1:sequence_len - 1 + n]) & (ep[:n] >= 0)
+            starts = np.nonzero(ok)[0].astype(np.int64)
+        self._valid_starts_cache = (sequence_len, self._size, starts)
+        return starts
+
     def sample(
         self,
         batch_size: int,
@@ -243,6 +401,7 @@ class ExpertDemoBuffer:
         burn_in_len: int = 8,
         rng: Optional[np.random.Generator] = None,
         max_retries: int = 20,
+        need_next: bool = True,
     ) -> Dict[str, np.ndarray]:
         """
         采样一个 batch，返回 float32 tensors，形状均以 (B, T, N, ...) 为前缀。
@@ -277,63 +436,55 @@ class ExpertDemoBuffer:
                 f"sequence_len={sequence_len}"
             )
 
-        max_start = self._size - sequence_len
-        starts = []
-        for _ in range(batch_size):
-            chosen = None
-            for _try in range(max_retries):
-                s = int(rng.integers(0, max_start + 1))
-                # 端点同 episode（不跨边界、不跨 circular 写头）
-                if self._episode_ids[s] == self._episode_ids[s + sequence_len - 1] \
-                        and self._episode_ids[s] >= 0:
-                    chosen = s
-                    break
-            if chosen is None:
-                # 退化：接受任意起点（极少发生，仅当 episode 普遍短于 sequence_len）
-                chosen = int(rng.integers(0, max_start + 1))
-            starts.append(chosen)
-        start_indices = np.array(starts, dtype=np.int64)
+        # 合法起点 = 该位置起 sequence_len 步不跨 episode 边界。预计算一次（向量化），
+        # 之后直接从中均匀取样。
+        # ★ 2026-09-10 修：原实现是"随机试 20 次，都失败就**接受任意起点**"——那个退化分支
+        # 会静默产出**跨 episode 边界**的序列（把上一局的结尾和下一局的开头拼成一条轨迹训练）。
+        # 小图数据 episode 中位数只有 35 步、22% 短于 32 步，实测约 3% 的采样会掉进这个分支。
+        # 现在按构造保证合法，退化分支彻底删掉。
+        starts_pool = self._valid_starts(sequence_len)
+        if starts_pool.size == 0:
+            raise ValueError(
+                f"没有任何长度 ≥ {sequence_len} 的 episode（数据 episode 太短）。"
+                f"请降低 sequence_len 或重新生成数据。")
+        start_indices = starts_pool[rng.integers(0, starts_pool.size, size=batch_size)]
 
         # (B, T) 连续索引（已保证不跨 episode，无需取模，但安全起见取模）
         idx_mat = (start_indices[:, None] + np.arange(sequence_len)[None, :]) % self.capacity
 
-        # 用 torch 高级索引（index_select）替代 numpy fancy-index 做 gather。
-        # 背景：DualGPU 异步预取线程的采样占 meta_step wall ~38%（profile 实测），且与
-        # 两 GPU 线程争 GIL 难以完全重叠。**实测**真实 DualGPU 端到端：torch 版中位
-        # 3001→2637 ms/iter（~12%）且方差更低（numpy 2817-3075 抖动 vs torch 2616-2909）。
-        # 机制未完全坐实（torch 张量直接喂 _patch_to_gpu，省 numpy→torch 包裹；gather 更稳），
-        # 但数值**逐位等价**（已验证 max|Δ|=0，同一 idx_mat）。注意：注释别再写"GIL-free"——
-        # 校准测试显示 numpy fancy-index 反而更好地释放 GIL，torch CPU 索引持 GIL 更多；
-        # 这里的收益不是来自 GIL 释放，而是端到端更快更稳的经验结果。真正吃掉那 38% 需进程级
-        # 并行（共享内存 buffer + 每卡独立进程，破 GIL）——见 memory 提速记录。
-        # torch.from_numpy 零拷贝包裹底层存储（缓存复用，见 _torch_views），index_select
-        # 输出即新张量（语义等价原 numpy .copy()）。patches 仍保留 uint8（消费方 _patch_to_gpu
-        # 在 GPU 上 .float()/255，省 4× 传输；见原注释）。
-        import torch  # 惰性 import：env_worker 等 CPU-only 模块不会在导入期拉入 torch
-        tv = self._torch_views()
-        idx = torch.from_numpy(np.ascontiguousarray(idx_mat.reshape(-1)))  # (B*T,) int64
-        B, T = idx_mat.shape
-        N, C, K = self.num_agents, self.obs_channels, self.patch_size
+        # patches 保留 uint8（不在 CPU 上 astype/255）：
+        # 实测 CPU 端 astype/255 占采样 ~75% 耗时（334/441 ms），且 float32 传输量是 uint8 的 4×。
+        # 改为传 uint8 到 GPU、在 GPU 上 .float()/255（实测整条 patch 管道快 ~5.9×）。
+        # 消费方（trainer）负责 GPU 端归一化（见 _patch_to_gpu）。
+        obs_p  = self._obs_patches[idx_mat]        # (B,T,N,C,K,K) uint8
 
-        def _g(name, tail):
-            return tv[name].index_select(0, idx).reshape(B, T, *tail)
-
-        return {
-            "obs_patches":       _g("obs_patches",       (N, C, K, K)),
-            "obs_scalars":       _g("obs_scalars",       (N, 8)),
-            "positions":         _g("positions",         (N, 2)),
-            "actions_expert":    _g("actions_expert",    (N,)),
-            "rewards":           _g("rewards",           (N,)),
-            "next_obs_patches":  _g("next_obs_patches",  (N, C, K, K)),
-            "next_obs_scalars":  _g("next_obs_scalars",  (N, 8)),
-            "next_positions":    _g("next_positions",    (N, 2)),
-            "dones":             _g("dones",             (N,)),
-            "valid":             _g("valid",             (N,)),
-            "action_masks":      _g("action_masks",      (N, 5)),
-            "next_action_masks": _g("next_action_masks", (N, 5)),
-            "margin_excluded":   _g("margin_excluded",   (N,)),
-            "margin_weights":    _g("margin_weights",    (N,)),
+        # 小字段现在是磁盘上的窄 dtype（见 attach_disk_dir 的 OOM 注释），在这里按 batch 升格
+        out = {
+            "obs_patches":       obs_p,
+            "obs_scalars":       self._obs_scalars[idx_mat].astype(np.float32),
+            "positions":         self._positions[idx_mat].astype(np.float32),
+            "actions_expert":    self._actions_expert[idx_mat].astype(np.int64),
+            "valid":             self._valid[idx_mat].copy(),
+            "action_masks":      self._action_masks[idx_mat].copy(),
+            "margin_excluded":   self._margin_excluded[idx_mat].copy(),
+            "margin_weights":    self._margin_weights[idx_mat].astype(np.float32),
         }
+        # next_obs/rewards/dones 仅 DQfD 的 TD 项需要；纯 IL 用不到 → 默认可跳过，
+        # 省掉 ~一半 CPU gather/copy（next_obs_patches 单项即 ~148MB/步）。
+        if need_next and getattr(self, "_next_fields_missing", None):
+            raise ValueError(
+                f"need_next=True 但该数据集未存 next_* 字段（缺 {self._next_fields_missing}）。"
+                "纯 IL 请用 need_next=False；要跑 DQfD/TD 需重新生成含 next_* 的数据。")
+        if need_next:
+            out.update({
+                "rewards":           self._rewards[idx_mat].copy(),
+                "next_obs_patches":  self._next_obs_patches[idx_mat],
+                "next_obs_scalars":  self._next_obs_scalars[idx_mat].copy(),
+                "next_positions":    self._next_positions[idx_mat].copy(),
+                "dones":             self._dones[idx_mat].copy(),
+                "next_action_masks": self._next_action_masks[idx_mat].copy(),
+            })
+        return out
 
     def _torch_views(self) -> dict:
         """底层存储数组的 torch 零拷贝视图（缓存）。供 sample 的 GIL-free gather 用。

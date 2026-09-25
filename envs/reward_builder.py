@@ -42,6 +42,8 @@ class RewardBuilder:
         collision_cost: float = 0.1,
         gamma: float = 0.99,
         normalize_shaping: bool = True,
+        stuck_cost: float = 0.0,
+        stuck_patience: int = 5,
     ):
         self.lambda_f      = lambda_f
         self.shaping_clip  = shaping_clip
@@ -54,11 +56,22 @@ class RewardBuilder:
         self.normalize_shaping = normalize_shaping
         self._d_start = None   # 每 episode 的归一距离（begin_episode 清空，compute 首次惰性计算）
 
+        # 持续无进展（死锁）惩罚：连续 stuck_patience 步未刷新"历史最近 d_BFS"(真进展)即每步
+        # 罚 stuck_cost。非势函数项（PBRS 策略不变、修不了死锁）。stuck_cost=0 关闭（默认，向后兼容）。
+        # 动机：等待近免费(step_cost)、撞车贵(collision_cost)→岔路口"一直等"价值最优→死锁；
+        # 此项把死锁代价拉到当下，不被 γ 折扣/n-step 短传播埋掉。只罚持续无进展、不罚战术性短等。
+        self.stuck_cost     = stuck_cost
+        self.stuck_patience = stuck_patience
+        self._best_d = None    # 每体历史最近 d_BFS（begin_episode 清空）
+        self._stuck  = None    # 每体连续无进展步数
+
         self._cache = PotentialFieldCache()
 
     def begin_episode(self):
-        """每 episode 开始时调用：清空归一距离缓存，下一次 compute 用 prev_pos(=start) 计算。"""
+        """每 episode 开始时调用：清空归一距离 + 无进展追踪状态。"""
         self._d_start = None
+        self._best_d  = None
+        self._stuck   = None
 
     @classmethod
     def from_config(cls, cfg: dict) -> "RewardBuilder":
@@ -71,6 +84,8 @@ class RewardBuilder:
             collision_cost= cfg.get("collision_cost",0.1),
             gamma         = cfg.get("gamma",         0.99),
             normalize_shaping = cfg.get("normalize_shaping", True),
+            stuck_cost     = cfg.get("stuck_cost",     0.0),
+            stuck_patience = cfg.get("stuck_patience", 5),
         )
 
     # ------------------------------------------------------------------
@@ -177,10 +192,34 @@ class RewardBuilder:
             shaping = shaping / self._d_start   # Φ 按 d_BFS(start) 归一 → shaping 累积≈lambda_f
         rewards += self.lambda_f * shaping
 
+        # ---- 5. 持续无进展（死锁）惩罚 ----
+        stuck_count = 0
+        if self.stuck_cost > 0:
+            # 当前到目标的 d_BFS（cache 命中，廉价）；不可达兜底为大值不影响 stuck 逻辑
+            d_curr = np.array([
+                -self._phi(obstacles,
+                           (int(curr_pos[i, 0]), int(curr_pos[i, 1])),
+                           (int(goal_pos[i, 0]), int(goal_pos[i, 1])))
+                for i in range(N)
+            ], dtype=np.float32)
+            goal_changed_vec = np.any(prev_goal != goal_pos, axis=-1)  # (N,) 目标刷新→重置基线
+            if self._best_d is None:
+                self._best_d = d_curr.copy()
+                self._stuck  = np.zeros(N, dtype=np.int32)
+            else:
+                progressed = d_curr < (self._best_d - 1e-3)            # 刷新历史最近距离=真进展
+                self._stuck = np.where(progressed | goal_changed_vec, 0, self._stuck + 1)
+                self._best_d = np.where(goal_changed_vec, d_curr, np.minimum(self._best_d, d_curr))
+            # 仅罚：连续无进展≥patience、仍 active、未到达（到达=已在目标，不算卡）
+            stuck_pen = (self._stuck >= self.stuck_patience) & active & (~arrived)
+            rewards -= stuck_pen.astype(np.float32) * self.stuck_cost
+            stuck_count = int(stuck_pen.sum())
+
         info = {
             "reward/goal_count":      int(arrived.sum()),
             "reward/collision_count": int((collision_counts > 0).sum()),
             "reward/swap_count":      int((swap_counts > 0).sum()),
+            "reward/stuck_count":     stuck_count,
             "reward/shaping_mean":    float(shaping[active].mean()) if active.any() else 0.0,
             "reward/total_mean":      float(rewards.mean()),
         }

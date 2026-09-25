@@ -1,0 +1,37 @@
+# v3 主网络配置 — 残差 CNN + 软稀疏/迟滞通信 + GRU 时间核 + 动作 logits（离线 IL）
+# 用户决策(2026-06-16)：Mamba 回退为 GRU（更稳、零依赖、双卡不被 Python-scan 抢 GIL）。
+# Mamba 版保留在 network_mamba.yaml 作 GRU-vs-Mamba 消融。
+
+obs_radius: 5
+patch_channels: 4
+scalar_feat_dim: 8
+num_actions: 5
+
+# --- 空间编码（轻量残差 CNN）---
+d_model: 192
+cnn_channels: 64
+d_scalar: 32
+n_res_blocks: 1
+
+# --- 通信（INVARIANT 10，v3 头条贡献：软稀疏 entmax + 迟滞）---
+comm_rounds: 1         # 消融轴：0=无通信 / 1 / 3 多轮
+intent_dim: 128
+comm_dim: 128
+comm_radius: 4
+comm_topk_cap: 6
+entmax_alpha: 1.5      # 消融轴：1.0=softmax(非稀疏) / 1.5 软稀疏 / 2.0 sparsemax
+tau_in: 0.05           # 迟滞进入；消融轴：tau_in=tau_out=0 → 无迟滞
+tau_out: 0.02          # 迟滞退出
+stickiness_bonus: 0.1
+ema_decay: 0.0
+num_attention_heads: 4
+
+# --- 时间核 ---
+temporal_backend: gru  # gru（主）| lstm | mamba（消融）
+temporal_layers: 2
+d_state: 16            # 仅 mamba 用（gru 忽略）
+d_conv: 4
+mamba_expand: 2
+
+# --- 动作头 ---
+head_hidden: 128

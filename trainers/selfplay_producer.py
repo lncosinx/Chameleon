@@ -15,7 +15,6 @@
 """
 from __future__ import annotations
 
-import threading
 from copy import deepcopy
 from typing import Dict, List, Optional
 
@@ -33,15 +32,6 @@ class SelfPlayProducer:
         self.sp_buf = sp_buf
         self.managers: Dict[str, object] = {}
         self.actor = None
-        # 异步重叠：后台 daemon 线程持续 rollout→推 sp_buf，主循环只非阻塞 sync_weights。
-        # _weight_lock 护 _pending_weights 快照；_new_weights 事件触发一次 rollout 周期
-        # （≤1 周期/次 sync → 数据率 = 原同步版的「1 周期/K iter」，但与训练重叠）。
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._new_weights = threading.Event()
-        self._weight_lock = threading.Lock()
-        self._pending_weights: Optional[dict] = None
-        self._async = False
         if not self.enabled:
             return
 
@@ -80,8 +70,12 @@ class SelfPlayProducer:
         self._seed += n
         return seeds
 
-    def _rollout_once(self) -> int:
-        """遍历四族各采一次 rollout → 段推入 sp_buf。返回新增段数。actor 权重须已 load。"""
+    def maybe_rollout(self, meta_iter: int, theta_meta_state: dict) -> int:
+        """每隔 K 个 meta-iter：同步 θ_meta → 遍历四族 rollout → 段推入 sp_buf。返回新增段数。"""
+        if not self.enabled or meta_iter % self.K != 0:
+            return 0
+        # 取**当前** θ_meta（杜绝滞后副本）
+        self.actor.load_weights(theta_meta_state)
         n_added = 0
         for fam, mgr in self.managers.items():
             seeds = self._next_seeds(self.n_env)
@@ -96,60 +90,7 @@ class SelfPlayProducer:
                     n_added += 1
         return n_added
 
-    def maybe_rollout(self, meta_iter: int, theta_meta_state: dict) -> int:
-        """【同步路径，保留兼容】每隔 K 个 meta-iter：同步 θ_meta → 四族 rollout。"""
-        if not self.enabled or meta_iter % self.K != 0:
-            return 0
-        self.actor.load_weights(theta_meta_state)   # 取**当前** θ_meta（杜绝滞后副本）
-        return self._rollout_once()
-
-    # ===== 异步重叠路径（推荐）=====
-    def start(self):
-        """启动后台 rollout 线程（enable=False 时 no-op）。"""
-        if not self.enabled or self._thread is not None:
-            return
-        self._async = True
-        self._thread = threading.Thread(target=self._run_loop, name="selfplay-producer", daemon=True)
-        self._thread.start()
-
-    def sync_weights(self, theta_meta_state: dict):
-        """主循环非阻塞调用：存一份 θ_meta 的 CPU 快照，触发后台一次 rollout 周期。
-
-        多次 sync 间若后台还没消费，只保留最新快照（事件去重）→ 后台用最新权重、丢中间帧，
-        仍是 off-policy replay（K-stale 内），符合 INVARIANT 9 阶段二容忍度。
-        """
-        if not self.enabled:
-            return
-        # CPU 快照（detach + clone），与训练张量解耦，跨线程安全
-        snap = {k: v.detach().to("cpu", copy=True) for k, v in theta_meta_state.items()}
-        with self._weight_lock:
-            self._pending_weights = snap
-        self._new_weights.set()
-
-    def _run_loop(self):
-        """后台线程：等新权重 → load → 一次四族 rollout → 循环。"""
-        while not self._stop_event.is_set():
-            # 等 sync_weights 信号（超时轮询以便响应 stop）
-            if not self._new_weights.wait(timeout=0.5):
-                continue
-            self._new_weights.clear()
-            with self._weight_lock:
-                snap = self._pending_weights
-                self._pending_weights = None
-            if snap is None:
-                continue
-            try:
-                self.actor.load_weights(snap)
-                self._rollout_once()
-            except Exception as e:  # noqa: BLE001
-                print(f"[selfplay] async rollout failed: {e!r}", flush=True)
-
     def close(self):
-        self._stop_event.set()
-        self._new_weights.set()   # 唤醒可能在 wait 的线程
-        if self._thread is not None:
-            self._thread.join(timeout=10.0)
-            self._thread = None
         for mgr in self.managers.values():
             try:
                 mgr.close()

@@ -1,8 +1,8 @@
-# Pogema random 地图配置
-# 对齐 pogema-benchmark/raw_data_LMAPF/01-random/01-random.yaml
-# 使用 pogema 原生 generator 生成
+# Pogema random 地图族（when-to-switch registry：random-* 训练集）
+# Reptile 任务=族；专家数据生成与训练只取 random-* 的 train split（8:2）。
 map_type: random
-map_size: 64           # 目标 64×64；开发调试可在命令行用 --map-size 16 覆盖
+map_name: "random-"    # 只取 when-to-switch random-* 族（envs/map_registry.py 内 8:2 划 train/test）
+map_size: 64           # 仅作元数据/回退用；地图实际尺寸由 registry 地图串决定
 num_agents: 8          # 开发默认；目标 96（见设计文档 §0）；命令行 --num-agents 覆盖
 obs_radius: 5          # ⟹ patch 边长 K = 11
 max_episode_steps: 512 # 设计文档 §0 目标值；开发阶段可在命令行降为 256
@@ -25,3 +25,8 @@ reward:
   collision_cost: 0.3
   normalize_shaping: true
   gamma:          0.99
+  # 持续无进展（死锁）惩罚：连续 stuck_patience 步未刷新历史最近 d_BFS 即每步罚 stuck_cost。
+  # 治岔路口死锁（等待近免费 + PBRS 残差(1−γ)d 还正奖励卡住 → 死锁价值最优）。
+  # 0.05 > 归一 PBRS 残差 ~0.015 → 卡住净负；只罚持续无进展、不罚战术性短等(patience=5)。
+  stuck_cost:     0.05
+  stuck_patience: 5

@@ -48,6 +48,8 @@ def _build_network(net_cfg: dict, use_torch_compile: bool = False) -> BiIntentGA
         gru_hidden_dim    = net_cfg.get("gru_hidden_dim",     256),
         dueling_hidden_dim= net_cfg.get("dueling_hidden_dim", 256),
         use_torch_compile = use_torch_compile,
+        comm_enabled      = net_cfg.get("comm_enabled",       True),  # 消融轴（兼容旧开关）
+        comm_rounds       = net_cfg.get("comm_rounds",        1),     # 通信层数消融：0/1/2/3
     )
 
 
@@ -67,15 +69,24 @@ def main():
     parser.add_argument("--resume",         type=str, default="none",
                         help="'none'=从头训；'auto'=若有 checkpoints/meta_latest.pt 则续；或指定 ckpt 路径")
     parser.add_argument("--ckpt-milestones", type=str, default="",
-                        help="逗号分隔的 meta-iter 里程碑，在这些点另存 checkpoints/meta_iter_{N}.pt（SR-vs-iters 曲线用）")
+                        help="逗号分隔的 meta-iter 里程碑，在这些点另存 checkpoints/{tag}_iter_{N}.pt（SR-vs-iters 曲线用）")
+    parser.add_argument("--tag", type=str, default="meta",
+                        help="ckpt 前缀，区分不同 run（消融并行用）：checkpoints/{tag}_iter_N.pt / {tag}_latest.pt")
     parser.add_argument("--no-selfplay", action="store_true",
                         help="强制关闭自游走（隔离测 DQfD 核心；覆盖 config 的 selfplay.enable）")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VAL",
                         help="覆盖 config 顶层键（可多次，值经 yaml 解析），用于实验不污染 config。"
                              "如 --set lambda_td=0 --set inner_lr=0.003")
+    parser.add_argument("--set-net", action="append", default=[], metavar="KEY=VAL",
+                        help="覆盖 network config 键（消融用），如 --set-net comm_enabled=false")
     parser.add_argument("--bc-iters", type=int, default=0,
                         help="两阶段：前 N 个 meta-iter 纯 BC（强制 lambda_td=lambda_nstep=0，"
                              "只学专家 margin 排序），之后恢复全 λ 做 DQfD 价值 grounding。0=关闭。")
+    parser.add_argument("--comm-rounds", type=int, default=None,
+                        help="通信层数消融轴：0=无通信/1/2/3 层多轮 GAT。覆盖 network config 的 comm_rounds。")
+    parser.add_argument("--families", type=str, default="random,mazes,sc1,street,wc3",
+                        help="Reptile 任务=地图族列表（逗号分隔），对应 data/expert_{族}.npz。"
+                             "默认 when-to-switch 原生 5 族。")
     args = parser.parse_args()
     milestones = {int(x) for x in args.ckpt_milestones.split(",") if x.strip()}
 
@@ -97,6 +108,16 @@ def main():
             d = d.setdefault(kk, {})
         d[keys[-1]] = val
         print(f"[override] {k.strip()} = {val}")
+    # network config 覆盖（消融用，如 --set-net comm_enabled=false / tau_in=0）
+    for kv in args.set_net:
+        k, _, v = kv.partition("=")
+        net_cfg[k.strip()] = yaml.safe_load(v)
+        print(f"[override-net] {k.strip()} = {net_cfg[k.strip()]}")
+    # 通信层数消融轴（优先级高于 config / --set-net）
+    if args.comm_rounds is not None:
+        net_cfg["comm_rounds"] = args.comm_rounds
+        print(f"[comm-rounds] comm_rounds = {args.comm_rounds}"
+              + ("  (无通信基线)" if args.comm_rounds == 0 else ""))
 
     # ---- 确定使用哪些 GPU ----
     n_cuda = torch.cuda.device_count()
@@ -121,47 +142,36 @@ def main():
 
     print(f"Device: {device_str}")
 
-    # ---- 加载专家数据（per-timestep × N-agent 格式）----
-    # 单一混合 buffer，四种地图随机混采。容量按时间步计，先 peek 各 npz 长度精确分配。
-    # 注意：所有地图必须用相同 num_agents 生成（buffer 要求 N 一致）。
+    # ---- 加载专家数据：每族一个独立 buffer（Reptile 任务=地图族）----
+    # 每 meta-iter 的若干 task 各自从某族 buffer 采样跑 inner loop，使 Reptile 真正
+    # 学"跨族快速适应"的 init（而非单一混合分布上的普通 IL）。
+    # 注意：所有族必须用相同 num_agents 生成（buffer 要求 N 一致）。
     from scripts.generate_lacam_data import load_buffer_from_disk
-    map_types = ["random", "warehouse", "maze", "room"]
+    families = [f.strip() for f in args.families.split(",") if f.strip()]
 
-    print(f"\nLoading expert data from '{args.data_dir}' ...")
-    present = []
-    total_steps = 0
-    for map_type in map_types:
-        npz = os.path.join(args.data_dir, f"expert_{map_type}.npz")
+    print(f"\nLoading expert data from '{args.data_dir}' | families={families} ...")
+    expert_buffers = {}
+    for fam in families:
+        npz = os.path.join(args.data_dir, f"expert_{fam}.npz")
         if not os.path.exists(npz):
-            print(f"  [skip] {npz} not found — train on remaining maps. "
-                  f"Generate it with: python scripts/generate_lacam_data.py "
-                  f"--config configs/env_{map_type}.yaml --num-workers 47")
+            print(f"  [skip] {npz} not found — 该族不参与训练。"
+                  f"生成: python scripts/generate_expert_data.py 或 "
+                  f"generate_lacam_data.py --config configs/env_{fam}.yaml")
             continue
         n = _peek_npz_timesteps(npz)
         if n < 0:
             raise ValueError(
-                f"{npz} is OLD per-agent format (no positions/episode_ids). "
-                f"Communication-aware training requires regenerated data. "
-                f"Run: python scripts/generate_lacam_data.py "
-                f"--config configs/env_{map_type}.yaml --num-workers 47"
-            )
-        present.append(npz)
-        total_steps += n
+                f"{npz} 为旧 per-agent 格式（无 positions/episode_ids），需重新生成。")
+        buf = ExpertDemoBuffer(capacity=max(n, 1))
+        load_buffer_from_disk(npz, buf)
+        expert_buffers[fam] = buf
+        print(f"  {fam}: {len(buf):,} timesteps × {buf.num_agents} agents "
+              f"({buf.num_episodes} episodes)")
 
-    if not present:
+    if not expert_buffers:
         raise FileNotFoundError(
-            f"No expert data found in '{args.data_dir}'. Generate it first "
-            f"(see scripts/generate_lacam_data.py)."
-        )
-
-    # 容量上限（时间步），可由 config 收紧以控显存/内存；默认装下全部
-    cap = min(total_steps, cfg.get("expert_buffer_capacity_steps", total_steps))
-    expert_buf = ExpertDemoBuffer(capacity=max(cap, 1))
-    for npz in present:
-        load_buffer_from_disk(npz, expert_buf)
-
-    print(f"Expert buffer: {len(expert_buf):,} timesteps × {expert_buf.num_agents} agents "
-          f"({expert_buf.num_episodes} episodes)")
+            f"No expert data found in '{args.data_dir}' for families={families}. "
+            f"Generate it first (scripts/generate_expert_data.py).")
 
     # 自游走段是 (T,N,...) 大对象（每段 ~十几 MB），容量按「段数」计，
     # 勿沿用单步样本的 500k（会占 TB 级内存）。
@@ -186,18 +196,16 @@ def main():
     from trainers.selfplay_producer import SelfPlayProducer
     sp_producer = SelfPlayProducer(net, cfg, sp_buf, device=devices[0])
     if sp_producer.enabled:
-        print(f"SelfPlay: ON (async overlap) | families={sp_producer.families} | "
+        print(f"SelfPlay: ON | families={sp_producer.families} | "
               f"{sp_producer.n_env}env/family × {sp_producer.num_agents}agents "
-              f"@size{sp_producer.map_size} | sync every {sp_producer.K} meta-iters "
+              f"@size{sp_producer.map_size} | rollout every {sp_producer.K} meta-iters "
               f"| buffer cap={sp_buf._buffer.maxlen} segs")
     else:
         print("SelfPlay: OFF (selfplay.enable=false)")
-    # 后台 rollout 线程：与 inner loop 重叠（rollout 是 CPU/延迟 bound，藏进训练 GPU 空泡）。
-    sp_producer.start()
 
     # ---- 断点续跑 ----
     os.makedirs("checkpoints", exist_ok=True)
-    latest_path = "checkpoints/meta_latest.pt"
+    latest_path = f"checkpoints/{args.tag}_latest.pt"
     if args.resume and args.resume != "none":
         resume_path = latest_path if args.resume == "auto" else args.resume
         if os.path.exists(resume_path):
@@ -228,15 +236,21 @@ def main():
     print(f"\nStarting training: {start_iter} → {args.meta_iters} meta-iterations"
           + (f"  (BC pretrain 前 {args.bc_iters} iter)" if args.bc_iters > 0 else "") + "\n")
     _prev_bc = None
-    import time as _time
-    _last_log_t = _time.perf_counter()
     for i in range(start_iter, args.meta_iters):
         in_bc = i < args.bc_iters
         if in_bc != _prev_bc:
             _set_td_lambdas(0.0, 0.0) if in_bc else _set_td_lambdas(_cfg_lam_td, _cfg_lam_n)
             print(f"  [phase] {'BC (margin only)' if in_bc else 'DQfD (full λ, +TD)'} @ iter {i}", flush=True)
             _prev_bc = in_bc
-        metrics = trainer.meta_step(expert_buf, sp_buf, env_factory=None)
+        metrics = trainer.meta_step(expert_buffers, sp_buf, env_factory=None)
+
+        # 自游走：每隔 K 个 meta-iter 用**当前** θ_meta 采四族段填 sp_buf（producer 内部判 K）。
+        # BC 期 TD 关、自游走 TD-only loss 贡献为 0，跳过 rollout 省算力。
+        if not in_bc:
+            theta_meta = trainer._meta_state if hasattr(trainer, "_meta_state") else trainer.net.state_dict()
+            n_sp = sp_producer.maybe_rollout(i + 1, theta_meta)
+            if n_sp > 0:
+                print(f"  [selfplay] +{n_sp} segs @ iter {i+1} (sp_buf={len(sp_buf)})", flush=True)
 
         # 自游走（异步重叠）：每 K 个 meta-iter 非阻塞地把**当前** θ_meta 快照推给后台线程，
         # 由它在训练 GPU 空泡里 rollout 填 sp_buf（不再阻塞主循环）。BC 期 TD 关、自游走
@@ -251,9 +265,6 @@ def main():
             mt_str = "+".join(mt) if isinstance(mt, list) else str(mt)
             n_tasks = metrics.get("num_tasks", metrics.get("num_gpus", 1))
             meta_lr = metrics.get("meta_lr", cfg.get("meta_lr_start", 0.0))
-            _now = _time.perf_counter()
-            _spi = (_now - _last_log_t) / args.log_interval   # 墙钟 s/iter（含 rollout 重叠后净值）
-            _last_log_t = _now
             # loss 分量（加权贡献，应约等于 loss_total）。BC 期 td/n 的有效 λ=0，显示按有效值。
             _lt = 0.0 if in_bc else cfg.get("lambda_td", 1.0)
             _ln = 0.0 if in_bc else cfg.get("lambda_nstep", 1.0)
@@ -279,14 +290,17 @@ def main():
 
         # 里程碑编号存档（SR-vs-iters 曲线评估用，不被覆盖）
         if (i + 1) in milestones:
-            mpath = f"checkpoints/meta_iter_{i+1}.pt"
+            mpath = f"checkpoints/{args.tag}_iter_{i+1}.pt"
             save_checkpoint(trainer.state_dict(), mpath, "meta")
             print(f"  [ckpt] {mpath} @ iter {i+1}", flush=True)
 
     # ---- 保存最终 checkpoint ----
-    save_checkpoint(trainer.state_dict(), "checkpoints/meta_init.pt", "meta")
+    save_checkpoint(trainer.state_dict(), f"checkpoints/{args.tag}_init.pt", "meta")
     _atomic_save(trainer.state_dict(), latest_path)
-    print("\nCheckpoint saved to checkpoints/meta_init.pt")
+    print(f"\nCheckpoint saved to checkpoints/{args.tag}_init.pt")
+
+    # 清理自游走 worker 进程（spawn 的 CPU 池）
+    sp_producer.close()
 
     # 清理自游走 worker 进程（spawn 的 CPU 池）
     sp_producer.close()

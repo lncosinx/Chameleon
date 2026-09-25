@@ -1,0 +1,22 @@
+backend: auto
+buffer_size: 699341
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/c2g_dense48/expert_random
+elapsed: 1072.1979253292084
+fail_count: 986
+hard_case_stats: {}
+map_size: null
+map_type: random
+num_agents: 48
+num_episodes: 20000
+num_workers: 20
+quality:
+  episodes_measured: 19014
+  makespan_mean: 36.7803
+  margin_excluded_ratio_mean: 0.0
+  mean_reward_mean: 1.7738
+  soc_mean: 896.7608
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.4806
+success_count: 19014
+total_samples: 699341

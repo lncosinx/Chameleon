@@ -1,0 +1,23 @@
+# v5 主训练配置（SCHEDULE.md §3/§5）。相对 train_il_joint_small.yaml 的变化：
+#   1. families 扩到多密度（48 体原有 + 64 体新生成），治"训练只有 48 体、评测要跑 8..64"的分布缺口；
+#   2. d4_augment: true —— D4 对称增强（M1），等效 8× 数据，治数据量瓶颈；
+#   3. joint（reptile: false）——v4 已证 Reptile 进预训练拖累峰值 CSR，元学习只放适应阶段（SQ2）。
+meta_iterations: 40000
+inner_steps: 5
+inner_lr: 0.0005
+meta_lr_start: 0.1
+meta_lr_end: 0.01
+tasks_per_meta: 2
+batch_size: 32
+sequence_len: 32
+grad_clip: 10.0
+use_amp: true
+excluded_weight: 0.3
+label_smoothing: 0.0
+il_wait_weight: 1.0       # valid-only 分布里 wait 是稀有类，不降权（v4 已纠正过一次）
+d4_augment: true          # ★ M1
+families: [random48, maze48, random64, maze64]
+held_out_family: null
+debug: false
+profile_interval: 200
+reptile: false

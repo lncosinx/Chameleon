@@ -1,0 +1,24 @@
+backend: auto
+buffer_size: 1259973
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/c2g_gen3_random32/expert_random
+elapsed: 1284.5905208587646
+fail_count: 836
+hard_case_stats: {}
+map_size: null
+map_type: random
+num_agents: 32
+num_episodes: 40000
+num_workers: 15
+quality:
+  episodes_measured: 39164
+  makespan_mean: 32.1717
+  margin_excluded_ratio_mean: 0.0
+  mean_reward_mean: 1.739
+  soc_mean: 549.8576
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.4587
+seed_end: 150000
+seed_start: 110000
+success_count: 39164
+total_samples: 1259973

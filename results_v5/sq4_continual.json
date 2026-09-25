@@ -1,0 +1,154 @@
+{
+  "madcl": {
+    "final": {
+      "random32": 0.921875,
+      "maze32": 0.65625,
+      "random64": 0.578125,
+      "maze64": 0.125
+    },
+    "curve": [
+      {
+        "segment": 0,
+        "trained": "random32",
+        "scores": {
+          "random32": 0.890625
+        }
+      },
+      {
+        "segment": 1,
+        "trained": "maze32",
+        "scores": {
+          "random32": 0.953125,
+          "maze32": 0.625
+        }
+      },
+      {
+        "segment": 2,
+        "trained": "random64",
+        "scores": {
+          "random32": 0.9375,
+          "maze32": 0.609375,
+          "random64": 0.703125
+        }
+      },
+      {
+        "segment": 3,
+        "trained": "maze64",
+        "scores": {
+          "random32": 0.921875,
+          "maze32": 0.65625,
+          "random64": 0.578125,
+          "maze64": 0.125
+        }
+      }
+    ],
+    "forgetting": 0.0390625,
+    "bwt": -0.015625,
+    "avg_final": 0.5703125
+  },
+  "replay": {
+    "final": {
+      "random32": 0.96875,
+      "maze32": 0.59375,
+      "random64": 0.609375,
+      "maze64": 0.125
+    },
+    "curve": [
+      {
+        "segment": 0,
+        "trained": "random32",
+        "scores": {
+          "random32": 0.9375
+        }
+      },
+      {
+        "segment": 1,
+        "trained": "maze32",
+        "scores": {
+          "random32": 0.96875,
+          "maze32": 0.640625
+        }
+      },
+      {
+        "segment": 2,
+        "trained": "random64",
+        "scores": {
+          "random32": 0.9375,
+          "maze32": 0.71875,
+          "random64": 0.625
+        }
+      },
+      {
+        "segment": 3,
+        "trained": "maze64",
+        "scores": {
+          "random32": 0.96875,
+          "maze32": 0.59375,
+          "random64": 0.609375,
+          "maze64": 0.125
+        }
+      }
+    ],
+    "forgetting": 0.03515625,
+    "bwt": -0.0078125,
+    "avg_final": 0.57421875
+  },
+  "naive": {
+    "final": {
+      "random32": 0.90625,
+      "maze32": 0.53125,
+      "random64": 0.609375,
+      "maze64": 0.125
+    },
+    "curve": [
+      {
+        "segment": 0,
+        "trained": "random32",
+        "scores": {
+          "random32": 0.9375
+        }
+      },
+      {
+        "segment": 1,
+        "trained": "maze32",
+        "scores": {
+          "random32": 0.9375,
+          "maze32": 0.59375
+        }
+      },
+      {
+        "segment": 2,
+        "trained": "random64",
+        "scores": {
+          "random32": 0.9375,
+          "maze32": 0.625,
+          "random64": 0.625
+        }
+      },
+      {
+        "segment": 3,
+        "trained": "maze64",
+        "scores": {
+          "random32": 0.90625,
+          "maze32": 0.53125,
+          "random64": 0.609375,
+          "maze64": 0.125
+        }
+      }
+    ],
+    "forgetting": 0.03515625,
+    "bwt": -0.02734375,
+    "avg_final": 0.54296875
+  },
+  "joint": {
+    "final": {
+      "random32": 0.9375,
+      "maze32": 0.640625,
+      "random64": 0.609375,
+      "maze64": 0.15625
+    },
+    "curve": [],
+    "forgetting": 0.0,
+    "bwt": 0.0
+  }
+}

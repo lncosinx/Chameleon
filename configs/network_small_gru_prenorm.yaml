@@ -1,0 +1,35 @@
+# 归因臂（2026-09-24，SCHEDULE 已定论 18）：拆开 "SSM vs GRU" 与 "pre-norm 残差 vs 无"。
+# 与 network_small_mamba.yaml 唯一差别 = temporal_backend；与 capsmall(裸 nn.GRU) 唯一差别
+# = 时间核外面套了 pre-norm + 逐层残差（参数只多 2 个 LayerNorm = 768，+0.03%）。
+# 三方对照：capsmall(裸GRU) 8.682 / smamba(Mamba) 9.016 / 本臂 = ?
+#   追平 smamba ⇒ 已定论 9 的 +0.334 是结构红利，与 SSM 无关；
+#   追不平     ⇒ SSM 另有贡献，需继续查。
+cnn_channels: 64
+comm_dim: 128
+comm_radius: 4
+comm_rounds: 1
+comm_topk_cap: 6
+cost2go_clip: 10.0
+d_conv: 4
+d_model: 192
+d_scalar: 32
+d_state: 16
+ema_decay: 0.0
+entmax_alpha: 1.5
+head_hidden: 128
+intent_dim: 128
+intent_mode: action
+mamba_expand: 2
+n_res_blocks: 1
+num_actions: 5
+num_attention_heads: 4
+obs_radius: 5
+patch_channels: 5
+scalar_feat_dim: 8
+spatial_pool: 0
+stickiness_bonus: 0.1
+tau_in: 0.05
+tau_out: 0.02
+temporal_backend: gru_prenorm
+temporal_checkpoint: false
+temporal_layers: 2

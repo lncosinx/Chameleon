@@ -1,0 +1,24 @@
+backend: auto
+buffer_size: 59637
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/c2g_heldout/m32/expert_maze
+elapsed: 159.28563380241394
+fail_count: 75
+hard_case_stats: {}
+map_size: null
+map_type: maze
+num_agents: 32
+num_episodes: 1000
+num_workers: 15
+quality:
+  episodes_measured: 925
+  makespan_mean: 64.653
+  margin_excluded_ratio_mean: 0.0009
+  mean_reward_mean: 2.0154
+  soc_mean: 814.7935
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.558
+seed_end: 401000
+seed_start: 400000
+success_count: 925
+total_samples: 59637

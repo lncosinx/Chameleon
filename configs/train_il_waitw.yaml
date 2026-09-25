@@ -1,0 +1,36 @@
+# wait 降权臂（2026-09-21）：il_wait_weight 1.0→0.5。
+# 依据：推断端压 wait（--wait-bias 1.5）是本轮唯一见效的改动（dev +0.265，零成本）；
+#   诊断显示失败源于 makespan 比专家慢 2~3.7×，机制推测为交叉熵偏好最安全的 wait
+#   （专家 wait 比例 0.48~0.51，我方训练期 wait_pred 0.6~0.78）。此臂把纠偏搬到训练端。
+# 对照 = ckpt_il/capbig_iter_16000.pt（同断点同数据同步数，wait_weight=1.0），无需重跑。
+batch_size: 32
+d4_augment: false
+debug: false
+excluded_weight: 0.3
+families:
+- maze32
+- maze32b
+- maze48
+- maze48b
+- maze64
+- maze64b
+- random32
+- random32b
+- random48
+- random48b
+- random64
+- random64b
+grad_clip: 10.0
+held_out_family: null
+il_wait_weight: 0.5
+inner_lr: 0.0001
+inner_steps: 5
+label_smoothing: 0.0
+meta_iterations: 30000
+meta_lr_end: 0.01
+meta_lr_start: 0.1
+profile_interval: 200
+reptile: false
+sequence_len: 32
+tasks_per_meta: 2
+use_amp: true

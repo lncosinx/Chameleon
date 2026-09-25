@@ -1,0 +1,24 @@
+backend: auto
+buffer_size: 116361
+buffer_stats: {}
+data_path: /root/autodl-tmp/chameleon_data/_smoke/r64b/expert_random
+elapsed: 385.14955377578735
+fail_count: 257
+hard_case_stats: {}
+map_size: null
+map_type: random
+num_agents: 64
+num_episodes: 3000
+num_workers: 15
+quality:
+  episodes_measured: 2743
+  makespan_mean: 42.4211
+  margin_excluded_ratio_mean: 0.0001
+  mean_reward_mean: 1.8196
+  soc_mean: 1296.2454
+  vertex_collision_rate_mean: 0.0
+  wait_ratio_mean: 0.5058
+seed_end: 303300
+seed_start: 300300
+success_count: 2743
+total_samples: 116361

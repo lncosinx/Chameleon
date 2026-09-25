@@ -1,0 +1,63 @@
+{
+  "ckpt": "ckpt_il/ab_d4_iter_12000.pt",
+  "tag": "ab_d4",
+  "args": {
+    "ckpt": "ckpt_il/ab_d4_iter_12000.pt",
+    "network_config": "configs/network_gru_c2g.yaml",
+    "set_net": [],
+    "families": "mazes",
+    "agent_counts": "32,48,64",
+    "num_maps": 128,
+    "max_steps": 128,
+    "on_target": "nothing",
+    "batch_envs": 32,
+    "action_mode": "sample",
+    "escape_k": 3,
+    "escape_temp": 1.0,
+    "escape_no_wait_after": 8,
+    "auto_protocol": false,
+    "tta": true,
+    "goal_hold": "none",
+    "seeds": "0",
+    "device": "cuda:0",
+    "out": "/root/autodl-tmp/eval_v5/ab_d4_12k.json",
+    "tag": "ab_d4"
+  },
+  "results": {
+    "mazes": {
+      "32": {
+        "CSR": 0.5546875,
+        "ISR": 0.94775390625,
+        "SoC": 1420.859375,
+        "makespan": 95.7109375,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.7982988357543945,
+        "edge_flip": 0.08472201796575973,
+        "n": 128,
+        "CSR_ci95": 0.08610090554854401
+      },
+      "48": {
+        "CSR": 0.265625,
+        "ISR": 0.8504231770833334,
+        "SoC": 3211.328125,
+        "makespan": 112.7265625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.905385655816644,
+        "edge_flip": 0.17415979492943734,
+        "n": 128,
+        "CSR_ci95": 0.0765146334745334
+      },
+      "64": {
+        "CSR": 0.1484375,
+        "ISR": 0.692138671875,
+        "SoC": 5502.8984375,
+        "makespan": 118.9296875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.942606449127197,
+        "edge_flip": 0.24534813009086065,
+        "n": 128,
+        "CSR_ci95": 0.06159297285746096
+      }
+    }
+  }
+}

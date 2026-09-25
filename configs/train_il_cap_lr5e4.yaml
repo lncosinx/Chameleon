@@ -1,0 +1,38 @@
+# A 臂（2026-09-24，用户批准）：检验容量结论是否被 lr 污染。
+# 背景：lr 1e-4 是**为大网选的**（SCHEDULE 已定论 8 注 2：大网从零训 5e-4 第 250 步即塌缩为全 wait），
+# 容量 A/B 里小网对照组被迫跟用。而同架构同参数同步数的 it_act（lr 5e-4、6 族）测得 8.961，
+# 比 capsmall（lr 1e-4、12 族 mix12）的 8.682 高 0.279 —— 混淆了 lr 与数据族两个变量。
+# 本臂与 capsmall 唯一变量 = inner_lr 1e-4 → 5e-4（数据族仍是 mix12 十二族）。
+#   若追平 ~8.96 ⇒ 驱动因素是 lr，已定论 8 的 +0.391 因对照组被低估而虚高，须改写；
+#   若仍 ~8.68 ⇒ 驱动因素是数据族（6 族 > 12 族），与已定论 12「更多数据更差」同向。
+batch_size: 32
+d4_augment: false
+debug: false
+excluded_weight: 0.3
+families:
+- maze32
+- maze32b
+- maze48
+- maze48b
+- maze64
+- maze64b
+- random32
+- random32b
+- random48
+- random48b
+- random64
+- random64b
+grad_clip: 10.0
+held_out_family: null
+il_wait_weight: 1.0
+inner_lr: 0.0005
+inner_steps: 5
+label_smoothing: 0.0
+meta_iterations: 30000
+meta_lr_end: 0.01
+meta_lr_start: 0.1
+profile_interval: 200
+reptile: false
+sequence_len: 32
+tasks_per_meta: 2
+use_amp: true

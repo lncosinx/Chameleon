@@ -61,7 +61,7 @@ selfplay:
   segment_len: 32            # = sequence_len，配合 burn_in_len=8 + n_step=5
   obs_radius: 5              # K=2r+1=11，与 patch 一致
   buffer_capacity_segments: 512   # sp_buf 容量（按段计；每段 ~十几 MB）
-  families: [random, warehouse, maze, room]
+  families: [random, mazes, sc1, street, wc3]   # when-to-switch 原生 5 族（与专家数据对齐）
   env_config_tpl: "configs/env_{fam}.yaml"
 
 # 地图采样概率（前期/中期/后期）

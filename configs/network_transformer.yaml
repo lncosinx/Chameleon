@@ -1,0 +1,32 @@
+# v3 网络配置 — Transformer 骨干 + 软稀疏/迟滞通信 + 动作 logits（离线 IL）
+# 对应设计文档 §0′ v3 战略转向。取代 network_biintent_drqn.yaml（CNN+GRU+Dueling Q）。
+
+# --- 观测 / tokenizer ---
+obs_radius: 5          # K = 2r+1 = 11
+patch_channels: 4      # Pogema 原生 3 + 足迹 1（INVARIANT 5）
+scalar_feat_dim: 8     # 目标方向(2)+上一步动作 one-hot(5)+到达(1)（INVARIANT 6）
+num_actions: 5         # wait/up/down/left/right（INVARIANT 1）
+
+# --- Transformer 骨干（每体独立，参数共享） ---
+d_model: 192           # token 嵌入 = 模型维度（LC-MAPF 同量级）
+n_layers: 3            # encoder 层数
+n_heads: 3             # 注意力头数
+d_ff: 768              # FFN 宽度（4×d_model）
+dropout: 0.0
+norm_first: true       # pre-LN（训练更稳）
+
+# --- 通信（INVARIANT 10，v3 头条贡献：软稀疏+迟滞，原样保留） ---
+comm_rounds: 1         # 邻居消息传递轮数（LC-MAPF 用 4；先 1，作消融轴）
+intent_dim: 128        # 通信在 agent 嵌入投影到此维上做
+comm_dim: 128          # 注意力内部 Q/K/V 宽度
+comm_radius: 4         # r_c < obs_radius=5，FOV 内（INVARIANT 10）
+comm_topk_cap: 6       # 算力上限（非邻居选择机制）
+entmax_alpha: 1.5      # 软稀疏度（1=softmax,2=sparsemax）
+tau_in: 0.05           # 迟滞进入阈值
+tau_out: 0.02          # 迟滞退出阈值（< tau_in）
+stickiness_bonus: 0.1  # 活跃边权重加分（时间稳定性）
+ema_decay: 0.0
+num_attention_heads: 4 # 通信多头数
+
+# --- 动作头 ---
+head_hidden: 128       # 动作 logits MLP 隐层

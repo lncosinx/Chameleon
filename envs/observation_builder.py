@@ -17,8 +17,10 @@ INVARIANT 6: 目标相对方向是合法局部特征（智能体始终知道自�
 from __future__ import annotations
 
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from collections import deque
+
+from envs.potential_field import PotentialFieldCache, UNREACHABLE_CONSTANT
 
 
 class ObservationBuilder:
@@ -40,12 +42,22 @@ class ObservationBuilder:
         obs_radius: int = 5,
         decay_rho: float = 0.9,
         max_footprint_history: int = 200,
+        use_cost2go: bool = False,
+        cost2go_clip: float = 10.0,
     ):
         self.num_agents = num_agents
         self.obs_radius = obs_radius
         self.K = 2 * obs_radius + 1
         self.decay_rho = decay_rho
         self.max_footprint_history = max_footprint_history
+
+        # cost2go 通道（T2）：FOV 内到目标的 BFS 测地距离（相对自身、居中到 [0,1]），
+        # 障碍感知的导航梯度。EPH 的 heuri_map / MAPF-GPT 的 cost2go 同类。
+        # 从全局静态障碍图算（对齐 baseline 惯例；INVARIANT 3 已放宽为合法局部特征）。
+        self.use_cost2go = use_cost2go
+        self.cost2go_clip = float(cost2go_clip)
+        self.patch_channels = 5 if use_cost2go else 4
+        self._c2g_cache = PotentialFieldCache()
 
         # 足迹历史：per-agent deque of (global_row, global_col, step)
         self._footprint_history: List[deque] = []
@@ -65,6 +77,7 @@ class ObservationBuilder:
         agents_xy: List[Tuple[int, int]],
         targets_xy: List[Tuple[int, int]],
         prev_actions: np.ndarray,  # (N,) int, 值为 0-4
+        obstacles: Optional[np.ndarray] = None,  # (H,W) 0/1，use_cost2go 时必需（算 cost2go）
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         构建增强观测（向量化实现）。
@@ -90,7 +103,7 @@ class ObservationBuilder:
             )
 
         # ---- 通道 0-2: 原生观测 (N, 3, K, K) ----
-        patches = np.empty((N, 4, K, K), dtype=np.float32)
+        patches = np.empty((N, self.patch_channels, K, K), dtype=np.float32)
         for i in range(N):
             obs_i = np.asarray(obs_list[i], dtype=np.float32)
             assert obs_i.shape == (3, K, K), (
@@ -101,6 +114,12 @@ class ObservationBuilder:
         # ---- 通道 3: 时间衰减足迹（向量化计算）----
         patches[:, 3] = 0.0
         self._build_footprint_channels_vectorized(patches[:, 3], agents_xy)
+
+        # ---- 通道 4: cost2go（FOV 内 BFS 测地距离，相对自身居中到 [0,1]）----
+        if self.use_cost2go:
+            patches[:, 4] = 0.5   # 默认中性（=与自身同距）
+            if obstacles is not None:
+                self._build_cost2go_channel(patches[:, 4], agents_xy, targets_xy, obstacles)
 
         # ---- 标量特征（向量化）----
         scalars = self._build_scalar_features_vectorized(agents_xy, targets_xy, prev_actions)
@@ -170,6 +189,44 @@ class ObservationBuilder:
             # 同一 patch 格取最大值（np.maximum.at 是向量化 scatter-max）
             np.maximum.at(channels[i], (pr, pc), values)
 
+    def _build_cost2go_channel(
+        self,
+        channel: np.ndarray,          # (N, K, K) to fill（已置 0.5）
+        agents_xy: List[Tuple[int, int]],
+        targets_xy: List[Tuple[int, int]],
+        obstacles: np.ndarray,        # (H, W) 0/1
+    ):
+        """填 cost2go 通道：每体 FOV 内每格到自身目标的 BFS 测地距离，
+        **相对自身距离居中**、clip 到 ±cost2go_clip、映射到 [0,1]（0.5=与自身同距，
+        <0.5=更近目标，>0.5=更远）。绝对偏移被消除 → 无论距目标多远，局部梯度都可见。
+        从全局静态障碍图算（cache 按 (grid,goal) 复用）；INVARIANT 3 已放宽。
+        """
+        N, half, K = self.num_agents, self.obs_radius, self.K
+        H, W = obstacles.shape
+        R = self.cost2go_clip
+        for i in range(N):
+            r_c, c_c = int(agents_xy[i][0]), int(agents_xy[i][1])
+            # 越界（如 finished 哨兵位）→ 保持中性 0.5
+            if not (0 <= r_c < H and 0 <= c_c < W):
+                continue
+            dist = self._c2g_cache.get(obstacles, targets_xy[i])   # (H,W) int32
+            d_self = dist[r_c, c_c]
+            if d_self >= UNREACHABLE_CONSTANT:
+                continue   # 自身不可达（罕见）→ 中性
+            # FOV 窗口（padding=obs_radius 保证在界内，但仍安全裁剪）
+            r0, r1 = r_c - half, r_c + half + 1
+            c0, c1 = c_c - half, c_c + half + 1
+            pr0, pc0 = max(0, -r0), max(0, -c0)
+            rr0, rr1 = max(0, r0), min(H, r1)
+            cc0, cc1 = max(0, c0), min(W, c1)
+            crop = dist[rr0:rr1, cc0:cc1].astype(np.float32)
+            rel = crop - float(d_self)
+            # 不可达格：dist 巨大 → rel 巨大 → clip 到 +R（"很远"）
+            rel = np.clip(rel, -R, R) / R          # [-1,1]
+            vals = 0.5 + 0.5 * rel                  # [0,1]，居中 0.5
+            ph, pw = crop.shape
+            channel[i, pr0:pr0 + ph, pc0:pc0 + pw] = vals
+
     def _build_scalar_features_vectorized(
         self,
         agents_xy: List[Tuple[int, int]],
@@ -220,11 +277,13 @@ def build_observations(
     从 PogemaWrapper 的一次 step 结果构建增强观测。
 
     Returns:
-        patches: (N, 4, K, K)
+        patches: (N, C, K, K)  C=4 或 5（use_cost2go）
         scalars: (N, 8)
     """
     agents_xy  = wrapper.get_agents_xy()
     targets_xy = wrapper.get_targets_xy()
 
-    # 显式断言：本函数绝不访问全局信息（INVARIANT 2, 3）
-    return builder.build(obs_list, agents_xy, targets_xy, prev_actions)
+    # cost2go 需要全局静态障碍图（INVARIANT 3 已放宽为合法局部特征：仅取 FOV 裁剪）。
+    # 非 cost2go 模式下 obstacles 不被使用，观测仍只含局部信息（INVARIANT 2）。
+    obstacles = wrapper.global_grid if builder.use_cost2go else None
+    return builder.build(obs_list, agents_xy, targets_xy, prev_actions, obstacles=obstacles)

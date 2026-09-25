@@ -1,0 +1,98 @@
+{
+  "ckpt": "ckpt_il/il_smallwarm100k_iter_100000.pt",
+  "tag": "",
+  "args": {
+    "ckpt": "ckpt_il/il_smallwarm100k_iter_100000.pt",
+    "network_config": "configs/network_gru_c2g.yaml",
+    "set_net": [],
+    "families": "random,mazes",
+    "agent_counts": "32,48,64",
+    "num_maps": 128,
+    "max_steps": 128,
+    "on_target": "nothing",
+    "batch_envs": 16,
+    "action_mode": "sample",
+    "escape_k": 3,
+    "escape_temp": 1.5,
+    "escape_no_wait_after": 8,
+    "auto_protocol": false,
+    "tta": true,
+    "goal_hold": "none",
+    "seeds": "0",
+    "device": "cuda:0",
+    "out": "/root/autodl-tmp/eval_v5/v4model_tta_T1.5.json",
+    "tag": ""
+  },
+  "results": {
+    "random": {
+      "32": {
+        "CSR": 0.8046875,
+        "ISR": 0.98388671875,
+        "SoC": 1320.46875,
+        "makespan": 117.0390625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.789048194885254,
+        "edge_flip": 0.07910649902688505,
+        "n": 128,
+        "CSR_ci95": 0.0686799125611288
+      },
+      "48": {
+        "CSR": 0.5390625,
+        "ISR": 0.9422200520833333,
+        "SoC": 2675.59375,
+        "makespan": 123.140625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.888210272649303,
+        "edge_flip": 0.16427978498359153,
+        "n": 128,
+        "CSR_ci95": 0.08635583106731225
+      },
+      "64": {
+        "CSR": 0.3984375,
+        "ISR": 0.889404296875,
+        "SoC": 4511.9140625,
+        "makespan": 125.0859375,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.924848675727844,
+        "edge_flip": 0.2637979602077394,
+        "n": 128,
+        "CSR_ci95": 0.08481478539172826
+      }
+    },
+    "mazes": {
+      "32": {
+        "CSR": 0.3828125,
+        "ISR": 0.92333984375,
+        "SoC": 1968.2265625,
+        "makespan": 124.015625,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.774895906448364,
+        "edge_flip": 0.10584638114414702,
+        "n": 128,
+        "CSR_ci95": 0.08420787394261624
+      },
+      "48": {
+        "CSR": 0.21875,
+        "ISR": 0.8292643229166667,
+        "SoC": 3855.9765625,
+        "makespan": 126.3359375,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.883627247996628,
+        "edge_flip": 0.2192354184371652,
+        "n": 128,
+        "CSR_ci95": 0.07161766091871997
+      },
+      "64": {
+        "CSR": 0.1015625,
+        "ISR": 0.6436767578125,
+        "SoC": 6193.71875,
+        "makespan": 127.6171875,
+        "escape_frac": 0.0,
+        "avg_neighbors": 5.919076085090637,
+        "edge_flip": 0.315761739257141,
+        "n": 128,
+        "CSR_ci95": 0.052331322860165896
+      }
+    }
+  }
+}

@@ -2,7 +2,9 @@
 # 对齐 pogema-benchmark/raw_data_LMAPF/03-warehouse/03-warehouse.yaml
 # 需经 pogema-toolbox WarehouseConfig + generate_warehouse 生成
 map_type: warehouse
-map_size: 64           # 目标 64×64
+# 直接用 when-to-switch 全部 231 张地图，全局 8:2 划 train/test（all=全池、不分类别）。
+map_name: "all"
+map_size: 64           # 仅作元数据/回退用；实际尺寸由 registry 地图串决定
 num_agents: 8          # 开发默认；目标 96（见设计文档 §0）；命令行 --num-agents 覆盖
 obs_radius: 5
 max_episode_steps: 512 # 设计文档 §0 目标值
@@ -31,3 +33,6 @@ reward:
   collision_cost: 0.3
   normalize_shaping: true
   gamma:          0.99
+  # 持续无进展（死锁）惩罚——见 env_random.yaml 注释。
+  stuck_cost:     0.05
+  stuck_patience: 5

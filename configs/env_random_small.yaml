@@ -1,0 +1,20 @@
+# 小图高密度 random：匹配 validation-random 分布(~20x20, density~0.2)以做公平同分布对比。
+# 在线 pogema generator(无 map_name),暴露 il_joint 训练中缺失的高密度拥堵。
+map_type: random
+map_size: 20
+num_agents: 48
+obs_radius: 5
+max_episode_steps: 256
+obstacle_density: 0.2
+collision_system: soft
+on_target: nothing
+reward:
+  lambda_f: 1.5
+  shaping_clip: 5.0
+  goal_reward: 3.5
+  step_cost: 0.005
+  collision_cost: 0.3
+  normalize_shaping: true
+  gamma: 0.99
+  stuck_cost: 0.05
+  stuck_patience: 5

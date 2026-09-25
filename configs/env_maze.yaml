@@ -2,7 +2,9 @@
 # 对齐 pogema-benchmark/raw_data_LMAPF/02-mazes/02-mazes.yaml
 # 需经 pogema-toolbox MazeGenerator.generate_maze 生成
 map_type: maze
-map_size: 64           # 目标 64×64
+# 直接用 when-to-switch 全部 231 张地图，全局 8:2 划 train/test（all=全池、不分类别）。
+map_name: "all"
+map_size: 64           # 仅作元数据/回退用；实际尺寸由 registry 地图串决定
 num_agents: 8          # 开发默认；目标 96。⚠️ 四个地图族必须用相同 num_agents 生成
                        # （专家 buffer 要求 N 一致，add_episode 拒绝混入不同 N）；命令行 --num-agents 覆盖
 obs_radius: 5
@@ -33,3 +35,6 @@ reward:
   collision_cost: 0.3
   normalize_shaping: true
   gamma:          0.99
+  # 持续无进展（死锁）惩罚——见 env_random.yaml 注释。
+  stuck_cost:     0.05
+  stuck_patience: 5

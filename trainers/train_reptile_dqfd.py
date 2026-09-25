@@ -28,6 +28,23 @@ from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.profiler import Profiler
 
 
+def _normalize_buffers(buffers) -> Dict[str, object]:
+    """把 meta_step 的 expert 参数统一成 {族名: buffer} 字典（兼容单一 buffer 旧调用）。"""
+    if isinstance(buffers, dict):
+        return buffers
+    return {"mixed": buffers}
+
+
+def _assign_task_families(fams: List[str], meta_iter: int, seed, n_tasks: int) -> List[str]:
+    """确定性地为本 meta-iter 的 n_tasks 个 task 分配地图族（presample 与执行须一致）。
+    n_tasks ≤ 族数时无放回采样（保证 task 跨族多样、Reptile 才有适应意义）。"""
+    base = (seed if seed is not None else 0) + meta_iter * 7919 + 13
+    rng = np.random.default_rng(base)
+    replace = n_tasks > len(fams)
+    idx = rng.choice(len(fams), size=n_tasks, replace=replace)
+    return [fams[i] for i in idx]
+
+
 def dqfd_sequence_loss(
     net: "BiIntentGATDRQN",
     target_net: "BiIntentGATDRQN",
@@ -95,7 +112,7 @@ def dqfd_sequence_loss(
             actions, rewards, dones, valid, action_masks, next_action_masks,
             margin_excluded, margin_weights, expert_actions,
             gamma, n_step, mellowmax_alpha, margin,
-            lambda_td, lambda_nstep, lambda_margin, lambda_l2, parameters,
+            lambda_td, lambda_nstep, lambda_margin, lambda_l2, burn_in_len, parameters,
             reward_scale,
         )
 
@@ -104,7 +121,11 @@ def _dqfd_forward(
     net, target_net, device, B, T, N,
     obs_patches, obs_scalars, positions,
     next_obs_patches, next_obs_scalars, next_positions,
-    burn_in_len,
+    actions, rewards, dones, valid, action_masks, next_action_masks,
+    margin_excluded, margin_weights, expert_actions,
+    gamma, n_step, mellowmax_alpha, margin,
+    lambda_td, lambda_nstep, lambda_margin, lambda_l2, burn_in_len, parameters,
+    reward_scale=1.0,
 ):
     """只做前向：online 网络出 Q(s)、target 网络出 Q(s')。已在 autocast 上下文内。
 
@@ -313,7 +334,9 @@ class ReptileDQfDTrainer:
 
     def _current_meta_lr(self) -> float:
         """线性衰减 meta_lr：meta_lr_start → meta_lr_end。"""
-        t = self.meta_iter / max(1, self.total_meta_iters - 1)
+        # clamp 到 [0,1]：resume 续训越过 total_meta_iters 时防止线性外推出负 meta_lr
+        # （负 meta_lr → 外层更新反向 → 发散）。越过末点后 meta_lr 恒为 meta_lr_end。
+        t = min(1.0, max(0.0, self.meta_iter / max(1, self.total_meta_iters - 1)))
         return self.meta_lr_start + (self.meta_lr_end - self.meta_lr_start) * t
 
     # ------------------------------------------------------------------
@@ -422,7 +445,6 @@ class ReptileDQfDTrainer:
                 if sp_segs:
                     from buffers.batch_collator import collate_selfplay_segments
                     selfplay_batch = collate_selfplay_segments(sp_segs)  # (B,T,N,...) numpy，_inner_step 搬设备
-                self._psync_stop("sp_sample_collate")
 
             if expert_batch is not None:
                 loss, info = self._inner_step(
@@ -466,13 +488,17 @@ class ReptileDQfDTrainer:
         """
         执行一次 meta-iteration（单 GPU）：
         run_inner_loop → outer update。
+
+        expert_buffer 可为 {族名: buffer} 字典（Reptile 任务=族，单 GPU 每 iter 轮转选一族）
+        或单一 buffer（旧用法）。
         """
         theta_meta = {k: v.detach().cpu().clone()
                       for k, v in self.net.state_dict().items()}
 
-        map_type = self.scheduler.sample(
-            self.meta_iter, self.total_meta_iters, adaptive=False
-        )
+        buffers = _normalize_buffers(expert_buffer)
+        fams = sorted(buffers.keys())
+        map_type = fams[self.meta_iter % len(fams)]   # 单 GPU：轮转选族
+        expert_buffer = buffers[map_type]
         exp_ratio_val = expert_ratio(
             self.meta_iter, self.total_meta_iters,
             self.expert_ratio_start, self.expert_ratio_end,
@@ -585,8 +611,27 @@ class ReptileDQfDTrainer:
         amp_enabled = self.use_amp and self.device.type == "cuda"
         _amp_ctx = torch.autocast(device_type=self.device.type, enabled=amp_enabled)
 
+        # ---- 多体序列 DQfD 损失（共享 helper：前向+折叠+1step+nstep+margin）----
+        total_loss, loss_info = dqfd_sequence_loss(
+            self.net, target_net,
+            obs_patches=obs_patches, obs_scalars=obs_scalars, positions=positions,
+            next_obs_patches=next_obs_patches, next_obs_scalars=next_obs_scalars,
+            next_positions=next_positions,
+            actions=actions, rewards=rewards, dones=dones, valid=valid,
+            action_masks=action_masks, next_action_masks=next_action_masks,
+            margin_excluded=margin_excluded, margin_weights=margin_weights,
+            expert_actions=expert_actions,
+            gamma=self.gamma, n_step=self.n_step, mellowmax_alpha=self.mellowmax_alpha,
+            margin=self.margin, lambda_td=self.lambda_td, lambda_nstep=self.lambda_nstep,
+            lambda_margin=self.lambda_margin, lambda_l2=self.lambda_l2,
+            burn_in_len=self.burn_in_len, parameters=list(self.net.parameters()),
+            use_amp=self.use_amp, reward_scale=self.reward_scale,
+        )
+
+        # ---- 自游走段：与专家同走 dqfd_sequence_loss，但关 margin（无专家监督）----
+        # 自游走的价值就是覆盖策略实际会漂到的 OOD 脏状态，让 1-step+n-step TD 把那里
+        # 被高估的 Q 压回真值（设计文档 §3.3.1 / line 397）。按 expert_ratio 课程混合。
         if aux_batch is not None:
-            self._psync_start("selfplay_h2d")
             sp_patches      = _patch_to_gpu(aux_batch["obs_patches"])
             sp_scalars      = _to_tensor(aux_batch["obs_scalars"])
             sp_positions    = _to_tensor(aux_batch["positions"])
@@ -599,67 +644,28 @@ class ReptileDQfDTrainer:
             sp_valid        = _to_tensor(aux_batch["valid"], dtype=torch.bool)
             sp_masks        = _to_tensor(aux_batch["action_masks"], dtype=torch.bool)
             sp_next_masks   = _to_tensor(aux_batch["next_action_masks"], dtype=torch.bool)
-            self._psync_stop("selfplay_h2d")
 
-            n_e = obs_patches.shape[0]
-            self.net.train()
-            self._psync_start("merged_fwd")
-            _cat = lambda a, b: torch.cat([a, b], dim=0)
-            with _amp_ctx:
-                q_online, q_target = _dqfd_forward(
-                    self.net, target_net, self.device,
-                    n_e + sp_patches.shape[0], T, N,
-                    _cat(obs_patches, sp_patches),
-                    _cat(obs_scalars, sp_scalars),
-                    _cat(positions, sp_positions),
-                    _cat(next_obs_patches, sp_next_patches),
-                    _cat(next_obs_scalars, sp_next_scalars),
-                    _cat(next_positions, sp_next_pos),
-                    self.burn_in_len,
-                )
-                # expert 段（带 margin/l2）
-                total_loss, loss_info = _dqfd_loss_from_qs(
-                    q_online[:n_e], q_target[:n_e], self.device, n_e, T, N,
-                    actions, rewards, dones, valid, action_masks, next_action_masks,
-                    margin_excluded, margin_weights, expert_actions,
-                    self.gamma, self.n_step, self.mellowmax_alpha, self.margin,
-                    self.lambda_td, self.lambda_nstep, self.lambda_margin, self.lambda_l2,
-                    list(self.net.parameters()), self.reward_scale,
-                )
-                # selfplay 段（关 margin / 关 l2）
-                sp_loss, sp_info = _dqfd_loss_from_qs(
-                    q_online[n_e:], q_target[n_e:], self.device, sp_patches.shape[0], T, N,
-                    sp_actions, sp_rewards, sp_dones, sp_valid, sp_masks, sp_next_masks,
-                    None, None, sp_actions,
-                    self.gamma, self.n_step, self.mellowmax_alpha, self.margin,
-                    self.lambda_td, self.lambda_nstep, 0.0, 0.0,
-                    None, self.reward_scale,
-                )
-                # 课程式混合：expert 项 ×er，selfplay 项 ×(1-er)
-                total_loss = expert_weight * total_loss + (1.0 - expert_weight) * sp_loss
-            self._psync_stop("merged_fwd")
+            sp_loss, sp_info = dqfd_sequence_loss(
+                self.net, target_net,
+                obs_patches=sp_patches, obs_scalars=sp_scalars, positions=sp_positions,
+                next_obs_patches=sp_next_patches, next_obs_scalars=sp_next_scalars,
+                next_positions=sp_next_pos,
+                actions=sp_actions, rewards=sp_rewards, dones=sp_dones, valid=sp_valid,
+                action_masks=sp_masks, next_action_masks=sp_next_masks,
+                expert_actions=sp_actions,
+                gamma=self.gamma, n_step=self.n_step, mellowmax_alpha=self.mellowmax_alpha,
+                margin=self.margin, lambda_td=self.lambda_td, lambda_nstep=self.lambda_nstep,
+                lambda_margin=0.0,   # 自游走无专家动作监督，关 margin
+                lambda_l2=0.0,       # L2 已在专家项对 self.net 计入，勿重复
+                burn_in_len=self.burn_in_len, parameters=None,
+                use_amp=self.use_amp, reward_scale=self.reward_scale,
+            )
+            # 课程式混合：expert 项 ×er，selfplay 项 ×(1-er)
+            total_loss = expert_weight * total_loss + (1.0 - expert_weight) * sp_loss
             loss_info["loss_sp"]       = sp_loss.item()
             loss_info["loss_sp_td"]    = sp_info.get("loss_td", 0.0)
             loss_info["loss_sp_nstep"] = sp_info.get("loss_nstep", 0.0)
             loss_info["loss_total"]    = total_loss.item()
-        else:
-            self._psync_start("expert_fwd")
-            total_loss, loss_info = dqfd_sequence_loss(
-                self.net, target_net,
-                obs_patches=obs_patches, obs_scalars=obs_scalars, positions=positions,
-                next_obs_patches=next_obs_patches, next_obs_scalars=next_obs_scalars,
-                next_positions=next_positions,
-                actions=actions, rewards=rewards, dones=dones, valid=valid,
-                action_masks=action_masks, next_action_masks=next_action_masks,
-                margin_excluded=margin_excluded, margin_weights=margin_weights,
-                expert_actions=expert_actions,
-                gamma=self.gamma, n_step=self.n_step, mellowmax_alpha=self.mellowmax_alpha,
-                margin=self.margin, lambda_td=self.lambda_td, lambda_nstep=self.lambda_nstep,
-                lambda_margin=self.lambda_margin, lambda_l2=self.lambda_l2,
-                burn_in_len=self.burn_in_len, parameters=list(self.net.parameters()),
-                use_amp=self.use_amp, reward_scale=self.reward_scale,
-            )
-            self._psync_stop("expert_fwd")
 
         # AMP：scaler.scale → backward → unscale → clip → step → update。
         # use_amp=False 时 GradScaler(enabled=False) 全为 no-op，与原路径等价。
@@ -681,7 +687,8 @@ class ReptileDQfDTrainer:
         }
 
     def load_state_dict(self, state: dict):
-        self.net.load_state_dict(state["net"])
+        # 剥 torch.compile 的 "_orig_mod." 前缀（旧 compile ckpt 兼容；幂等）。
+        self.net.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in state["net"].items()})
         self.meta_iter = state.get("meta_iter", 0)
 
 
@@ -794,11 +801,14 @@ class DualGPUReptileTrainer:
     # 预采样 + 异步预取
     # ------------------------------------------------------------------
 
-    def _presample(self, expert_buffer, meta_iter: int, seed) -> list:
-        """采样某 meta-iter 全部 GPU×task×inner 的 expert batch。布局 [gpu][task][inner]。"""
+    def _presample(self, expert_buffers: dict, meta_iter: int, seed) -> list:
+        """采样某 meta-iter 全部 GPU×task×inner 的 expert batch（按 task 所属族取 buffer）。
+        布局 [gpu][task][inner]。task→族分配与 meta_step 用同一确定性函数。"""
         n_gpus = len(self.devices)
         tpg = self.tasks_per_gpu
         ref = self.sub_trainers[0]
+        fams = sorted(expert_buffers.keys())
+        task_fams = _assign_task_families(fams, meta_iter, seed, n_gpus * tpg)
         exp_ratio_val = expert_ratio(
             meta_iter, self.total_meta_iters,
             self.expert_ratio_start, self.expert_ratio_end,
@@ -810,12 +820,13 @@ class DualGPUReptileTrainer:
             gpu_b = []
             for task_offset in range(tpg):
                 task_idx = gpu_idx * tpg + task_offset
+                buf = expert_buffers[task_fams[task_idx]]
                 task_seed = (seed or meta_iter * 1000) + task_idx * 99991
                 rng = np.random.default_rng(task_seed)
                 batches = []
                 for _ in range(ref.inner_steps):
                     try:
-                        batches.append(expert_buffer.sample(
+                        batches.append(buf.sample(
                             batch_size=n_expert_seqs,
                             sequence_len=ref.sequence_len,
                             burn_in_len=ref.burn_in_len,
@@ -827,7 +838,7 @@ class DualGPUReptileTrainer:
             all_pre.append(gpu_b)
         return all_pre
 
-    def _get_presample(self, expert_buffer, meta_iter: int, seed) -> list:
+    def _get_presample(self, expert_buffers: dict, meta_iter: int, seed) -> list:
         """取本轮预采样：命中上一轮后台预取则直接用，否则同步采样。"""
         if self._prefetch_thread is not None:
             self._prefetch_thread.join()
@@ -836,19 +847,21 @@ class DualGPUReptileTrainer:
             batches = self._prefetched[1]
             self._prefetched = None
             return batches
-        return self._presample(expert_buffer, meta_iter, seed)
+        return self._presample(expert_buffers, meta_iter, seed)
 
-    def _start_prefetch(self, expert_buffer, meta_iter: int, seed):
+    def _start_prefetch(self, expert_buffers: dict, meta_iter: int, seed):
         """后台线程预采下一轮（与本轮 GPU inner loop 重叠；CUDA kernel 释放 GIL 时 CPU 采样得以并行）。"""
         key = (meta_iter, seed)
         def _work():
-            self._prefetched = (key, self._presample(expert_buffer, meta_iter, seed))
+            self._prefetched = (key, self._presample(expert_buffers, meta_iter, seed))
         self._prefetch_thread = threading.Thread(target=_work, name="prefetch", daemon=True)
         self._prefetch_thread.start()
 
     def _current_meta_lr(self) -> float:
         """线性衰减 meta_lr：meta_lr_start → meta_lr_end。"""
-        t = self.meta_iter / max(1, self.total_meta_iters - 1)
+        # clamp 到 [0,1]：resume 续训越过 total_meta_iters 时防止线性外推出负 meta_lr
+        # （负 meta_lr → 外层更新反向 → 发散）。越过末点后 meta_lr 恒为 meta_lr_end。
+        t = min(1.0, max(0.0, self.meta_iter / max(1, self.total_meta_iters - 1)))
         return self.meta_lr_start + (self.meta_lr_end - self.meta_lr_start) * t
 
     @property
@@ -864,17 +877,18 @@ class DualGPUReptileTrainer:
         seed: int = None,
     ) -> Dict[str, float]:
         """
-        执行一次 meta-iteration（双 GPU 并行）：
+        执行一次 meta-iteration（双 GPU，**顺序执行不并发**）：
 
-        1. 主线程顺序预采样两张 GPU 所需的全部 expert batch（消除跨线程锁竞争）
-        2. 两线程在各自 GPU 上并行跑 K 步 inner loop（纯 GPU compute，无 Python 锁）
-        3. 收集两份 θ_inner
+        1. 预采样全部 GPU×task×inner 的 expert batch（按 task 所属族取 buffer）
+        2. 两卡**依次**各跑 tasks_per_gpu 个 K 步 inner loop（硬件约束：两卡不能同时跑）
+        3. 收集 n_tasks 份 θ_inner
         4. 平均增量，做 outer update
         5. 将新 θ_meta 同步回两卡
-        """
-        # 首个 meta-iter 前串行预热 torch.compile（避免两线程并发首次编译抢 inductor 缓存）
-        self._warmup_compile()
 
+        expert_buffer 可为 {族名: buffer} 字典（Reptile 任务=族）或单一 buffer（旧用法）。
+        """
+        expert_buffers = _normalize_buffers(expert_buffer)
+        fams = sorted(expert_buffers.keys())
         theta_meta = self._meta_state   # 当前 θ_meta（CPU tensors）
         n_gpus     = len(self.devices)
         tpg        = self.tasks_per_gpu   # 每卡串行任务数
@@ -886,11 +900,9 @@ class DualGPUReptileTrainer:
             self.expert_ratio_decay_iters, bc_offset=self.bc_iters,
         )
 
-        # 采样 n_tasks 个地图类型（相邻偏移保证多样性）
-        map_types = [
-            str(self.scheduler.sample(self.meta_iter + i, self.total_meta_iters))
-            for i in range(n_tasks)
-        ]
+        # 本 meta-iter 各 task 的地图族（与 _presample 用同一确定性分配）。日志即族名。
+        task_fams = _assign_task_families(fams, self.meta_iter, seed, n_tasks)
+        map_types = list(task_fams)
 
         _seg = self.profiler.segment if self.profiler else lambda _: nullcontext()
 
@@ -898,10 +910,10 @@ class DualGPUReptileTrainer:
         # 本轮 batch：命中上一轮后台预取直接用；随后立即启动下一轮预取，与下方
         # GPU inner loop 重叠（patch 已是 uint8，转换在 GPU；此处只剩 gather，可被隐藏）。
         with _seg("presample"):
-            all_pre_batches = self._get_presample(expert_buffer, self.meta_iter, seed)
-        self._start_prefetch(expert_buffer, self.meta_iter + 1, seed)
+            all_pre_batches = self._get_presample(expert_buffers, self.meta_iter, seed)
+        self._start_prefetch(expert_buffers, self.meta_iter + 1, seed)
 
-        # ---- 并行 inner loop（每线程在各自 GPU 上串行跑 tasks_per_gpu 个任务）----
+        # ---- inner loop：两卡顺序执行（不并发，硬件约束 "不能同时跑"）----
         results: Dict[int, List[Optional[Dict]]] = {i: [] for i in range(n_gpus)}
         errors:  Dict[int, Optional[Exception]]  = {i: None for i in range(n_gpus)}
 
@@ -910,9 +922,10 @@ class DualGPUReptileTrainer:
                 gpu_results: List[Optional[Dict]] = []
                 for task_offset in range(tpg):
                     task_idx  = gpu_idx * tpg + task_offset
+                    fam       = task_fams[task_idx]
                     task_seed = (seed or self.meta_iter * 1000) + task_idx * 99991
                     r = self.sub_trainers[gpu_idx].run_inner_loop(
-                        expert_buffer   = expert_buffer,
+                        expert_buffer   = expert_buffers[fam],
                         selfplay_buffer = selfplay_buffer,
                         theta_meta_cpu  = theta_meta,
                         exp_ratio_val   = exp_ratio_val,
@@ -926,10 +939,8 @@ class DualGPUReptileTrainer:
                 errors[gpu_idx] = exc
 
         with _seg("inner_loop_wall"):
-            threads = [threading.Thread(target=_run_gpu, args=(i,), name=f"inner-gpu{i}")
-                       for i in range(n_gpus)]
-            for t in threads: t.start()
-            for t in threads: t.join()
+            for i in range(n_gpus):     # 顺序：GPU0 跑完它的 tasks，再 GPU1
+                _run_gpu(i)
 
         for idx, exc in errors.items():
             if exc is not None:
@@ -998,7 +1009,9 @@ class DualGPUReptileTrainer:
         }
 
     def load_state_dict(self, state: dict):
-        self._meta_state = {k: v.cpu() for k, v in state["net"].items()}
+        # 剥 torch.compile 的 "_orig_mod." 前缀：旧 ckpt 可能在 use_torch_compile=True 下存的，
+        # 当前非编译网络 load 会 key 不匹配（幂等，对干净 ckpt 无副作用）。
+        self._meta_state = {k.replace("_orig_mod.", ""): v.cpu() for k, v in state["net"].items()}
         self.meta_iter   = state.get("meta_iter", 0)
         for trainer in self.sub_trainers:
             trainer.net.load_state_dict(

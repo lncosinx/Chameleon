@@ -1,0 +1,58 @@
+batch_size: 32
+d4_augment: false
+debug: false
+excluded_weight: 0.3
+families:
+- maze32
+- maze32b
+- maze32c
+- maze48
+- maze48b
+- maze48c
+- maze64
+- maze64b
+- maze64c
+- random32
+- random32b
+- random32c
+- random48
+- random48b
+- random48c
+- random64
+- random64b
+- random64c
+- random64d
+grad_clip: 10.0
+held_out_family: null
+il_wait_weight: 1.0
+inner_lr: 0.0001
+inner_steps: 5
+label_smoothing: 0.0
+meta_iterations: 30000
+meta_lr_end: 0.01
+meta_lr_start: 0.1
+profile_interval: 200
+reptile: false
+sequence_len: 32
+tasks_per_meta: 2
+use_amp: true
+family_weights:
+  maze32: 0.051466
+  maze32b: 0.03875
+  maze32c: 0.076451
+  maze48: 0.044793
+  maze48b: 0.045632
+  maze48c: 0.076241
+  maze64: 0.061831
+  maze64b: 0.051912
+  maze64c: 0.052924
+  random32: 0.03709
+  random32b: 0.055547
+  random32c: 0.07403
+  random48: 0.037045
+  random48b: 0.055557
+  random48c: 0.074065
+  random64: 0.026821
+  random64b: 0.04031
+  random64c: 0.065931
+  random64d: 0.033604

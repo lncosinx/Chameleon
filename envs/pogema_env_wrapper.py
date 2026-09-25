@@ -16,6 +16,8 @@ from copy import deepcopy
 
 from pogema import GridConfig, pogema_v0
 
+from envs.dataset_split import resolve_seed
+
 
 # ---------------------------------------------------------------------------
 # 地图生成
@@ -37,14 +39,26 @@ def _generate_warehouse_map(cfg: dict, seed: Optional[int] = None) -> str:
         generate_warehouse,
     )
     wh_cfg = cfg.get("warehouse", {})
+    # ★ pogema-toolbox 的 warehouse 生成器是**确定性**的（同参数永远同一张图）。
+    # 若直接用固定参数生成训练数据，整族只有一个布局，模型会把那个布局背下来。
+    # 故与 maze 一致：配置里给 *_min/*_max 时按 episode seed 采样结构参数，
+    # 得到一族"仓库式"布局（货架尺寸/过道宽度/行列数不同），而非一张图。
+    rng = np.random.default_rng(seed)
+
+    def _pick(key, default):
+        lo, hi = wh_cfg.get(f"{key}_min"), wh_cfg.get(f"{key}_max")
+        if lo is None or hi is None:
+            return wh_cfg.get(key, default)
+        return int(rng.integers(int(lo), int(hi) + 1))
+
     wc = WarehouseConfig(
-        wall_width=wh_cfg.get("wall_width", 5),
-        wall_height=wh_cfg.get("wall_height", 2),
-        walls_in_row=wh_cfg.get("walls_in_row", 5),
-        walls_rows=wh_cfg.get("walls_rows", 5),
-        bottom_gap=wh_cfg.get("bottom_gap", 5),
-        horizontal_gap=wh_cfg.get("horizontal_gap", 1),
-        vertical_gap=wh_cfg.get("vertical_gap", 3),
+        wall_width=_pick("wall_width", 5),
+        wall_height=_pick("wall_height", 2),
+        walls_in_row=_pick("walls_in_row", 5),
+        walls_rows=_pick("walls_rows", 5),
+        bottom_gap=_pick("bottom_gap", 5),
+        horizontal_gap=_pick("horizontal_gap", 1),
+        vertical_gap=_pick("vertical_gap", 3),
     )
     map_str = generate_warehouse(wc)
     # warehouse generator 用 '!' 表示空闲，转换为 Pogema 期望的 '.'
@@ -152,9 +166,27 @@ class PogemaWrapper:
     全局信息（grid / starts / goals）通过独立属性访问，仅供训练期 reward/LaCAM。
     """
 
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, split: Optional[str] = None):
         with open(config_path, "r") as f:
             self._raw_cfg = yaml.safe_load(f)
+
+        # 训练/测试地图集划分。
+        # 优先级：构造参数 > 配置 split 键 > 默认 'train'。评估脚本须显式传 split='test'。
+        self.split: str = split or self._raw_cfg.get("split") or "train"
+
+        # 地图来源：若配置含 map_name（正则前缀），改为从 when-to-switch 固定地图池按
+        # split 取图（见 envs/map_registry.py，对齐 _test_regexp 划分）；否则回退到本仓库
+        # 在线程序化生成器（_MAP_GENERATORS）。
+        self.map_pattern: Optional[str] = self._raw_cfg.get("map_name")
+
+        # 外部固定地图（如 marl-gpt eval_configs 的 ascii 地图池）：优先级最高，
+        # 跳过 registry/generator，直接用给定 map string 建 GridConfig。
+        self.fixed_map_str: Optional[str] = self._raw_cfg.get("fixed_map")
+        self.fixed_map_name: Optional[str] = self._raw_cfg.get("fixed_map_name")
+        # 显式起终点（DAgger 用：从策略访问过的任意状态重启专家）。给定时跳过 pogema
+        # 的随机放置，直接把这批 (agents_xy, targets_xy) 交给 GridConfig。
+        self.fixed_agents_xy = self._raw_cfg.get("fixed_agents_xy")
+        self.fixed_targets_xy = self._raw_cfg.get("fixed_targets_xy")
 
         self.map_type: str = self._raw_cfg["map_type"]
         self.map_size: int = self._raw_cfg.get("map_size", 64)
@@ -168,6 +200,7 @@ class PogemaWrapper:
         self._env = None
         self._episode_step: int = 0
         self._seed: Optional[int] = None
+        self._map_name: Optional[str] = None
 
         # 当前 episode 的地图全局信息（仅供训练期 reward/LaCAM 使用，不进 policy）
         self._global_grid: Optional[np.ndarray] = None
@@ -206,7 +239,9 @@ class PogemaWrapper:
             obs_list: list of np.ndarray, 每体原生观测 shape=(3, K, K)
             info: dict with metadata
         """
-        self._seed = seed if seed is not None else np.random.randint(0, 2**31 - 1)
+        raw_seed = seed if seed is not None else np.random.randint(0, 2**31 - 1)
+        # 按 split 把 raw seed 映射到 train/test 互不相交的 seed 空间。
+        self._seed = resolve_seed(raw_seed, self.split)
         self._episode_step = 0
         self._env = self._create_env()
 
@@ -305,12 +340,21 @@ class PogemaWrapper:
     # ---- 内部 --------------------------------------------------------
 
     def _create_env(self):
-        """根据 map_type 创建对应的 Pogema 环境。"""
-        generator = _MAP_GENERATORS.get(self.map_type)
-        if generator is None:
-            raise ValueError(f"Unknown map_type: {self.map_type}")
-
-        map_str = generator(self._raw_cfg, seed=self._seed)
+        """创建 Pogema 环境。地图来源：外部固定地图 > when-to-switch 固定地图池（配置含 map_name）> 在线生成器。"""
+        if self.fixed_map_str is not None:
+            map_str = self.fixed_map_str
+            self._map_name = self.fixed_map_name or "fixed-map"
+        elif self.map_pattern:
+            # 从 when-to-switch 固定地图池按 split 确定性取图（train/test 结构互不相交）。
+            from envs.map_registry import pick_map
+            map_name, map_str = pick_map(self.map_pattern, self.split, self._seed)
+            self._map_name = map_name
+        else:
+            generator = _MAP_GENERATORS.get(self.map_type)
+            if generator is None:
+                raise ValueError(f"Unknown map_type: {self.map_type}")
+            map_str = generator(self._raw_cfg, seed=self._seed)
+            self._map_name = f"{self.map_type}-seed-{self._seed}"
 
         gc_kwargs = dict(
             size=self.map_size,
@@ -329,10 +373,20 @@ class PogemaWrapper:
         #    后设属性 gc.map = str 会跳过 validator，导致 grid.py 解析失败。
         if map_str is not None:
             gc_kwargs["map"] = map_str
-            gc_kwargs["map_name"] = f"{self.map_type}-seed-{self._seed}"
+            gc_kwargs["map_name"] = self._map_name
         else:
             # random 地图：传入 obstacle_density（Pogema GridConfig 对应参数名 density）
             gc_kwargs["density"] = self.obstacle_density
+
+        if self.fixed_agents_xy is not None and self.fixed_targets_xy is not None:
+            # ★ 坐标系陷阱：pogema 内部把地图四周 pad 了 obs_radius 圈，`get_agents_xy()` /
+            # `global_grid` 都是 **padded** 坐标，而 GridConfig 的 agents_xy 收的是
+            # **unpadded** 原图坐标。本项目其它地方一律用 padded 系，故这里接受 padded
+            # 输入、减去 obs_radius 再交给 GridConfig（否则每个 agent 会被平移 5 格且不报错）。
+            off = self.obs_radius
+            gc_kwargs["agents_xy"] = [[int(p[0]) - off, int(p[1]) - off] for p in self.fixed_agents_xy]
+            gc_kwargs["targets_xy"] = [[int(p[0]) - off, int(p[1]) - off] for p in self.fixed_targets_xy]
+            gc_kwargs["num_agents"] = len(gc_kwargs["agents_xy"])
 
         gc = GridConfig(**gc_kwargs)
         return pogema_v0(grid_config=gc)
@@ -362,9 +416,9 @@ class PogemaWrapper:
 # 便捷工厂函数
 # ---------------------------------------------------------------------------
 
-def make_env(config_path: str) -> PogemaWrapper:
-    """从 YAML 配置文件创建 PogemaWrapper。"""
-    return PogemaWrapper(config_path)
+def make_env(config_path: str, split: Optional[str] = None) -> PogemaWrapper:
+    """从 YAML 配置文件创建 PogemaWrapper。split 见 PogemaWrapper.__init__。"""
+    return PogemaWrapper(config_path, split=split)
 
 
 def make_env_from_dict(cfg: dict) -> PogemaWrapper:

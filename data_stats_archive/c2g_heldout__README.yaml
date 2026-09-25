@@ -1,0 +1,6 @@
+# 真·留出集（2026-09-17）：seed 段与所有训练批次不相交，永不参与训练，只用于拟合/泛化探针。
+random64: {dirs: [r64/expert_random, r64b/expert_random], seeds: [300000, 303300]}
+maze48:   {dirs: [m48/expert_maze], seeds: [500000, 501500]}
+maze64:   {dirs: [m64/expert_maze], seeds: [600000, 600300]}
+random32: {dirs: [r32/expert_random], seeds: [100000, 102000]}
+maze32:   {dirs: [m32/expert_maze], seeds: [400000, 401000]}

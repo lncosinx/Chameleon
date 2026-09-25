@@ -46,7 +46,8 @@ def evaluate(
     net.to(device)
     net.eval()
 
-    wrapper = PogemaWrapper(config_path)
+    # split='test'：评估只用 held-out 测试地图池（与训练 seed 空间不相交）。
+    wrapper = PogemaWrapper(config_path, split="test")
     wrapper._raw_cfg["size"] = map_size
     wrapper._raw_cfg["num_agents"] = num_agents
     wrapper.map_size = map_size
@@ -58,7 +59,8 @@ def evaluate(
 
     for ep in range(num_episodes):
         obs_builder.reset()
-        obs_list, _ = wrapper.reset(seed=20000 + ep)
+        # 评估第 ep 张测试地图（split='test' 映射到 held-out 池）。
+        obs_list, _ = wrapper.reset(seed=ep)
 
         prev_actions = np.zeros(num_agents, dtype=np.int64)
         hidden = net.init_hidden(1, num_agents, device)

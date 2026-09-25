@@ -1,0 +1,37 @@
+# v3 训练配置：离线 IL（交叉熵）+ Reptile（任务=地图族）。取代 train_reptile_dqfd.yaml。
+# 无 TD/target/selfplay/reward；inner loop = 某族离线专家数据上几步 CE-SGD。
+
+meta_iterations: 20000
+inner_steps: 5
+inner_lr: 0.0005        # IL 无 TD 发散风险，可比 DQfD(3e-4) 略大
+meta_lr_start: 0.1      # Reptile 外层步长（线性衰减）
+meta_lr_end: 0.01
+tasks_per_meta: 2       # 每 meta-iter 采样几个族跑 inner loop，平均增量做 outer（≈双卡 task-并行的单卡版）
+batch_size: 32
+# 训练段长 = 策略能学着利用的历史长度（Mamba 推断时跨整 episode 携带状态，但只"学过"~T 步上下文）。
+# 实测(N=96,batch=32,单卡5090)：seq=16→1.72s/it、seq=32→4.0s/it、seq=64→OOM（通信 (B,T,N,N)
+# 注意力 O(B·T·N²) 是大 T 内存墙）。32 为标准值（旧 DQfD 同）。要更长需降 batch/梯度累积/通信分块。
+sequence_len: 32        # 无 GRU 故无 burn-in；通信迟滞 + Mamba 记忆都跨 T 生效
+grad_clip: 10.0
+use_amp: true
+excluded_weight: 0.3    # margin_excluded（对称让行）样本 CE 降权
+label_smoothing: 0.0
+# wait 类别平衡。★2026-07-22 更正：先前以为专家 wait 占 ~50% 是**错的**——那是**含已完成 agent
+# 补零(wait)** 的原始分布；loss 按 `valid` 掩码，真实看到的是 **valid-only 分布：wait 仅 2.0%**
+# （moves 各 ~24.5%，native LaCAM 数据实测）。即 wait 是**稀有类**而非多数类。
+# 之前设 0.25/0.5 是在压制一个本就 2% 的类 → wait_pred 恒 0（"从不等待"）。故恢复 1.0=不加权。
+il_wait_weight: 1.0
+
+# T2 阶段先用 cost2go 重生成的 2 族（data_c2g/）做 A/B；确认 cost2go 有效后再补齐 5 族。
+# warehouse 作 held-out 评估族（与旧 IL/DQfD 的 warehouse eval 可比）。
+families: [random, maze]
+
+# 适应评估（Reptile 的存在理由）：留一族 held-out 不进元训练，few-shot 微调测适应
+held_out_family: null   # 例如 "room"；null=四族全用于元训练
+
+debug: false
+profile_interval: 200
+
+# Reptile 消融臂：关闭外层平均，退化为普通 joint 训练（保留优化器动量）。
+# 其余超参与 train_il_reptile.yaml 完全一致，唯一变量 = reptile。
+reptile: false

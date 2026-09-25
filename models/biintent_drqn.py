@@ -57,6 +57,7 @@ class BiIntentGATDRQN(nn.Module):
         tau_out: float = 0.02,           # 迟滞退出阈值
         stickiness_bonus: float = 0.1,   # 活跃邻居加分
         ema_decay: float = 0.0,          # 跨步 EMA 平滑
+        comm_rounds: int = 1,            # 通信层数（GAT 轮数）：0=无通信, 1/2/3=多轮消息传递
         # GRU
         gru_hidden_dim: int = 256,
         # Dueling Q
@@ -64,6 +65,8 @@ class BiIntentGATDRQN(nn.Module):
         num_actions: int = 5,
         # 性能（§4.2）
         use_torch_compile: bool = False,
+        # 消融：False=禁用通信（comm_feat 置零，架构/参数量不变，仅去通信信号）
+        comm_enabled: bool = True,
     ):
         super().__init__()
 
@@ -92,19 +95,25 @@ class BiIntentGATDRQN(nn.Module):
         # 意图投影
         self.intent_proj = nn.Linear(self.fused_dim, intent_dim)
 
-        # 双向意图注意力（软稀疏 + 迟滞）
-        self.communication = BiIntentAttention(
-            intent_dim=intent_dim,
-            comm_dim=comm_dim,
-            comm_radius=comm_radius,
-            comm_topk_cap=comm_topk_cap,
-            num_heads=num_attention_heads,
-            entmax_alpha=entmax_alpha,
-            tau_in=tau_in,
-            tau_out=tau_out,
-            stickiness_bonus=stickiness_bonus,
-            ema_decay=ema_decay,
+        # 双向意图注意力（软稀疏 + 迟滞）。多轮通信 = 堆叠多个 BiIntentAttention。
+        # 第一层保留属性名 `self.communication`（兼容 reset/消融代码 + comm_rounds≤1 主路径）；
+        # 第 2..comm_rounds 层放 extra_comm_layers，层间用 intent_refine 残差刷新意图。
+        def _make_comm():
+            return BiIntentAttention(
+                intent_dim=intent_dim, comm_dim=comm_dim, comm_radius=comm_radius,
+                comm_topk_cap=comm_topk_cap, num_heads=num_attention_heads,
+                entmax_alpha=entmax_alpha, tau_in=tau_in, tau_out=tau_out,
+                stickiness_bonus=stickiness_bonus, ema_decay=ema_decay,
+            )
+        # 始终构造第一层 → comm_rounds=0(无通信)与>=1 的参数量基本一致，便于公平消融。
+        self.communication = _make_comm()
+        n_extra = max(0, comm_rounds - 1)
+        self.extra_comm_layers = nn.ModuleList([_make_comm() for _ in range(n_extra)])
+        # 层间意图刷新：把上一轮通信输出(intent_dim) 残差加回意图，作为下一轮输入。
+        self.intent_refine = nn.ModuleList(
+            [nn.Linear(intent_dim, intent_dim) for _ in range(n_extra)]
         )
+        self.comm_rounds = comm_rounds
 
         # 通信后的特征维度 = fused_dim + intent_dim（通信输出维度 = intent_dim）
         gru_input_dim = self.fused_dim + intent_dim
@@ -123,6 +132,8 @@ class BiIntentGATDRQN(nn.Module):
         # 缓存超参
         self.num_actions = num_actions
         self.gru_hidden_dim = gru_hidden_dim
+        self.comm_enabled = comm_enabled
+        self.intent_dim = intent_dim
 
     @staticmethod
     def _try_compile(module: nn.Module) -> nn.Module:
@@ -155,7 +166,13 @@ class BiIntentGATDRQN(nn.Module):
         迟滞状态（_active_mask/_prev_edge_set），EdgeFlipRate 防闪烁机制失效。
         现改为由调用方在 episode 边界显式调用本方法。
         """
+        self._reset_all_comm()
+
+    def _reset_all_comm(self):
+        """重置所有通信层（含多轮）的迟滞状态。"""
         self.communication.reset_state()
+        for layer in self.extra_comm_layers:
+            layer.reset_state()
 
     def forward(
         self,
@@ -190,7 +207,7 @@ class BiIntentGATDRQN(nn.Module):
 
         # 仅在显式要求时重置通信状态（训练 batch 起始或 episode 起始）
         if reset_comm:
-            self.communication.reset_state()
+            self._reset_all_comm()
 
         # ---- 1. 编码 ----
         patches_flat = patches.reshape(B * T * N, *patches.shape[-3:])
@@ -201,11 +218,27 @@ class BiIntentGATDRQN(nn.Module):
 
         fused = torch.cat([patch_feat, scalar_feat], dim=-1)  # (B, T, N, fused_dim)
 
-        # ---- 2. 通信（向量化整段；迟滞 active 递推内部串行，重活批量化）----
-        intent = self.intent_proj(fused)  # (B, T, N, intent_dim)
-        comm_feat, comm_info = self.communication.forward_sequence(intent, positions)
-        edge_flip_rates = [comm_info.get("edge_flip_rate", 0.0)]
-        avg_neighbors_list = [comm_info.get("avg_neighbors", 0.0)]
+        # ---- 2. 通信（多轮 GAT；向量化整段，迟滞 active 递推内部串行，重活批量化）----
+        # 有效轮数：comm_enabled=False 等价 comm_rounds=0（无通信，仅去信号，参数量不变）。
+        eff_rounds = self.comm_rounds if self.comm_enabled else 0
+        if eff_rounds <= 0:
+            # 消融：无通信——comm_feat 置零（GRU 输入维度不变，仅去通信信号）
+            B_, T_, N_ = fused.shape[:3]
+            comm_feat = fused.new_zeros(B_, T_, N_, self.intent_dim)
+            edge_flip_rates, avg_neighbors_list, active_neighbors_list = [0.0], [0.0], [0.0]
+        else:
+            intent = self.intent_proj(fused)  # (B, T, N, intent_dim)
+            comm_feat, comm_info = self.communication.forward_sequence(intent, positions)
+            edge_flip_rates = [comm_info.get("edge_flip_rate", 0.0)]
+            avg_neighbors_list = [comm_info.get("avg_neighbors", 0.0)]
+            active_neighbors_list = [comm_info.get("avg_active_neighbors", 0.0)]
+            # 第 2..eff_rounds 层：用上一轮输出残差刷新意图后再传一轮消息。
+            for r in range(eff_rounds - 1):
+                intent = intent + self.intent_refine[r](comm_feat)
+                comm_feat, comm_info = self.extra_comm_layers[r].forward_sequence(intent, positions)
+                edge_flip_rates.append(comm_info.get("edge_flip_rate", 0.0))
+                avg_neighbors_list.append(comm_info.get("avg_neighbors", 0.0))
+                active_neighbors_list.append(comm_info.get("avg_active_neighbors", 0.0))
 
         # ---- 3. GRU ----
         # 拼接 fused + comm → (B*N, T, gru_input_dim)
@@ -234,6 +267,7 @@ class BiIntentGATDRQN(nn.Module):
             "q_min": q_values.detach().min().item(),
             "edge_flip_rate": float(np.mean(edge_flip_rates)) if edge_flip_rates else 0.0,
             "avg_neighbors": float(np.mean(avg_neighbors_list)) if avg_neighbors_list else 0.0,
+            "avg_active_neighbors": float(np.mean(active_neighbors_list)) if active_neighbors_list else 0.0,
         }
 
         return q_values, h_final, info
