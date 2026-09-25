@@ -28,20 +28,25 @@ export all_proxy="socks5://127.0.0.1:20171"
 
 ## 项目概述
 
-基于 **Pogema** 网格环境的**部分可观测多智能体路径规划（MAPF）**。
+基于 **POGEMA** 网格环境的**部分可观测多智能体路径规划（MAPF）**。方法细节见设计文档。
 
-> **⚠️ v3 战略转向（2026-06-15，最高优先级，详见设计文档 §0′）**：原 `DQfD/CNN+GRU/在线 RL/刷泛化 SR` 路线**比不过同实验室的 LC-MAPF/MAPF-GPT**（meta_iter_20000 实测≈经典 MARL 档），已转向：
-> - **头条贡献 = 通信**（软稀疏 entmax + 迟滞，抗边闪烁/受限带宽/稳定性），**不**比"泛化"。
-> - **骨干**：`CNN patch + GRU + 单轮 GAT` → **tokenized 观测 + Transformer（或时间维 Mamba + 体间注意力）**（transformer vs Mamba 待定）。
-> - **范式**：在线 DQfD(TD/n-step/selfplay/BFS-PBRS) → **离线 IL（专家动作监督/交叉熵）为主**（价值项作可选消融）。
-> - **Reptile 保留**，重定位为"通信策略对新环境的快速适应"；阶段三在线微调 → **离线 few-shot 适应评估**（对位 MAPF-GPT active fine-tuning）。
-> - 下文带 `[v3]` 标注的条目为现行；未标注但属旧范式（reward shaping/DQfD 损失/selfplay/阶段三在线）的内容在 v3 中**降为可选或废弃**。
+**现行方案（v5，2026-09-25）**：
+- **流水线只有两段**：① LaCAM 专家数据（训练期特权，只产专家动作）→ ② **离线模仿学习**（交叉熵）。
+  **没有在线阶段三、没有 reward、没有 DQfD 损失、没有 Q 头。**
+- **头条贡献 = 通信**（FOV 受限 + entmax 软稀疏 + 迟滞），**不**比"泛化"。
+- **骨干 = MADCL / `MAPFCommNet`**：残差 CNN → FOV 软稀疏通信（残差写回）→ 可插拔时间核 → 动作 logits。
+  时间核实测**用 GRU**（`temporal_backend: gru`）；Transformer / Mamba 都不是主线
+  （Mamba 的增益已查明是**前馈**的，与时序无关，见 SCHEDULE 已定论 21）。
+- **主模型 = MADCL-L，7.45M，`ckpt_il/capbig_iter_20000.pt`**；
+  推断 `sample` + `T=1.0` + `wait_bias=1.0` + `TTA`，12 档总分 **9.375**。
+- **元学习**：Reptile 保留（SQ2 零样本跨族迁移有效）；joint 是主模型用的模式；FOMAML 已放弃。
 
-旧流水线（v2，已被上面取代）：`LaCAM 专家 → DQfD 模仿（off-policy）→ Reptile 元学习 → 近 on-policy 微调`。
+**目标硬件（实测）**：**单卡 RTX 4080 SUPER 32G + 16 vCPU**（cgroup 80G 内存）。
+> ⚠️ 旧文写"2×RTX 5090 + 47 核"已不成立；双 GPU task-并行的设计随之废弃。
 
-网络（旧）：**共享参数的去中心化 Dueling DRQN（BiIntent-GAT-DRQN）**。**仍坚持**：每体只用自身局部观测、去中心化、**不用 QMIX/不构造 $Q_{tot}$**；v3 把 Q 头换成动作 logits + 交叉熵（离线 IL）。
-
-目标硬件：**2×RTX 5090 + 47 核 CPU**。
+**★ 2026-09-25：857G 专家数据已按用户要求删除。** 保留训练日志、`ckpt_il/`、`eval_v5/`、`dev_maps/`。
+⇒ **任何需要训练的作业先读 `DATA_REGEN.md` 重生成数据（约 14h，必须 lacam310）**；纯评测可直接跑。
+⇒ 重生成的数据与原数据**同分布但非同一份**，新臂**不能与历史臂做唯一变量对比**。
 
 ---
 
@@ -49,7 +54,16 @@ export all_proxy="socks5://127.0.0.1:20171"
 
 > 改动任何一条前，先在设计文档找到对应小节并同步更新。这些是项目里最容易被改坏、且改坏后症状隐蔽的地方。
 
-> **[v3 适用性]** 仍铁律：**1**(动作序)、**2**(只吃局部)、**3**(特权只训练期/LaCAM 只产专家数据)、**6**(目标方向是合法局部特征)、**10**(通信——现为**头条贡献**)。因转**离线 IL**而**废弃/降可选**：**4**(BFS-PBRS reward 纯 IL 不用)、**8**(Reptile 的 DQfD target)、**9**(on/off-policy 分工、阶段三 lag)、**11**(margin 过滤)、**12**(mellowmax α)、**13**(burn-in，取决于骨干)。**5/7** 随骨干换 tokenized 观测 + 交叉熵可能调整（观测语义保留、非法动作仍需屏蔽）。详见设计文档 §0′。
+> **[v5 适用性，2026-09-25]** **仍是铁律**：**1**(动作序 wait=0)、**2**(只吃局部)、**3**(特权只训练期；
+> cost2go 已放宽为合法局部特征)、**5**(观测通道，现 **5 通道**)、**6**(目标方向合法)、**7**(-inf 掩码)、
+> **10**(通信，**头条**)、**13**(整段展开 + episode 边界 `reset_comm_state()`)、**14**(曼哈顿只做诊断)。
+> **因转离线 IL 而废弃**：**4**(reward shaping)、**8**(Reptile 的 target 网络)、**9**(on/off-policy 分工)、
+> **11**(margin 过滤；其动机仍解释"单步准确率不是 CSR 的好代理")、**12**(mellowmax)。
+>
+> **设计文档 v5 新增三条硬约束（都是真金白银换来的）**：
+> **15 评测口径写死**（nothing/128 步/soft/validation-* 128 图/split=all；推断统一 sample+TTA）；
+> **16 超参不得跨臂强加**（`lr=1e-4` 是为 7.45M 选的，小网对照臂被迫跟用而被低估 0.227 ★）；
+> **17 默认值即协议**（探针脚本必须显式写死全部口径参数，已因此三次翻车）。
 
 1. **Pogema 动作顺序（已实测，勿凭记忆）**：
    `0=wait(0,0)`, `1=up(-1,0)`, `2=down(+1,0)`, `3=left(0,-1)`, `4=right(0,+1)`。
@@ -101,112 +115,128 @@ export all_proxy="socks5://127.0.0.1:20171"
 
 ---
 
-## 并行与进程布局
+## 并行与进程布局（单卡，2026-09-25 实测）
 
-**inner loop 是 K 步串行 SGD，单 task 内不可并行。** 并行只在两轴：
+**inner loop 是 K 步串行 SGD，单 task 内不可并行。** 现行只有一轴并行：
 
-- **轴 1｜CPU 多进程 env 采样**：`start_method=spawn`；env-worker **只做 CPU/env/观测构建，绝不创建 CUDA 上下文**；产 numpy 写入共享内存环形缓冲。
-- **轴 2｜双 GPU task-并行 Reptile**：两卡各跑一个**不同 task** 的完整 K 步 inner loop，meta-iter 末平均增量做一次 outer 更新。**用 task-并行而非逐步 DDP**（`batch_size=32`，且 Reptile 每 K 步才同步一次）。
-
-布局：
-```
-阶段二（预训练）
-  GPU0 trainer  ── task A inner loop (K 步 DQfD) ┐
-  GPU1 trainer  ── task B inner loop (K 步 DQfD) ┘→ 平均 Δ → outer 更新
-  ~40 env-worker（自游走 rollout+观测→共享内存 uint8）
-  ~4 LaCAM-worker（C++ 绑定）
-  ~3 核 prefetch/collator/主控
-
-阶段三（单目标地图微调，无 task 并行）
-  GPU0 = learner
-  GPU1 = batched 推理 actor（给数十并行 env 跑策略前向）
-  ~40 核并行 env（同步段采样，lag≤1）
-```
+- **CPU 多进程专家数据生成**：`start_method=spawn`；worker 只做 CPU/env/LaCAM，**绝不创建 CUDA 上下文**。
+  ★ **worker 数不超过 `nproc-4`**（本机 16 vCPU ⇒ ≤12），并配 `nice -n 19` / `ionice`
+  —— 曾开 15 个进程把用户的 vscode-ssh 挤掉线。
+- **训练是单卡单进程**（`--device cuda:0`）。双 GPU task-并行的设计已废弃（只有一张卡）。
+- **显存**：7.45M 训练峰值约 19.6 GiB（接入官方 CUDA scan 核后，此前 29.7 GiB）；
+  2.16M 约 8 GiB。**两个训练并跑会贴边 32 GiB，容易 OOM ⇒ 串行排队**。
 
 ---
 
-## 仓库结构与各模块职责
+## 仓库结构与各模块职责（2026-09-25 与代码核对）
 
 ```
-configs/      env_{random,warehouse,maze,room}.yaml, train_reptile_dqfd.yaml,
-              finetune_online.yaml, network_biintent_drqn.yaml
-envs/         pogema_env_wrapper（random 用 pogema 原生 generator；warehouse/maze/room 经 pogema-toolbox 加载）
-              / observation_builder(原生3通道+足迹通道+标量)
-              / action_mask(-inf) / reward_builder(BFS-PBRS) / potential_field(BFS 距离场)
-lacam/        lacam_runner(C++绑定) / lacam_dataset_builder / trajectory_converter(动作映射+可解释性过滤)
-              / hard_case_manager
-models/       encoders / communication(FOV内 软稀疏entmax+迟滞 双向意图注意力, top-k仅算力上限) / recurrent_core(GRU)
-              / q_heads(Dueling) / biintent_drqn(组装)
-losses/       q_target(masked mellowmax) / td_losses(1-step+n-step) / dqfd_losses(总损失)
-buffers/      expert_demo / selfplay / recent_online(lag≤1) / shared_rollout(连续内存)
-              / batch_collator
-trainers/     train_reptile_dqfd(双GPU task-并行) / finetune_online / evaluator(关专家介入) / scheduler(地图课程)
-utils/        metrics / profiler / checkpoint(meta/pretrained/finetuned/best) / seed / logger
-scripts/      generate_lacam_data / train_meta / finetune_target_map / evaluate_policy
+configs/      env_*.yaml｜network_*.yaml（gru_c2g 2.16M / **big 7.45M 主模型** / small_mamba /
+              big_mamba / small_gru_prenorm / 消融变体 small_mamba_{dtfix,fnorm,both,dconv1}）
+              train_il_*.yaml（离线 IL 配方；**主模型用 train_il_cap_lr1e4.yaml**）
+envs/         pogema_env_wrapper / observation_builder(原生3ch+足迹+cost2go) / action_mask(-inf)
+              potential_field(现只为 cost2go 与诊断) / map_registry / dataset_split / d4_augment / env_worker
+lacam/        lacam_runner(C++绑定，★必须 lacam310；已加 solver_seed 支持确定性求解)
+              lacam_dataset_builder / trajectory_converter / hard_case_manager
+models/       **mapf_comm_net（主网络组装入口）** / spatial_encoder(ResidualCNNEncoder)
+              communication(BiIntentAttention：entmax+迟滞) / temporal_core(可插拔时间核)
+              comm_baselines(6 个外部通信基线移植到同骨干) / obs_tokenizer / transformer_*
+losses/       **il_losses（现行：交叉熵 + wait 权重 + label smoothing）**
+buffers/      **expert_demo_buffer（现行，memmap 零拷贝）** / batch_collator
+trainers/     **train_il_reptile（ILReptileTrainer：joint / reptile / maml 三模式）** / evaluator / scheduler
+utils/        metrics / profiler / checkpoint / seed / logger
+scripts/      **train_il_meta（训练入口）** / **eval_bench（统一评测台）** / make_dev_maps(独立 dev 地图集)
+              generate_lacam_data、generate_expert_data(`--seed-start` 防重复) / make_sq1_table
+              run_sq2_adaptation / run_sq4_continual / run_mapfgpt_bench / check_episode_overlap / test_*
 ```
 
-DQfD 总损失：`L = λ_td·L_TD + λ_nstep·L_n + λ_margin·L_margin + λ_l2·||θ||²`。
+**⚠️ v2 遗留文件保留但不使用**：`losses/{dqfd,td,q_target}`、`buffers/{selfplay,recent_online,shared_rollout}`、
+`models/{biintent_drqn,q_heads,encoders,recurrent_core}`、`trainers/{train_reptile_dqfd,finetune_online,
+seed_actor,selfplay_producer}`、`envs/reward_builder`、`configs/{train_reptile_dqfd,finetune_online}.yaml`。
+**不要以为它们在跑。**
 
 ---
 
-## 环境与协议（2026-07-23，v4 实测，最高操作优先级）
+## 环境与协议（2026-09-25 实测，最高操作优先级）
 
-> **换服务器后完整交接见 `SCHEDULE.md` 顶部"服务器迁移交接"。** 以下是每次工作都要知道的硬事实：
+- **3 个 conda 环境**（注意路径，`ls /root/miniconda3/envs` 只看得到一个）：
+  | 环境 | 路径 | 用途 |
+  |---|---|---|
+  | **base** | `/root/miniconda3`（py3.12） | **训练 / 评测**，pogema 2.0.0a |
+  | `marlgpt` | **`/root/autodl-tmp/envs/marlgpt`** | MAPF-GPT / pogema-benchmark 复现，**pogema==1.4.0** |
+  | `lacam310` | `/root/miniconda3/envs/lacam310`（py3.10） | **只**生成专家数据 |
+  > 旧文写的 `gat` 环境**不存在**。
+- **★ LaCAM 致命坑**：`lacam/_lacam.so` 是 **py3.10 编译**，**py3.12 下 import 失败 →
+  `backend=auto` 静默回退到差得多的 prioritized 规划器**（污染专家数据、不报错）。
+  所有 LaCAM 数据生成**必须** `lacam310`。
+- **评测协议（写死）**：`on_target=nothing`、`max_episode_steps=128`、`collision_system=soft`、
+  `validation-*` 全 128 图、`split="all"`。主指标 CSR/ISR/SoC/makespan
+  （★ makespan **右censored 于 128**，失败记 128）。
+- **解码规则（本文的推断规则，基线用各自默认）**：`--action-mode sample`（**不是 argmax**，
+  argmax 会让共享参数策略在对称局面互锁）、`--base-temp 1.0`、`--wait-bias 1.0`、`--tta`。
+- **选模隔离**：检查点与解码超参**只在独立 dev 集上选**（`scripts/make_dev_maps.py`，64 图/族，
+  `DEV_SEED_BASE=7_000_000`），report 只用 `validation-*`。**不得用测试集选配置。**
+- **判性能只看 rollout，不看 loss**：loss ~2000 步就平台震荡，rollout CSR 涨到 20000+。
+  **别在 ≤25% 训练下结论。**
+- **root 所有不可写**：`checkpoints/`、`data/`、`logs/` → 用 `ckpt_il/`、`/root/autodl-tmp/`、scratchpad。
+- **进程**：多进程任务用 `setsid` 独立进程组，`kill -9 -- -PGID`
+  （`pkill -f 脚本名` 杀不掉 spawn 子进程，会留孤儿写坏数据）。
+  **等作业不要用 `pgrep -f 名字`**（会匹配到自己的 heredoc，曾空等 12 小时）——用 PID 文件 + `kill -0` 或产物文件。
 
-- **3 个 conda 环境**：`gat`（本仓库训练/评测，pogema 2.0.0a）；`marlgpt`（marl-gpt/MAPF-GPT/pogema-benchmark，**pogema==1.4.0**）；`lacam310`（**py3.10，只为生成专家数据**）。
-- **★ LaCAM 致命坑**：`lacam/_lacam.so` 是 **py3.10 编译**，py3.11 下 import 失败 → `backend=auto` **静默回退到差得多的 prioritized 规划器**（污染专家数据、不报错）。**所有 LaCAM 数据生成必须用 `lacam310` 环境**（`lacam_runner.py` 已加大声告警）。
-- **评测协议 = `on_target: nothing`**（标准 MAPF，到达即守位）、`max_episode_steps=128`、observation_type MAPF、CSR/ISR。这是 pogema-benchmark leaderboard（DCC/SCRIMP/MAMBA/LaCAM 已算好，可直接引用）与 MAPF-GPT 的协议。`finish`(到达消失) 训的模型在 `nothing` 下不守位 → CSR≈0。
-- **判性能只看 rollout，不看 loss**：训练 loss ~2000 步就平台震荡，但 rollout CSR 涨到 20000+。**别在 ≤25% 训练下结论。**
-- **v4 主线现状**：`il_joint`（MAPFCommNet 2.16M，5ch cost2go + full-flatten，joint，nothing）≈ DCC~SCRIMP 档、低于 MAPF-GPT-2M；**头条=通信消融**（通信在拥堵区 +0.2~0.5 CSR）。数据 `/data/lncosinx/chameleon_data/c2g_small/`，ckpt `ckpt_il/il_smallwarm_iter_20000.pt`。
-- **root 所有不可写**：`checkpoints/`、`data/`、`logs/` → 改用 `ckpt_il/`、`/data/...`、scratchpad。
-- **进程**：多进程数据生成/训练用 `setsid` 独立进程组，`kill -9 -- -PGID`（`pkill -f 脚本名` 杀不掉 spawn 子进程，会留孤儿写坏数据）。
+---
 
-## 命令（预期入口；实现后请校准）
-
-> 项目处于设计→实现阶段，以下为**预期**命令；新增/改名脚本时同步此节。
+## 命令（2026-09-25 校准）
 
 ```bash
-# 环境（已实测 pogema 1.4.0，注意 numpy 兼容）
-# pogema 自带 generator 只能生成 random 地图；
-# warehouse / maze / room 需经 pogema-toolbox 加载/生成
-git clone https://github.com/Cognitive-AI-Systems/pogema-toolbox.git
-cd pogema-toolbox
-pip install -e .          # 会一并拉入 pogema 依赖
-cd ..
-pip install torch numpy numba pyyaml
-# LaCAM 需单独构建并提供 Python 绑定（C++）
+# 阶段一：生成 LaCAM 专家数据 —— ★必须 lacam310，★worker ≤ nproc-4
+conda activate lacam310
+nice -n 19 python scripts/generate_lacam_data.py --map-type maze --num-agents 64 \
+  --num-episodes 20000 --seed-start <不相交段> --num-workers 12 --out <目录>
+# 数据已删除，重生成配方与逐族参数见 DATA_REGEN.md（含「校正 A」：c2g_a64 的 stats 标错了 map_type）
 
-# 阶段一：生成 LaCAM 专家数据（多进程）
-python scripts/generate_lacam_data.py --config configs/env_random.yaml --num-workers 4
+# 阶段二：离线 IL 训练（单卡）
+python -u scripts/train_il_meta.py --config configs/train_il_cap_lr1e4.yaml \
+  --network-config configs/network_big.yaml --data-dir <数据目录> \
+  --meta-iters 20000 --ckpt-milestones 2000,4000,...,20000 --seed 42 \
+  --tag <tag> --out ckpt_il/<tag>_latest.pt
 
-# 阶段二：DQfD + Reptile 元预训练（双 GPU task-并行 + 多进程 env）
-python scripts/train_meta.py --config configs/train_reptile_dqfd.yaml
+# 评测（统一评测台；★口径全部显式写死，不依赖默认值）
+python -u scripts/eval_bench.py --ckpt ckpt_il/capbig_iter_20000.pt \
+  --network-config configs/network_big.yaml \
+  --families random,mazes --agent-counts 8,16,24,32,48,64 \
+  --num-maps 128 --seeds 0,1,2 --max-steps 128 --on-target nothing \
+  --action-mode sample --base-temp 1.0 --wait-bias 1.0 --tta \
+  --out /root/autodl-tmp/eval_v5/<name>.json
+# 调超参时加 --maps-file /root/autodl-tmp/dev_maps（dev 集，64 图/族）
 
-# 阶段三：目标地图近 on-policy 微调
-python scripts/finetune_target_map.py --config configs/finetune_online.yaml --init <meta_ckpt>
-
-# 评估（务必关闭专家介入）
-python scripts/evaluate_policy.py --ckpt <finetuned_ckpt> --config configs/env_maze.yaml
+# 主表 + 逐基线判决
+python scripts/make_sq1_table.py --ours <json>:MADCL --metric CSR
 ```
 
 ---
 
-## 关键超参（默认值，来自设计文档）
+## 关键超参（主模型 `network_big.yaml` + `train_il_cap_lr1e4.yaml`）
 
 | 项 | 值 | 备注 |
 |---|---|---|
 | `obs_radius` / patch K | 5 / 11 | K = 2·r+1 |
-| `patch_channels` | 4 | 原生3 + 足迹1 |
+| `patch_channels` | **5** | 原生3 + 足迹 + **cost2go** |
 | `scalar_feat_dim` | 8 | 方向(2)+上一步动作(5)+到达(1) |
 | `num_actions` | 5 | wait,up,down,left,right |
-| `comm_radius` / `comm_topk` | 4 / 6 | r_c < obs_radius，FOV 内；选择用软稀疏+迟滞，topk 仅算力上限 |
-| `gru_hidden_dim` | 256 | DRQN 记忆 |
-| `inner_steps` / `inner_lr` / `meta_lr` | 5 / 3e-4 / 0.05 | Reptile |
-| `n_step` / `gamma` | 5 / 0.99 | |
-| `sequence_len` / `burn_in_len` | 32 / 8 | R2D2 burn-in |
-| `mellowmax_alpha` | 1.0 | 调参 {0.5,1,2}，勿用 0.1 |
-| `expert_ratio` | 0.9→0.5 | 阶段二课程式混合 |
-| `max_policy_version_lag` | 1 | 阶段三 |
+| `d_model` / `cnn_channels` / `n_res_blocks` | 320 / 128 / 3 | |
+| `comm_radius` / `comm_topk_cap` | 4 / 6 | r_c < obs_radius；topk **仅算力上限** |
+| `entmax_alpha` | 1.5 | 软稀疏 |
+| `tau_in` / `tau_out` / `stickiness_bonus` | 0.05 / 0.02 / 0.1 | 迟滞 |
+| `comm_dim` / `intent_dim` / `intent_mode` | 192 / 192 / `action` | |
+| `temporal_backend` / `temporal_layers` | `gru` / 2 | |
+| `batch_size` / `sequence_len` | 32 / 32 | |
+| `inner_lr` | **1e-4** | ★**只对 7.45M 合适**；2.16M 偏好 **5e-4**（见 INVARIANT 16） |
+| `inner_steps` / `tasks_per_meta` | 5 / 2 | |
+| `grad_clip` / `use_amp` | 10.0 / true | |
+| `reptile` | `false`（主模型 joint） | Reptile 臂用 true；`meta_lr` 0.1→0.01 |
+
+> **废弃的旧超参**：`gru_hidden_dim`、`n_step`/`gamma`、`burn_in_len`、`mellowmax_alpha`、
+> `expert_ratio`、`max_policy_version_lag` —— 都属 DQfD / 在线阶段三，v5 不用。
 
 ---
 
@@ -215,8 +245,12 @@ python scripts/evaluate_policy.py --ckpt <finetuned_ckpt> --config configs/env_m
 - 所有可调项进 `configs/*.yaml`，勿硬编码。
 - 全程固定随机种子（`utils/seed.py`），保证可复现。
 - 任何性能改动**先跑 `utils/profiler.py`**，按占比改，改完用 §5 指标确认 SR/Deadlock/WaitRate 不退化。
-- 指标必须能定位问题来源（任务效果/路径质量/冲突死锁/学习稳定性/Q诊断/模仿/通信/系统八类）；新增模块同时补对应指标。
-- checkpoint 分四类保存：meta-init / pretrained-DQfD / finetuned / best-eval。
+- 指标必须能定位问题来源（任务效果/路径质量/冲突死锁/学习稳定性/模仿/通信/系统**七类**；
+  **Q 值诊断整类已废弃**——没有 Q 头）。新增模块同时补对应指标。
+- checkpoint 按 `--ckpt-milestones` 存里程碑 + `_latest.pt`（v2 的四类命名已不用）。
+- **阴性结论要给上界，不要只说"不显著"**（例："效应 ≤ 基准的 8%，95% 置信"）。
+- **差值必须报合并 CI**；落在 CI 内写"打平"，不得写"反超"。
+- **先算功效再花算力**：SQ3 曾计划 512 图重跑，功效计算显示某臂需 968× 样本 ⇒ 直接放弃，省 20h。
 
 ---
 
@@ -224,13 +258,18 @@ python scripts/evaluate_policy.py --ckpt <finetuned_ckpt> --config configs/env_m
 
 - [ ] 动作 0 是 wait 吗？（不是最后一位）
 - [ ] policy 输入是否混进了任何全局/未来/他体信息？
-- [ ] reward 是否用了 BFS 势函数形式、而**不是**点积对齐或曼哈顿势函数？
+- [ ] ~~reward 形式~~（v5 无 reward；纯 IL 只有交叉熵）
 - [ ] 观测是否误加了与原生 ch2 重复的目标投影通道？
-- [ ] Reptile inner loop 的 target 是否冻结于 θ_meta？
-- [ ] 阶段三是否真做到 lag≤1、用完即同步？
+- [ ] ~~Reptile target 网络~~ / ~~阶段三 lag≤1~~（v5 均已废弃）
+- [ ] **评测是否显式写死了全部口径参数**（不依赖任何默认值）？dev 与 test 有没有混用？
+- [ ] **两臂是否各自在自己的最优 lr 下**？（别把治疗组的超参强加给对照组）
+- [ ] 引用历史结果前**查过文件 mtime** 吗？（记录的 args ≠ 当时生效的行为，已三次翻车）
+- [ ] 等作业是否用了 PID 文件 + `kill -0`，而**不是** `pgrep -f 名字`？（自匹配曾空等 12h）
+- [ ] 多进程 worker 数是否 ≤ `nproc-4` 并加了 `nice`？
 - [ ] 非法动作是否用 `-inf` 掩码？
 - [ ] env-worker 里是否误建了 CUDA 上下文？
 - [ ] 热路径是否残留 per-agent/per-step 的 Python 循环？
 - [x] 通信邻居选择是否用了软稀疏+迟滞（而非 hard top-k 做选择）？EdgeFlipRate 是否在监控？
 - [ ] 训练/评估地图是否互不相交？（地图直接取自 when-to-switch 全部 231 张 `when-to-switch/pomapf_env/maps.yaml`，**全池不分类别**、全局 8:2 划 train/test（184/47），见 `envs/map_registry.py`。配置 `map_name: "all"`；想只用某族改成正则前缀如 `random-`。`PogemaWrapper(split=...)` 默认 'train'，评估脚本须传 `split='test'`。`pick_map` 用乘法哈希按 seed 取图（连续 seed 跨族分布、确定性）。`envs/dataset_split.py` 把 train/test 的 seed 段隔开保证评估可复现。)
 - [ ] 是否在没 profile 的情况下就动手写 Rust？（不要）
+- [ ] 需要训练的作业：**数据已删**，是否先读了 `DATA_REGEN.md`（含 `c2g_a64` 的 map_type 标错）？
