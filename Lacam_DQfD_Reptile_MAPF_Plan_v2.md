@@ -1,678 +1,433 @@
-# 基于 LaCAM-DQfD-Reptile 的部分可观测多智能体路径规划方案说明（修订版 v2）
+# MADCL：部分可观测多智能体路径规划方案说明（v5，2026-09-25）
 
-> **本版相对 v1 的主要改动（changelog）**
+> **本文件是设计与方法的事实来源。** 滚动的实验记录与结论在 `SCHEDULE.md`（§6.5「已定论」），
+> 每次工作都要读的操作性摘要在 `CLAUDE.md`。三者冲突时：**实验事实以 SCHEDULE 为准，
+> 方法与不变式以本文件为准，操作细节以 CLAUDE.md 为准**；修改设计决策时三处一并更新。
 >
-> 1. **奖励**：删除"动作方向对齐点积奖励"（非势函数、会偏置最优策略）。改用 **BFS 真实测地距离的势函数 shaping（PBRS）**，并给出"严格局部奖励"的退化备选。明确论证 reward shaping 使用全局信息 **不破坏部分可观测性**。
-> 2. **观测**：按 Pogema 1.4.0 **实测**的原生观测格式重写。原生观测为 `(3, 11, 11)`：障碍物 / 智能体（自身恒在中心）/ 目标边界投影。v1 自创的"channel 4 目标投影"与 Pogema 原生 channel 2 **重复**，已删除。足迹通道与标量特征为 wrapper 追加。
-> 3. **动作空间**：按 Pogema 实测顺序修正为 `0=wait, 1=up, 2=down, 3=left, 4=right`（wait 在 **第 0 位**，而非 v1 的最后一位）。掩码、专家动作转换、one-hot 全部对齐。
-> 4. **Reptile + target 网络**：明确 target 在每个 inner loop 内 **冻结于 θ_meta**，每个 task 起始重置；阶段三微调采用周期性 target 同步。
-> 5. **阶段三**：由"replay + 版本滞后 ≤2"改为 **低滞后同步式近 on-policy（lag ≤ 1）**，避免权重滞后导致的不收敛/慢收敛。明确阶段二（DQfD）必须 off-policy、阶段三转 near-on-policy 的分工。
-> 6. **mellowmax**：删除 `alpha=0.1`（过小→近 hard max→易高估）。改为扫描 `α∈{0.5,1,2}`，按 `Q_max/Q_mean` 走势选取。
-> 7. **通信**：约束 `r_c < obs_radius`，仅与视野内智能体通信；邻居选择改为 **软稀疏注意力(entmax)+迟滞**，`top-k` 降级为纯算力上限（更正早期"top-k 抑制雪崩"的措辞——hard top-k 会引入通信图闪烁）。规模由 FOV+稀疏控制，时间稳定性由迟滞/软化保证。
-> 8. **循环回放**：新增 **R2D2 式 burn-in**，缓解隐状态陈旧。
-> 9. **预训练混合比例**：由固定 70/30 改为 **课程式**（早期专家为主，后期逐步增加自游走）。
-> 10. **大幅扩写第 4 章「训练速度优化」**：新增 **语言选型（为何绝大部分用 Python、Rust 非杠杆，编译顺序 numpy→numba→Rust）**、**元学习两层并行（CPU 多进程采样 + 双 GPU task-并行 Reptile）**、**目标硬件 2×RTX 5090 + 47 核的进程布局（阶段二/阶段三）**，以及 launch-受限的诊断分流；保留吞吐目标、瓶颈顺序与 GAT 降级备选。
-> 11. **预期结果**：所有量化数字降级为 **待验证假设**；新增 **held-out 地图族** 以真正检验泛化。
-> 12. 正文公式全部改写为可渲染 LaTeX（替代 v1 的图片占位符）。
+> **⚠️ v2→v5 的落差提示**：本文件在 2026-06-26 到 2026-09-25 之间未同步，
+> 而这段时间方法已换过两次范式。旧 v2 正文（DQfD / 在线 RL / Dueling Q / 双 GPU 布局）
+> 已整体移入 §9 归档，**不再是现行方案**。
 
 ---
 
-## 0′. v3 战略转向（2026-06-15，最高优先级，覆盖下文冲突处）
+## 变更摘要（v2 → v5）
 
-> 本节是当前生效的方向。与下文 v2 正文冲突时**以本节为准**；下文相关小节已标注 `[v3 superseded]`。本节记录**为什么转**、**转去哪**、以及**哪些已定 / 哪些待定**。
-
-**触发（竞品分析结论）**：同实验室（CogAI/AIRI，Skrynnik 等）的系列工作已占据本赛道——`When-to-Switch`（学习+搜索混合）、`MAPF-GPT`（transformer 基础模型，~10 亿 (obs,action) 离线 IL）、`LC-MAPF`（MAPF-GPT + 多轮通信，learnable decentralized SOTA）。本项目 `meta_iter_20000` 在 POGEMA 一次性 MAPF 上实测 **≈ 经典 MARL(QMIX/QPLEX) 档**（CSR≈0、ISR/AR 0.45-0.65），**远低于 SCRIMP/DCC/LC-MAPF**。结论：**用 CNN+GRU 骨干 + ~10× 更少数据、在人家造的 benchmark 上比"泛化/刷 SR"，赢不了**。故转向。
-
-**新论文定位（已定）**：
-- **头条贡献 = 通信本身**，不是"泛化/通用元模型"（"泛化"是 LC-MAPF 的头号卖点，不与其正面比）。具体押 **软稀疏(entmax)+迟滞 的通信图时间稳定性（抗边闪烁 EdgeFlipRate）/ 通信效率 / 受限或有损通信下的鲁棒性**——LC-MAPF 的 4 轮 dense message passing 没专门处理这些。
-- **骨干现代化**：`CNN patch + GRU + 单轮 GAT` → **tokenized 观测 + Transformer（或 时间维 Mamba/SSM + 体间注意力）**。动机：① 小卷积在 5090 上吃不满 tensor core、是当前训练大头；② transformer 是该领域 SOTA 骨干、且离线训练 GPU 友好；③ 是被严肃对待的"入场券"。**换骨干是入场券、不是贡献**。
-- **训练范式**：转向 **离线 IL（对专家动作做监督/交叉熵，MAPF-GPT 式）为主**——可去掉在线 RL 机器（DQfD 的 TD/n-step、selfplay、BFS-PBRS reward 在纯 IL 下不参与），换来又快又简单的 dataloader→transformer 训练。
-- **Reptile 保留**，但**重新定位为"通信策略对新环境的快速适应"**（meta×communication 交叉点），**不**包装成"泛化"。前提：**必须保留一个适应评估**（见下），否则 Reptile 无意义（meta-init 不适应 ≈ 还不如直接多任务联合训练）。
-- **阶段三在线 near-on-policy 微调 → 改为离线 few-shot 适应评估**：在 held-out 地图族上比 "普通预训练→微调" vs "Reptile-init→微调" 的适应速度/数据量，并对位 `MAPF-GPT active fine-tuning`（IROS 2025）这条 baseline。
-
-**待定（不要在代码/文档里写死，需先定）**：
-- **Transformer vs Mamba/SSM** 作骨干（倾向 transformer=主流可比；Mamba 更省、若 MAPF 未被做过可作小新意，但有撞车风险）。
-- **是否保留一点 DQfD 价值项**（纯 IL vs IL+轻量 TD grounding）——默认先做纯 IL，价值项作为可选消融。
-- 通信贡献的最终窄口（稳定性 / 受限带宽 / 有损 / 异步 选一主打）。
-
-**仍然有效（与骨干/范式无关，继续遵守）**：INVARIANT 1（动作序 wait=0）、2（policy 只吃局部）、3（特权信号只训练期：LaCAM 仍只产专家数据）、10（通信只与 FOV 内邻居、软稀疏+迟滞、非 hard top-k、监控 EdgeFlipRate——现在是**头条**）、第 5 章评价指标、阶段一 LaCAM 专家数据生成。
-
-**因转范式而废弃/降级**：BFS-PBRS reward（§3.3 INVARIANT 4，纯 IL 不用）、DQfD 的 TD/n-step/mellowmax/双 buffer 课程混合（§3.3.3 / §4 损失，降为可选消融）、selfplay 自游走子系统、阶段三在线 near-on-policy（§3.6，改离线 few-shot）。下文这些小节标 `[v3 superseded]`。
-
-**基线（必须对照）**：公开有代码的 SCRIMP / DCC / MAPF-GPT（仓库 `pogema-benchmark/` 内有它们的 POGEMA 结果），适应性对位 active fine-tuning。LC-MAPF 盲审无源码，只能对其论文报的 POGEMA 曲线。
+| # | 项 | v2（2026-06） | **v5（现行）** |
+|---|---|---|---|
+| 1 | **训练范式** | DQfD（TD + n-step + margin）+ 在线 RL 三阶段 | **纯离线模仿学习**：对 LaCAM 专家动作做交叉熵 |
+| 2 | **输出头** | Dueling Q（5 维 Q 值） | **动作 logits（5 维）+ 交叉熵** |
+| 3 | **奖励** | BFS 势函数 shaping（PBRS） | **不用奖励**（纯 IL 无 reward 项） |
+| 4 | **阶段三** | 在线 near-on-policy 微调（lag ≤ 1） | **废弃**，改为离线 few-shot 适应评估（SQ2） |
+| 5 | **观测通道** | 4 通道（原生 3 + 足迹） | **5 通道**（+ cost2go，INVARIANT 3 已放宽） |
+| 6 | **骨干** | Patch CNN + 单轮 GAT + GRU | **残差 CNN + FOV 软稀疏通信 + 时间核**（时间核可插拔：gru / gru_prenorm / mamba / transformer） |
+| 7 | **硬件** | 2×RTX 5090 + 47 核 | **单卡 4080S 32G + 16 vCPU**（cgroup 80G 内存） |
+| 8 | **主模型** | 未定 | **MADCL-L：GRU 7.45M @ iter 20000** |
+| 9 | **评测协议** | `on_target=finish`、512 步 | **`on_target=nothing`、128 步、soft 碰撞、validation-* 128 图**（写死不再改） |
+| 10 | **元学习** | Reptile（含 target 网络处理） | Reptile 保留（SQ2），**新增 joint 与 FOMAML 两个对照臂**；FOMAML 已放弃 |
+| 11 | **选模** | 未规定 | **独立 dev 地图集**（`make_dev_maps.py`）选检查点与解码超参，report 只用 validation-* |
+| 12 | **科学问题** | 无 | **SQ1~SQ4 四条主线**（见 §7） |
 
 ---
 
-## 0. 方案定位
+## 0. 定位（v5 现行）
 
-本方案面向基于 **Pogema** 网格环境的部分可观测多智能体路径规划（MAPF）任务。环境部分可观测：每个智能体仅能使用自身局部视野（FOV）内的信息决策，**不能访问全局地图、全局最短路距离场、或全局规划器输出的未来轨迹**。
+基于 **POGEMA** 网格环境的**部分可观测多智能体路径规划**。每体只用自身 FOV 内信息决策，
+去中心化、共享参数、**不构造 $Q_{tot}$、不用 QMIX**。
 
-训练不从纯随机探索开始，而是：利用 **LaCAM** 生成专家轨迹，通过 **DQfD** 损失进行模仿学习；在四种地图分布上用 **Reptile** 元学习得到可快速适应的初始化参数 $\theta^\*$；最终在特定目标地图上以 **低滞后近 on-policy** 微调，降低离线回放导致的策略滞后。
+**流水线只有两段**：
 
-网络采用**共享参数的去中心化 DQN**：每个智能体根据自身局部观测输出动作价值函数 $Q$。**不使用 QMIX，不构建中心化联合值函数 $Q_{tot}$。**
+```
+① LaCAM 专家数据生成（训练期特权，只产专家动作）
+      ↓
+② 离线模仿学习（交叉熵）—— joint 或 Reptile 元初始化
+      ↓
+   评测：POGEMA 标准协议 + 解码规则（采样 + wait_bias + TTA）
+```
 
-> **已知局限（如实声明）**：去中心化独立 Q 学习（IQL 式）在多智能体下存在 **非平稳性**——他人策略变化使每个智能体面对的环境非平稳，破坏单体 Q 学习的收敛保证。本方案以**双向意图通信**部分缓解，但不消除该问题。最接近的先行工作是 PRIMAL/PRIMAL2（IL+RL+共享参数去中心化），建议作为 baseline 对照。
+**头条贡献 = 通信**（FOV 受限 + entmax 软稀疏 + 迟滞），不比"泛化"。
+理由与竞品分析见 §9.1（v3 战略转向原文，仍然有效）。
 
-> **目标规模**（与 v1 一致，沿用 Pogema 配置）：`map_size=64, num_agents=96, obs_radius=5, max_episode_steps=512, obstacle_density=0.3`。`obs_radius=5` ⟹ 局部 patch 边长 $K=2\cdot5+1=11$。
+**诚实边界**：主模型对 SCRIMP 在 mazes 赢、random 平；对 MAPF-GPT（2M / 85M）输，
+按**参数 × 数据双轴 Pareto** 陈述而非"我们更强"。详见 `SCHEDULE.md` §6.5「当前主表」。
 
 ---
 
-## 1. 文件命名与作用
+## 1. 不可违反的硬约束（INVARIANTS，v5 现行）
 
-### 1.1 总体目录结构
+> 改动任何一条前，先在本文件找到对应小节并同步更新。带 ~~删除线~~ 的是因范式转换而废弃的。
+
+1. **POGEMA 动作顺序（实测，勿凭记忆）**：`0=wait`, `1=up(-1,0)`, `2=down(+1,0)`, `3=left(0,-1)`, `4=right(0,+1)`。
+   **wait 在第 0 位。** one-hot、动作掩码、LaCAM 动作转换、logits 语义全部以此为准。
+   改顺序会让模仿学习整体错位**且不报错**。
+2. **部分可观测**：policy 输入**仅** `(C,11,11) patch + 8 维标量`（C=5）。
+   严禁全局地图、**整幅**全局距离场、LaCAM 路径、他体未来轨迹进 policy。
+3. **特权信号只在训练期**：LaCAM 只产专家动作，部署期无 LaCAM。
+   **[v4 放宽]** **cost2go（FOV 内 BFS 测地距离场的局部裁剪）是合法局部特征、可进 policy**（channel 4）。
+   理由：所有对比 baseline（EPH / MAPF-GPT / SCRIMP）都喂障碍感知的目标梯度；
+   只给穿墙方向向量会导致 mazes SR=0、纯 IL 塌缩成直线策略。
+   **全局 BFS 距离场整幅、他体路径、LaCAM 路径仍严禁进 policy。**
+4. ~~**Reward = BFS 势函数 shaping（PBRS）**~~ —— **v5 废弃**：纯 IL 无 reward 项。
+   历史约束保留在 §9 供追溯（其中「禁止用曼哈顿距离做势函数」的理由仍有参考价值）。
+5. **观测通道**：POGEMA 原生 `(3,11,11)` = 障碍 / 智能体（自身恒在中心格）/ 目标边界投影；
+   本仓库追加 **ch3 = 时间衰减自身足迹**（[0,0.8]，当前位置 1.0）、**ch4 = cost2go**（[0,1]，0.5=同距）。
+   ⇒ `patch_channels=5`。**禁止再加与原生 ch2 重复的"目标投影通道"**；自身位置已由 ch1 中心格表达。
+6. **目标相对方向是合法局部特征**（`get_targets_xy`）——不是全局泄露。
+7. **非法动作掩码 = `-float('inf')`**，不是有限大负常数。须保证每体至少 1 个合法动作（wait 通常恒合法）。
+8. ~~**Reptile 的 target 网络冻结于 θ_meta**~~ —— **v5 废弃**（无 target 网络，纯 IL）。
+9. ~~**on/off-policy 分工**~~ —— **v5 废弃**（无在线阶段）。
+10. **通信约束**：`comm_radius=4 < obs_radius=5`，**只与 FOV 内可见邻居通信**。
+    邻居选择用**软稀疏注意力（entmax α=1.5）+ 迟滞（τ_out=0.02 < τ_in=0.05）**，
+    **不用 hard top-k 做选择**——hard top-k 会引起通信图闪烁（边界排名交换 → 边反复通断）。
+    `comm_topk_cap=6` 仅是**算力上限**。监控 `EdgeFlipRate`。
+    > **⚠️ 实测修正（已定论 24）**：出货配置下 **迟滞把 entmax 的稀疏性抵消了** ——
+    > 真实度数 dense 5.911 / entmax 无迟滞 4.118 / **entmax+迟滞 5.877（仅比 dense 少 0.6%）**。
+    > 故「软稀疏省带宽」在出货配置下**不成立**；可立住的是通信必要性与迟滞降低闪烁（同机制内 −19.6%）。
+11. ~~**专家 margin 样本过滤**~~ —— margin loss 已废弃；但其动机（同一局部观测下专家动作不唯一）
+    仍解释为何**单步模仿准确率不是 CSR 的好代理**（见 §7.2）。
+    现行的对应旋钮是 `il_wait_weight`（专家数据 wait 占 ~50%），**实测降权无效**（已定论 15）。
+12. ~~**mellowmax α**~~ —— 废弃（无 Q 目标）。
+13. **循环回放 burn-in**：GRU 类时间核在训练时按 `sequence_len=32` 整段展开；
+    评测期逐步推进并在 episode 边界 `reset_comm_state()`（同时重置通信迟滞与时间核状态）。
+14. **诊断用曼哈顿距离 ≠ 训练信号**：事后诊断可用，绝不进策略内部目标。
+15. **[v5 新增] 评测口径写死**：`on_target=nothing`、`max_episode_steps=128`、`collision_system=soft`、
+    `validation-*` 全 128 图、`split="all"`（不重映射 seed，保证与 leaderboard 逐实例配对）。
+    **推断规则统一为采样**（`--action-mode sample`，`base_temp=1.0`）**+ TTA**，所有臂一致（含基线消融）。
+16. **[v5 新增] 超参不得跨臂强加**：为治疗组选的超参不能强加给对照组。
+    实测教训：`inner_lr=1e-4` 是为 7.45M 选的（大网 5e-4 第 250 步塌缩），
+    小网对照臂被迫跟用而被系统性低估 **0.227（显著）**，导致「等步数加容量就赢」这一结论失效（已定论 23）。
+17. **[v5 新增] 默认值即协议**：评测台每个默认值都是一份隐式协议。
+    探针脚本必须**显式写死全部口径参数**，不得依赖默认值。已因此三次翻车（见 §7.1）。
+
+---
+
+## 2. 目录结构与模块职责（2026-09-25 与代码核对）
 
 ```
-mapf_lacam_dqfd_reptile/
-├── configs/
-│   ├── env_random.yaml
-│   ├── env_warehouse.yaml
-│   ├── env_maze.yaml
-│   ├── env_room.yaml
-│   ├── train_reptile_dqfd.yaml
-│   ├── finetune_online.yaml
-│   └── network_biintent_drqn.yaml
-│
-├── envs/
-│   ├── pogema_env_wrapper.py
-│   ├── observation_builder.py     # 在 Pogema 原生 3 通道之上追加足迹通道与标量特征
-│   ├── action_mask.py
-│   ├── reward_builder.py          # BFS 势函数 shaping（训练时特权信号）
-│   └── potential_field.py         # 训练时按地图预计算 BFS 测地距离场（每个 goal 一张）
-│
-├── lacam/
-│   ├── lacam_runner.py
-│   ├── lacam_dataset_builder.py
-│   ├── trajectory_converter.py
-│   └── hard_case_manager.py
-│
-├── models/
-│   ├── encoders.py
-│   ├── communication.py
-│   ├── recurrent_core.py
-│   ├── q_heads.py
-│   └── biintent_drqn.py
-│
-├── losses/
-│   ├── td_losses.py
-│   ├── dqfd_losses.py
-│   └── q_target.py
-│
-├── buffers/
-│   ├── expert_demo_buffer.py
-│   ├── selfplay_buffer.py         # 阶段二自游走数据
-│   ├── recent_online_buffer.py    # 阶段三低滞后近 on-policy
-│   ├── shared_rollout_buffer.py
-│   └── batch_collator.py
-│
-├── trainers/
-│   ├── train_reptile_dqfd.py
-│   ├── finetune_online.py
-│   ├── evaluator.py
-│   └── scheduler.py
-│
-├── utils/
-│   ├── metrics.py
-│   ├── profiler.py
-│   ├── checkpoint.py
-│   ├── seed.py
-│   └── logger.py
-│
-└── scripts/
-    ├── generate_lacam_data.py
-    ├── train_meta.py
-    ├── finetune_target_map.py
-    └── evaluate_policy.py
+configs/      env_*.yaml（random/mazes/maze/warehouse/room/street/sc1/wc3 + *_small/*_nothing/*_bench）
+              network_*.yaml   骨干与规模：gru_c2g(2.16M) / big(7.45M，主模型) / xl(16.9M，弃)
+                               small_mamba(2.22M) / big_mamba(7.57M) / small_gru_prenorm / transformer
+                               消融变体：small_mamba_{dtfix,fnorm,both,dconv1}、arm{T,S}
+              train_il_*.yaml  离线 IL 训练配方（cap_lr{1e4,2e4,5e4} / joint / reptile / v5* / v6* / waitw）
+              train_reptile_dqfd.yaml、finetune_online.yaml  ← v2 遗留，已不用
+envs/         pogema_env_wrapper（random 用 POGEMA 原生 generator；其余经 pogema-toolbox）
+              observation_builder（原生 3ch + 足迹 + cost2go，`use_cost2go` 开关）
+              action_mask（-inf）/ potential_field（BFS 距离场，现只为 cost2go 与诊断）
+              map_registry / dataset_split（train/test seed 段隔离）/ d4_augment（D4 对称增强）
+              env_worker（多进程采样）/ reward_builder ← v2 遗留，纯 IL 不用
+lacam/        lacam_runner（C++ 绑定，★必须用 lacam310 环境）/ lacam_dataset_builder
+              trajectory_converter（动作映射）/ hard_case_manager / _lacam.so（py3.10 编译）
+models/       mapf_comm_net（**主网络 MAPFCommNet，v5 组装入口**）
+              spatial_encoder（ResidualCNNEncoder）/ communication（BiIntentAttention：entmax + 迟滞）
+              temporal_core（可插拔时间核：gru / gru_prenorm / mamba / transformer）
+              comm_baselines（6 个外部通信基线移植到同骨干）/ obs_tokenizer / transformer_*
+              biintent_drqn / q_heads / encoders / recurrent_core ← v2 遗留
+losses/       il_losses（**现行**：交叉熵 + wait 权重 + label smoothing）
+              dqfd_losses / td_losses / q_target ← v2 遗留，已不用
+buffers/      expert_demo_buffer（**现行**，支持 memmap 零拷贝挂载）/ batch_collator
+              selfplay_buffer / recent_online_buffer / shared_rollout_buffer ← v2 遗留
+trainers/     train_il_reptile（**现行 ILReptileTrainer**：joint / reptile / maml 三模式）
+              evaluator / scheduler / seed_actor / selfplay_producer / finetune_online / train_reptile_dqfd ← 遗留
+utils/        metrics / profiler / checkpoint / seed / logger
+scripts/      train_il_meta（**训练入口**）/ eval_bench（**统一评测台**）
+              generate_lacam_data、generate_expert_data（`--seed-start` 防重复）/ generate_dagger_data
+              make_dev_maps（**独立 dev 地图集**，DEV_SEED_BASE=7_000_000）
+              make_sq1_table（主表 + 逐基线判决）/ run_sq2_adaptation / run_sq4_continual
+              run_mapfgpt_bench（marlgpt 环境复现 MAPF-GPT）/ probe_generalization
+              check_episode_overlap（首帧哈希查重）/ test_*（单测与阶段门）
 ```
 
-### 1.2 configs/
+**⚠️ v2 遗留文件保留但不使用**：`losses/{dqfd,td,q_target}`、`buffers/{selfplay,recent_online}`、
+`models/{biintent_drqn,q_heads}`、`trainers/{train_reptile_dqfd,finetune_online}`、`envs/reward_builder`。
+保留是为可追溯与将来做「IL + 轻量 TD grounding」消融；**不要以为它们在跑**。
 
-#### configs/env_random.yaml
-```yaml
-map_type: random
-map_size: 64
-num_agents: 96
-obs_radius: 5          # ⟹ patch 边长 K = 11
-max_episode_steps: 512
-obstacle_density: 0.3
-```
+### 三个 conda 环境（不可混用）
 
-#### configs/env_warehouse.yaml / env_maze.yaml / env_room.yaml
-分别定义 Pogema 的 warehouse（规则货架、窄通道、瓶颈）、maze（长通道、多转角，考验记忆与死锁恢复）、room（房间+门洞，考验门口协同）三类地图。**注意：pogema 自带 generator 只能生成 random 地图；warehouse/maze/room 需经 `pogema-toolbox` 加载/生成**（见安装说明）。结构参数沿用 pogema-toolbox 各地图的默认/标定值。
-
-#### configs/train_reptile_dqfd.yaml
-```yaml
-meta_iterations: 20000
-inner_steps: 5
-inner_lr: 0.0003
-meta_lr: 0.05
-batch_size: 32
-sequence_len: 32
-burn_in_len: 8         # 新增：R2D2 式隐状态重建步数
-gamma: 0.99
-n_step: 5
-lambda_td: 1.0
-lambda_nstep: 1.0
-lambda_margin: 1.0
-lambda_l2: 0.00001
-margin: 0.5
-mellowmax_alpha: 1.0   # 修正：删除 0.1，先取 1.0，按 Q_max/Q_mean 在 {0.5,1,2} 中调
-# 阶段二专家/自游走混合比例改为课程式（见 3.3.1）
-expert_ratio_start: 0.9
-expert_ratio_end: 0.5
-expert_ratio_decay_iters: 8000
-# 并行（见 §4.4 / §4.5），目标硬件 2×RTX 5090 + 47 核
-parallel:
-  task_parallel_gpus: [0, 1]   # 双卡 task-并行 Reptile：两卡各跑一个 task 的 inner loop
-  num_env_workers: 40          # CPU 多进程 env/观测构建（spawn，不碰 CUDA）
-  num_lacam_workers: 4         # C++ 绑定，按需生成/介入
-  start_method: spawn
-  shared_buffer_dtype: uint8   # patch 共享内存 zero-copy，禁用 pickle
-  use_amp: true
-  use_torch_compile: true      # + CUDA graphs，砍 kernel launch 开销
-```
-
-#### configs/finetune_online.yaml
-```yaml
-# 阶段三：低滞后同步式近 on-policy
-rollout_segment_len: 32     # 每段同步采样长度
-num_parallel_envs: 64
-max_policy_version_lag: 1   # 修正：由 2 收紧到 1（同步段内权重冻结）
-sync_after_each_segment: true
-reuse_epochs_per_segment: 1 # 近 on-policy：每段数据基本只用 1 次
-expert_prob_start: 0.5
-expert_prob_end: 0.02
-expert_decay_steps: 200000
-lambda_margin_start: 1.0
-lambda_margin_end: 0.0       # 末期专家项归零，退化为纯近 on-policy Q 学习
-```
-
-#### configs/network_biintent_drqn.yaml
-```yaml
-obs_radius: 5
-patch_channels: 4      # Pogema 原生 3 通道 + 追加足迹通道 1
-cnn_channels: [32, 64, 64]
-scalar_feat_dim: 8     # 目标相对方向(2)+上一步动作 one-hot(5)+到达标志(1)
-intent_dim: 64
-comm_dim: 64
-comm_radius: 4         # 修正：r_c < obs_radius(=5)，且仅与视野内邻居通信
-comm_topk: 6           # 仅算力上限(封顶 GAT 计算量)；邻居选择用软稀疏+迟滞，非"抑制雪崩"
-gru_hidden_dim: 256
-dueling_hidden_dim: 256
-num_actions: 5
-num_attention_heads: 4
-```
-
-**动作空间（按 Pogema 1.4.0 实测，`GridConfig.MOVES`）**：
-
-| action_id | 含义 | (drow, dcol) |
+| 环境 | 用途 | 关键约束 |
 |---|---|---|
-| 0 | wait | (0, 0) |
-| 1 | up | (−1, 0) |
-| 2 | down | (+1, 0) |
-| 3 | left | (0, −1) |
-| 4 | right | (0, +1) |
+| 默认（`/root/miniconda3`，py3.12） | 训练 / 评测 | pogema 2.0.0a；`mamba-ssm 2.3.2.post1` 已装（内核可用） |
+| `marlgpt` | MAPF-GPT / pogema-benchmark 复现 | **pogema==1.4.0** |
+| `lacam310` | **只**生成专家数据 | **py3.10**；`_lacam.so` 是 py3.10 编译 |
 
-> ⚠️ 注意 wait 是 **action 0**，与 v1 文档相反。所有 one-hot、掩码、专家转换均以此为准。
-
-### 1.3 envs/
-
-#### envs/pogema_env_wrapper.py
-封装 Pogema，统一训练 / 专家数据生成 / 评估接口。功能：创建 random/warehouse/maze/room 四类地图；设置 agent 数、尺寸、障碍密度、最大步数；返回每体局部观测；记录 episode 成功率、碰撞、停滞、路径长度；支持 policy rollout 与 LaCAM expert rollout。
-
-环境建模为部分可观测多智能体决策过程 $\langle N, \mathcal{S}, \{\mathcal{A}_i\}, \{O_i\}, P, R, \gamma\rangle$，其中 $N$ 为智能体数，$o_i^t = O_i(s^t)$ 为第 $i$ 体在 $t$ 时刻的局部观测。
-
-#### envs/observation_builder.py — **按 Pogema 实测重写**
-
-**Pogema 1.4.0 原生观测**为每体一个 `(3, K, K)` float32 张量（实测确认）：
-
-- **channel 0｜障碍物**：FOV 内障碍（含越界 padding 为 1）；
-- **channel 1｜智能体**：FOV 内所有智能体，**自身恒在中心格** `[K//2, K//2]`，其余为可见邻居；
-- **channel 2｜目标投影**：自身目标在 FOV 内则标在真实格；在 FOV 外则**沿射线投影到 FOV 边界格**（这正是 v1 自创"channel 4"想做的事——已由 Pogema 原生提供，故删除自创通道）。
-
-本方案在原生 3 通道之上 **追加 1 个自定义通道**（仍是纯局部、不含全局/未来信息）：
-
-- **channel 3｜自身历史足迹（时间衰减）**：当前位置置 1.0，历史足迹随时间衰减，落在 $[0, 0.8]$。
-
-$$\text{channel3}(u) = \max_{\tau \le t}\; \mathbb{1}[\,p_i^\tau \text{ 落在以当前位置为中心的 patch 坐标 } u\,]\cdot \rho^{\,t-\tau},\quad \rho\in(0,1)$$
-
-足迹通道只记录走过的位置，**不含未来路径、不含全局规划器信息**，因此不破坏部分可观测。最终 patch 为 `(4, 11, 11)`。
-
-**追加的标量/向量特征**（均为局部或自身已知信息，经 MLP 编码）：
-
-- **目标相对方向** $\mathbf{g}_i^t \in \mathbb{R}^2$：归一化的"指向自身目标"的方向向量。
-  > 合法性说明：智能体**始终知道自己的目标坐标**（Pogema `get_targets_xy` 确认每体有自身 goal），这是它的任务定义，不是全局地图泄露。该向量只给直线几何朝向，不含绕障信息。
-- **上一步动作** $a_i^{t-1}$：5 维 one-hot（或 embedding）。
-- **到达标志** $\text{done}_i^t \in \{0,1\}$：是否已到达自身目标。
-
-#### envs/action_mask.py
-对智能体 $i$，合法动作集合 $\mathcal{A}_i^{\text{legal}}$ 排除：(1) 越界；(2) 进入静态障碍；(3) 环境明令禁止的动作。**动态碰撞不做硬掩码**（多体冲突需策略学习协调），改由 reward 惩罚并记为诊断指标。掩码实现：非法位置在 Q 上填 $-\infty$（工程上 `-float('inf')`，不用有限大负常数）。
-
-#### envs/potential_field.py — **新增**
-训练时为每个 `(map, goal)` 用 **BFS 在四连通可行图上**预计算真实测地距离场 $d_{\text{BFS}}(\cdot, \text{goal})$（不可达格设为大常数）。该距离场**只用于环境计算 reward shaping，不进入任何 agent 的观测**。每张地图每个 goal 只算一次，开销可忽略。
-
-#### envs/reward_builder.py — **重写（核心修订）**
-
-> **设计原则（回应"全局信息=破坏部分可观测"的疑虑）**：部分可观测性是 **policy 输入** 的属性，而 reward 由模拟器在训练时计算、**永不进入 policy 网络**；部署时根本不计算 reward。因此 reward 使用全局距离 **不改变 policy 的部分可观测性**。这是标准的"特权/非对称训练"。况且本方案已接受更强的特权信号（LaCAM 用全局图直接产出被模仿的动作），用全局距离做 reward 只是更弱的特权。
-
-**主方案：BFS 测地距离的势函数 shaping（PBRS）**
-
-$$\Phi_i(s) = -\,d_{\text{BFS}}\big(p_i,\ \text{goal}_i\big),\qquad F_i^t = \gamma\,\Phi_i(s^{t+1}) - \Phi_i(s^{t})$$
-
-总奖励：
-
-$$R_i^t = \underbrace{R_{\text{goal}}\mathbb{1}[\text{到达}]}_{\text{稀疏达标}} \;-\; \underbrace{c_{\text{step}}}_{\text{每步}} \;-\; \underbrace{c_{\text{coll}}\,\mathbb{1}[\text{碰撞}]}_{\text{碰撞}} \;-\; \underbrace{c_{\text{wait}}\,\mathbb{1}[\text{无意义等待}]}_{\text{无障碍却 wait}} \;+\; \underbrace{\lambda_F\,F_i^t}_{\text{BFS 势函数}}$$
-
-- **为何用 BFS 而非曼哈顿**：曼哈顿忽略墙，其梯度"穿墙"指向，在 maze/room 中误导学习；BFS 测地距离的梯度沿真实最短路，绕墙时也单调下降。
-- **为何用势函数形式**：由 Ng–Harada–Russell (1999)，$F=\gamma\Phi(s')-\Phi(s)$ 形式的 shaping **策略不变**——绕行造成的临时变化只影响学习动力学，**不改变最优策略**，迷宫亦然。（v1 的点积对齐奖励 **不是** 势函数，会把最优策略偏向直线运动，是 maze 失败的根因之一，已删除。）
-
-**退化备选（若坚持 reward 也必须纯局部）**：去掉一切稠密方向 shaping，仅保留 `稀疏达标 − 每步 − 碰撞 − 无意义等待`，依靠 **n-step 回报 + DQfD 专家 margin** 传播价值。此路收敛更慢，但不需要任何全局量。**无论哪种，都不要用点积对齐奖励。**
-
-### 1.4 lacam/
-
-#### lacam/lacam_runner.py
-对给定地图、起终点调用 LaCAM 生成多体路径。LaCAM 可用全局地图——它只作训练期专家，**不进入学生策略输入**。输出：
-```json
-{ "map_type": "random|warehouse|maze|room", "map_size": 64, "num_agents": 96,
-  "starts": [[r,c],...], "goals": [[r,c],...], "success": true,
-  "paths": [[[r,c],...],...], "makespan": 0, "sum_of_costs": 0, "runtime": 0.0 }
-```
-
-#### lacam/lacam_dataset_builder.py
-成功样本 → DQfD 专家监督（含完整路径与动作序列）；失败样本 → hard case 池（保存地图、起终点、失败原因、运行信息），**不进入专家 margin loss**，避免学习失败动作。
-
-#### lacam/trajectory_converter.py — **动作映射按 Pogema 修正**
-设 $\Delta = p^{t+1} - p^{t} = (\Delta r, \Delta c)$，专家动作：
-
-```
-(0, 0)  -> 0  wait
-(-1,0)  -> 1  up
-(1, 0)  -> 2  down
-(0,-1)  -> 3  left
-(0, 1)  -> 4  right
-```
-
-> **关键**：观测 $o_i^t$ **必须由 observation_builder 按局部可观测规则重新生成**，不能直接用 LaCAM 的全局状态。
-
-> **专家可解释性过滤（针对中心化→去中心化的时序信息丢失）**：LaCAM 是全局时间步同步的——某体 wait 是因为"它知道"另一体将在精确时刻让开。去中心化策略无此上下文，盲目模仿会退化为死锁。因此：**若同一 `(局部patch + 足迹 + 目标方向)` 下专家动作不唯一（典型如长廊对称让行），将该样本剔除出 margin loss**（否则 margin 永远拉不开，对应 §5.1 的失败模式），其 TD 项仍可保留。
-
-#### lacam/hard_case_manager.py
-hard case 来源：LaCAM 失败、策略 rollout 失败、高碰撞、高停滞、长时间未达标、warehouse 拥堵、room 门口阻塞、maze 长廊往返。对困难任务提高在环境回放中被重采样的权重。
-
-### 1.5 models/
-
-#### models/encoders.py
-- **PatchEncoder**：CNN 对 `(4,11,11)` patch 快速提特征。
-- **GoalEncoder / ActionEncoder / StatusEncoder**：对目标相对方向、上一步动作、到达标志编码（合为 `scalar_feat_dim`）。
-
-#### models/communication.py — **FOV 约束 + 防闪烁的稀疏邻居选择**
-
-> **更正(相对 v1/早期措辞)**:hard top-k 截断**会引入通信图闪烁(flickering)**——当第 k 与第 k+1 名邻居得分接近时,任一体微动一步就使排名交换,边在相邻时间步反复通断,导致 (a) 聚合特征 $\mathbf{c}_i$ 跳变、GRU 输入不连续,(b) hard 选择不可导、边界梯度来回翻、训练方差大,(c) 让行决策走/停振荡。因此 **top-k 只压住了通信图的*规模*(雪崩),却用*时间稳定性*换规模(闪烁)**——这是两个不同的病,不能用 top-k 同时声称解决。下面把邻居选择改为**软稀疏 + 迟滞**,把 top-k 降级为纯粹的算力上限。
-- **IntentEncoder**：生成自身意图向量 $\mathbf{z}_i\in\mathbb{R}^{64}$。
-- **NeighborSelector**：候选邻居须**同时**满足 (a) 距离 $\le r_c$ 且 $r_c < \text{obs\_radius}$，(b) **在自身 FOV 内可见**。在候选集上**不做 hard top-k**，改为：
-  - **主方案——软稀疏注意力**：对所有候选邻居用带温度的**稀疏 softmax(entmax/sparsemax)** 算权重,让不相关邻居权重被自然压到 0。稀疏性由可导的权重衰减实现,**不闪烁**;
-  - **迟滞(hysteresis)**:维持/纳入邻居用阈值 $\tau_{in}$、踢出用更宽松的 $\tau_{out}<\tau_{in}$,已在集合内的邻居要明显变差才被踢,避免边界反复横跳;
-  - **粘滞项(可选)**:对"上一步已在集合内"的邻居给一个小加分,制造切换惯性;
-  - **`comm_topk=6` 仅作算力上限**:当软稀疏后非零邻居仍超过 k 时,取权重最高的 k 个以封顶 GAT 计算量($O(Nk)$),**不再把它当作"抑制雪崩的机制"**。
-- **BiIntentAttention**：多头注意力聚合选中邻居意图,得 $\mathbf{c}_i$。配合上面的软稀疏 + 迟滞,通信图在时间上平滑;必要时对 $\mathbf{c}_i$ 跨步做轻度 EMA 平滑进一步抑制高频抖动。
-
-> 通信只在 FOV 内、软稀疏选择(算力上限 k),从机制上限制级联*规模*,同时用迟滞/软化保证时间*稳定性*。"和谁通信"(选择层)与"通信内容/如何聚合"(意图+注意力)是两个不同层面——见 §7 的消融阶梯(H5)验证后者是否值得其复杂度。
-
-#### models/recurrent_core.py
-DRQN 循环记忆，建议 GRU：$h_i^t = \text{GRU}(x_i^t, h_i^{t-1})$，$x_i^t$ 为融合局部观测+通信后的特征。对 maze/room 尤为重要。
-
-#### models/q_heads.py
-Dueling 头：$Q(s,a)=V(s)+\big(A(s,a)-\frac{1}{|\mathcal{A}|}\sum_{a'}A(s,a')\big)$。
-
-#### models/biintent_drqn.py
-组合完整网络，命名 **BiIntent-GAT-DRQN**。
-
-### 1.6 losses/
-- **q_target.py**：masked mellowmax target（数值安全切片，见 §3.3.3）。
-- **td_losses.py**：1-step 与 n-step TD loss。
-- **dqfd_losses.py**：DQfD 总损失 $L = \lambda_{td}L_{TD} + \lambda_{n}L_{n} + \lambda_{m}L_{margin} + \lambda_{l2}\lVert\theta\rVert^2$。
-
-### 1.7 buffers/
-- **expert_demo_buffer.py**：存 LaCAM 成功专家轨迹。每条至少含 `obs, hidden_init, action_expert, reward, next_obs, done, action_mask, map_type, task_id`。
-- **selfplay_buffer.py**：阶段二自游走探索数据（含噪声）。
-- **recent_online_buffer.py**：阶段三短窗口近 on-policy 数据，记 `policy_version, sample_time, task_id, is_expert_action`；仅当 $v_{\text{learner}} - v_{\text{sample}} \le \text{lag}_{\max}(=1)$ 时可训练，否则丢弃。
-- **shared_rollout_buffer.py**：连续内存、避免 pickle、支持切片与 pinned/异步拷贝。结构化数组：
-  ```
-  obs_buffer:     [E, T, N, C, K, K]   (K=11, C=4, uint8/float16)
-  action_buffer:  [E, T, N]
-  reward_buffer:  [E, T, N]
-  done_buffer:    [E, T]
-  mask_buffer:    [E, T, N, A]
-  version_buffer: [E]
-  ```
-- **batch_collator.py**：构造 batch，保证 padding/对齐一致，支持 `batch.to(device, non_blocking=True)`。
-
-### 1.8 trainers/
-- **train_reptile_dqfd.py**：DQfD + Reptile 联合训练（见 §3.3–3.4）；按 §4.4–4.5 实现 **双 GPU task-并行 Reptile**（两卡各跑一个 task 的 inner loop，meta-iter 末平均增量做 outer 更新）+ **CPU 多进程 env-worker** 采样。
-- **finetune_online.py**：目标地图低滞后近 on-policy 微调（见 §3.6–3.8）。
-- **evaluator.py**：评估时**必须关闭专家介入**，否则不反映策略本身能力。
-- **scheduler.py**：管理课程与地图采样概率（见 §3.5）。
-
-### 1.9 utils/
-metrics（足够细以定位问题来源）、profiler（env/forward/batch/IPC/序列化/拷贝/backward/optimizer/LaCAM 各段耗时）、checkpoint（meta init / pretrained DQfD / finetuned / best 分别保存）、seed、logger。
+**★ LaCAM 致命坑**：py3.12 下 import `_lacam.so` 失败 → `backend=auto` **静默回退到差得多的
+prioritized 规划器**，污染专家数据且不报错。所有 LaCAM 数据生成必须用 `lacam310`。
 
 ---
 
-## 2. 网络架构
+## 3. 网络架构（MADCL / `MAPFCommNet`）
 
-> **[v3 superseded 骨干]** 本章描述的 `Patch CNN + 标量 MLP + 单轮软稀疏 GAT + GRU + Dueling Q` 骨干在 v3 中被 **tokenized 观测 + Transformer（或时间维 Mamba + 体间注意力）** 取代（见 §0′）。**仍有效**：输入只含局部信息（INVARIANT 2）、目标相对方向作合法局部特征、通信只与 FOV 内邻居（§2.5/INVARIANT 10，v3 头条）。**变化**：Q 头（Dueling DQN）→ 动作 logits + 交叉熵（离线 IL）；GRU 记忆 → transformer 上下文 / Mamba。
-
-### 2.1 问题建模
-每体共享参数网络 $f_\theta$，依局部观测 $o_i^t$、隐状态 $h_i^{t-1}$、邻居通信 $\mathbf{c}_i^t$ 选动作：
-
-$$a_i^t = \arg\max_{a\in\mathcal{A}_i^{\text{legal}}} Q_\theta\big(o_i^t, h_i^{t-1}, \mathbf{c}_i^t,\ a\big),\qquad \theta \text{ 全体共享}$$
-
-输入不同 ⟹ 输出不同。
-
-### 2.2 输入表示
-每体输入由四部分组成：`patch (4,11,11)` + `目标相对方向 (2)` + `上一步动作 one-hot (5)` + `到达标志 (1)`，后三者合为标量特征。详见 §1.3。
-
-### 2.3 Patch Encoder
-```
-Conv2d(4, 32, k=3, pad=1) + ReLU
-Conv2d(32, 64, k=3, pad=1) + ReLU
-Conv2d(64, 64, k=3, pad=1) + ReLU
-Flatten -> Linear -> d_patch (=128)
-```
-
-### 2.4 状态特征编码
-目标方向/上一步动作/到达标志经 MLP 得 $d_{\text{scalar}}$，与 patch 特征拼接。
-
-### 2.5 双向意图通信
-意图 $\mathbf{z}_i = g_\theta(\text{patch}\oplus\text{scalar})$。候选邻接：$j\in\mathcal{N}_i^{\text{cand}} \iff \lVert p_i-p_j\rVert\le r_c \wedge j\in\text{FOV}_i$。在候选集上用**稀疏 softmax(entmax)** 算权重(不相关邻居权重→0),配合迟滞 $\tau_{out}<\tau_{in}$ 保证时间稳定;`comm_topk` 仅在非零邻居超额时封顶算力。多头注意力：
-
-$$\alpha_{ij}=\text{entmax}_j\big(\text{score}(\mathbf{z}_i,\mathbf{z}_j)\big),\quad \mathbf{c}_i=\sum_{j\in\mathcal{N}_i}\alpha_{ij}\,W\mathbf{z}_j$$
-
-无邻居则 $\mathbf{c}_i = \mathbf{0}$。
-
-### 2.6 DRQN 记忆
-$h_i^t=\text{GRU}(x_i^t, h_i^{t-1})$，$x_i^t=\text{patch}\oplus\text{scalar}\oplus\mathbf{c}_i^t$。
-
-### 2.7 Dueling Q Head
-输出 5 维 $Q$（对应 wait/up/down/left/right）。选动作时非法位置置 $-\infty$。
-
-### 2.8 完整前向
-```
-patch -> CNN -> patch feature
-scalar(目标方向/上一步动作/到达) -> MLP -> state feature
-patch⊕state -> intent z
-z -> (FOV内 top-k) 双向 attention -> communication feature c
-patch⊕state⊕c -> GRU -> hidden h
-h -> dueling Q head -> Q(5)
-```
-
----
-
-## 3. 训练方式
-
-### 3.1 总体流程（三阶段）
-- **阶段一**：LaCAM 专家数据离线积累 + 困难库标定。
-- **阶段二**：DQfD + Reptile 联合预训练（**off-policy**，混合自游走防 OOD 高估）。
-- **阶段三**：目标地图 **低滞后近 on-policy** 微调（lag≤1，专家介入概率 + margin 权重退火）。
-
-> **关于 on/off-policy 的分工（回应你的点 3）**：DQfD 的本质是从专家示范学习——专家轨迹按定义**不是**当前策略产生的，所以**阶段二必须 off-policy（replay 复用专家+自游走）**，无法做成纯 on-policy。你担心的"版本滞后导致不收敛"主要发生在**阶段三**的自主 RL；因此阶段三改为**同步式近 on-policy**：并行 env 在冻结权重下采一段 rollout，learner 仅在这段新鲜数据上更新，随即同步权重，**lag ≤ 1 段**。专家 margin 项随退火→0，末期即纯近 on-policy Q 学习。这样既拿到你要的低滞后稳定性，又能靠批量并行采样维持吞吐（与 PPO 的"按段 on-policy"同理）。
-
-### 3.2 阶段一：LaCAM 专家数据生成
-对每种地图类型采样任务 $\tau=(m, \text{size}, N, \text{struct}, \text{starts}, \text{goals})$，LaCAM 求解；成功转动作入专家 buffer，失败入 hard case 池。
-
-### 3.3 阶段二：DQfD + Reptile 联合预训练
-
-> **[v3 superseded 训练范式]** v3 改为**离线 IL（对专家动作做监督/交叉熵）为主**（见 §0′）。本节的 DQfD 价值学习（1-step/n-step TD、mellowmax、防高估、专家+自游走课程混合、selfplay）**降为可选消融**，默认不启用。**仍保留**：Reptile（§3.4，重定位为"通信策略快速适应"）、专家数据来自 LaCAM、burn-in（若用循环/Mamba 骨干）。BFS-PBRS reward（INVARIANT 4）在纯 IL 下不参与。
-
-#### 3.3.1 防高估混合策略（**课程式**）
-纯专家预训练会令策略一旦偏离 LaCAM 轨迹就进入未见过的"脏状态"，Q 值在那里塌缩/高估、退火即崩。故每个 inner-loop batch 按比例混合专家与自游走：
-
-- 早期 `expert_ratio≈0.9`（策略尚弱，自游走多为碰撞噪声，价值有限）；
-- 随 meta 迭代**线性降至 0.5**（逐步引入真实惩罚传播，收敛 Q 边界）。
-
-（取代 v1 的固定 70/30。）
-
-#### 3.3.2 1-step TD
-$$y_i^{1}=r_i^t+\gamma\,(1-\text{done})\,V_{\bar\theta}^{\text{mm}}(o_i^{t+1}),\qquad L_{TD}=\big(Q_\theta(o_i^t,a_i^t)-y_i^{1}\big)^2$$
-
-#### 3.3.3 数值安全的 Masked Mellowmax Target
-对合法动作集 $\mathcal{A}^{\text{legal}}$，温度 $\alpha$：
-
-$$V^{\text{mm}}_{\bar\theta}(s)=\alpha\Big(\log\!\sum_{a\in\mathcal{A}^{\text{legal}}} e^{\,Q_{\bar\theta}(s,a)/\alpha}-\log|\mathcal{A}^{\text{legal}}|\Big)$$
-
-工程实现（非法项以 $-\infty$ 隔离在求导路径外；保证至少 1 个合法动作——wait 通常恒合法）：
-```python
-safe_q = q_values / alpha
-safe_q = safe_q.masked_fill(~action_masks, -float('inf'))
-v_target = alpha * (torch.logsumexp(safe_q, dim=-1)
-                    - torch.log(valid_counts + 1e-8))
-```
-
-> **α 选取（修正）**：本实现中 $\alpha$ 越小越接近 hard max、越易高估。删除 v1 的 `α=0.1`（过小）。默认 `α=1.0`，并在 `{0.5, 1, 2}` 中按 `Q_max/Q_mean` 走势与 TD error 分布选取。
-
-#### 3.3.4 n-step TD
-$$y_i^{n}=\sum_{l=0}^{n-1}\gamma^l r_i^{t+l}+\gamma^{n}V^{\text{mm}}_{\bar\theta}(o_i^{t+n}),\qquad L_n=\big(Q_\theta(o_i^t,a_i^t)-y_i^{n}\big)^2$$
-
-#### 3.3.5 专家大间隔损失
-对专家动作 $a^E$（已剔除可解释性不足的样本，§1.3）：
-
-$$L_{margin}=\max_{a\in\mathcal{A}^{\text{legal}}}\big[Q_\theta(s,a)+\ell(a^E,a)\big]-Q_\theta(s,a^E),\quad \ell(a^E,a)=\begin{cases}0 & a=a^E\\ m & a\ne a^E\end{cases}$$
-
-非法动作已置 $-\infty$，自动排除。
-
-#### 3.3.6 wait 权重
-专家 wait 过多易致过度等待，对 margin 按 wait 比例加权（避碰/瓶颈让行的 wait 保留较高权重，过渡性静止 wait 降权）。
-
-### 3.4 Reptile 元学习（**含 target 网络处理，回应你的点 2**）
-学习易适应的初始化 $\theta^\*$。每个 task $\tau\sim P(m)$：
+### 3.1 前向（与代码一致）
 
 ```
-initialize meta-parameter θ
-for meta_iter = 1 ... M:
-    sample map type m ~ P(m); sample task τ from m
-    θ_inner ← θ
-    θ_target ← θ            # ★ target 在本 task 内冻结于 θ_meta（你的方案）
-    for k = 1 ... K:
-        sample mixed batch (course expert/self-play ratio) from τ
-        burn-in 前 burn_in_len 步重建隐状态（只前向，不计 loss）
-        compute DQfD loss with masked-mellowmax target using θ_target
-        θ_inner ← θ_inner − β ∇L(θ_inner)
-    θ ← θ + ε (θ_inner − θ)
+patch (5,11,11) + scalar (8)
+      ↓  ResidualCNNEncoder（n_res_blocks 个残差块，cnn_channels 通道）
+   e : (M, d_model)                          M = batch × agents
+      ↓  comm_rounds 次（默认 1 轮）
+   intent = comm_in( e )                     intent_mode=feature
+          = comm_in( [e ; prev_action_onehot] )   intent_mode=action（主模型用）
+   comm_feat = BiIntentAttention(intent, 位置, FOV 掩码)
+   e = e + comm_out(comm_feat)               ← 残差写回
+      ↓
+   TemporalCore（backend ∈ {gru, gru_prenorm, mamba, transformer}，temporal_layers 层）
+      ↓
+   head: Linear(d_model, head_hidden) → GELU → Linear(head_hidden, 5)
+      ↓
+   logits (5)   —— 非法动作置 -inf 后按 §5 的解码规则取动作
 ```
 
-> **target 选择（采纳你的判断）**：inner loop 内 target **冻结于 θ_meta**，每个 task 起始重置。理由：inner 只有 $K=5$ 步，若 target 在 inner 内同步几乎不动、语义混乱；冻结于 θ_meta 给出每个 task 一致、稳定的自举基准，与 Reptile"围绕 θ 做局部适应"的语义一致。阶段三微调则改用**周期性 target 同步**（标准 DQN）。
->
-> 外层更新 $\theta\leftarrow\theta+\varepsilon(\theta_{\text{inner}}-\theta)$，$\beta$=inner_lr，$\varepsilon$=meta_lr，$K$=inner_steps。
+### 3.2 通信模块（`BiIntentAttention`，头条）
 
-> **隐状态陈旧（R2D2）**：专家/自游走序列存了 `hidden_init`，但 θ 变化后旧 hidden 失效。故每段训练前做 `burn_in_len=8` 步 burn-in，仅前向重建 GRU 隐状态、不回传，再在其后计 loss。
+候选邻接：$j \in \mathcal{N}_i^{\text{cand}} \iff \lVert p_i - p_j \rVert \le r_c \wedge j \in \mathrm{FOV}_i$。
+在候选集上算多头注意力，用 **entmax(α=1.5)** 代替 softmax 得到可**精确为零**的权重：
 
-### 3.5 地图类型采样课程
-仅用 `random / warehouse / maze / room`，$\sum_m P(m)=1$。
+$$\alpha_{ij}=\mathrm{entmax}_{1.5}\big(\mathrm{score}(\mathbf z_i,\mathbf z_j)\big),\qquad
+  \mathbf c_i=\sum_{j}\alpha_{ij}\,W\mathbf z_j$$
 
-| 阶段 | random | warehouse | maze | room |
+**迟滞**：已存在的边按较低阈值 `tau_out=0.02` 保留，新边需越过 `tau_in=0.05` 才建立，
+并对已有边加 `stickiness_bonus=0.1`。无邻居则 $\mathbf c_i=\mathbf 0$。
+
+上报三个指标：`avg_neighbors`（= `W>0` 的真实度数，**即带宽口径**）、`edge_flip_rate`、`attention 熵`。
+
+> **★ fp16 溢出坑（已修，`8f4bbb4`）**：注意力 logits 在 AMP 下会溢出到 65504 → NaN。
+> **只写 `.float()` 无效**——autocast 会拦截 matmul 把 fp32 入参强制降回 fp16。
+> 必须显式 `with torch.autocast(..., enabled=False)` 包住该 matmul。
+> 回归测试：`scripts/test_comm_fp16_overflow.py`（comm_dim × 激活幅度 12 组合全过）。
+
+### 3.3 时间核（`TemporalCore`，可插拔）
+
+| backend | 说明 |
+|---|---|
+| `gru`（**主模型**） | 标准 `nn.GRU`，`temporal_layers=2` |
+| `gru_prenorm` | GRU 外套 pre-norm + 逐层残差（归因臂，实测 −0.060 n.s.） |
+| `mamba` | S6 选择性 SSM；`mamba-ssm` 官方 CUDA 内核可用（块级快 6.7×，但只占训练单步 1.4%） |
+| `transformer` | 未作为主线 |
+
+> **★ Mamba 的实测结论（已定论 18/21）**：该块的增益**不来自时序机制**。
+> SSM 因 `dt` 初始化缺失而无记忆（dA≈2.5e-3，scan 坍缩）；`d_conv` 的 4 步局部卷积贡献 +0.018 n.s.；
+> 把卷积降到 kernel=1（跨时步泄漏 0.63 → 4.6e-3）后相对裸 GRU 仍保留 +0.315。
+> ⇒ 赢在**门控前馈块**（`in_proj` 2× 扩张 + SiLU(z) 门控 + `out_proj`），不是时间核。
+> 反向印证：修好 `dt` 初始化并补出口 LayerNorm（`dt_init: official` + `final_norm: true`）
+> 终点 −0.042 n.s. —— 救活时序通路同样买不到分。
+> ⚠️ 上述优势量级**与 lr 不可分离**（各臂皆 lr=1e-4，最优 lr 未测，见 INVARIANT 16）。
+
+### 3.4 主模型超参（`configs/network_big.yaml`，7.45M）
+
+| 项 | 值 | | 项 | 值 |
 |---|---|---|---|---|
-| 前期（学基本避障达标） | 0.45 | 0.20 | 0.20 | 0.15 |
-| 中期（提结构化比例） | 0.30 | 0.30 | 0.25 | 0.15 |
-| 后期（强瓶颈/迷宫泛化） | 0.20 | 0.30 | 0.30 | 0.20 |
-
-某类失败率显著偏高时启用自适应采样 $P(m)\propto \exp(\eta\cdot\text{failrate}(m))$。
-
-### 3.6 阶段三：目标地图近 on-policy 微调
-
-> **[v3 superseded]** v3 **取消在线 near-on-policy 微调**（§3.6–3.8 全节，含实时专家介入、lag≤1、margin/专家退火）。改为 **离线 few-shot 适应评估**：在 held-out 地图族上对比 "普通预训练→微调" vs "Reptile-init→微调" 的适应速度/数据量，并对位 `MAPF-GPT active fine-tuning`。这是 Reptile 在 v3 里的存在理由（见 §0′），定位为"通信策略对新环境的快速适应"，**不**包装成泛化。
-初始化 $\theta\leftarrow\theta^\*$。采用短窗口 recent buffer + 同步段采样，丢弃 $v_{\text{learner}}-v_{\text{sample}}>1$ 的样本（见 §3.1 分工说明）。
-
-### 3.7 LaCAM 实时专家介入
-按概率 $p(t)$（`p_start=0.5 → p_min=0.02` 衰减）调用 LaCAM 帮脱困；或仅在困难态触发（多步无人达标 / 同区反复冲突 / 反复踏自身足迹 / 剩余步数不足 / 通道门口长时拥堵）。
-
-### 3.8 微调损失退火
-$\lambda_E$ 退火：前期 1.0 → 中期 0.3 → 后期 0.05 或 0；前期靠专家脱困，后期靠自主 RL。
+| `patch_channels` | 5 | | `comm_radius` / `comm_topk_cap` | 4 / 6 |
+| `scalar_feat_dim` | 8 | | `entmax_alpha` | 1.5 |
+| `obs_radius` / patch K | 5 / 11 | | `tau_in` / `tau_out` / `stickiness_bonus` | 0.05 / 0.02 / 0.1 |
+| `d_model` | 320 | | `comm_dim` / `intent_dim` | 192 / 192 |
+| `cnn_channels` / `n_res_blocks` | 128 / 3 | | `intent_mode` | `action` |
+| `head_hidden` | 256 | | `temporal_backend` / `temporal_layers` | `gru` / 2 |
+| `num_actions` | 5 | | `num_attention_heads` | 4 |
 
 ---
 
-## 4. 训练速度优化（**新增**）
+## 4. 训练（离线模仿学习）
 
-### 4.1 吞吐目标与瓶颈定性
-对标"When to Switch …"（PPO，约 8h/10 亿步，≈ 4.3×10⁴ env-step/s）。可接受最多慢 10×，故 **目标 ≥ 4×10³ env-step/s**。需先认清：本方案比纯 PPO 重在两处——**(a) GRU 循环展开**、**(b) 每步对 96 体做 top-k 邻居注意力（GAT）**；这两项是预算大头。该 PPO 论文能跑那么快，恰说明 **Pogema 在向量化时步进很快、不是主瓶颈**——本方案慢在更重的网络与数据管道，**不在 env**。
+### 4.1 阶段一：LaCAM 专家数据
 
-本方案模型很小、目标硬件 GPU 很大（见 §4.5），因此大概率处于 **kernel-launch 受限**区间：GPU 算力没吃满，时间耗在零碎 kernel 启动与 Python 逐体/逐步循环上。**这一点决定了下面所有取舍——必须先 profile 再动手。**
+`scripts/generate_lacam_data.py` / `generate_expert_data.py`，**必须 `lacam310` 环境**。
+`--seed-start` 必传并与 `TEST_SEED_BASE` 做范围检查（**曾因 seed 写死产出 66~98% 重复 episode**，
+使「数据扩充无用」与「泛化 gap 0.009」两条结论作废，见 §7.1）。
+落盘为 `expert_{family}/` 目录 + memmap，`ExpertDemoBuffer` 零拷贝挂载。
+查重工具：`scripts/check_episode_overlap.py`（首帧哈希）。
 
-### 4.2 语言选型：绝大部分用 Python，Rust 不是杠杆
-真正的开销分两类：**GPU 上的网络计算** 与 **CPU 上的 env 步进 + 数据搬运**。据此定语言：
+### 4.2 阶段二：离线 IL
 
-- **网络前向/反向、DQfD 损失、mellowmax、TD target、Dueling/GRU/GAT**：全是 GPU 张量运算（CUDA kernel），PyTorch 调用即可，**Rust 毫无帮助**。
-- **Pogema env 步进**：env 内核，不应"用 Rust 重写"；向量化后本就不慢（见 §4.1）。
-- **LaCAM**：Okumura 原版即 **C++**，通过绑定调用即达 native 速度，**不用动**。
-- **observation_builder / reward_builder(BFS 查表) / action_mask / top-k 邻居选择**：唯一**可能**值得编译加速的 CPU 热点。但**正确顺序是 numpy 向量化 → numba → 最后才 Rust**：跨 Python↔Rust 边界每步搬大数组，若非 zero-copy，FFI 开销会吃掉收益；对研究项目，PyO3/maturin 的构建与维护成本通常不划算。
+**损失**（`losses/il_losses.py`）：对专家动作的交叉熵，可选 `wait_weight`（专家 wait 占 ~50%）
+与 `label_smoothing`。**无 TD、无 n-step、无 margin、无 reward。**
 
-> **Rust 唯一可能真正赚到的场景**：profile 后确认"96 体 × 数十并行 env 的 per-agent 不规则 patch 拼装 + 足迹衰减 + 不规则 top-k 邻接"在 CPU 上占大头，且因不规则结构 numpy/numba 都向量化不掉——此时写一个**操作共享 numpy 缓冲区的 zero-copy 小扩展**才有意义。这是**最后手段**，多数情况用不到。
+$$\mathcal L = \mathbb E_{(o,a^E)}\big[\, w(a^E)\cdot \mathrm{CE}\big(\text{logits}_\theta(o),\, a^E\big)\,\big]$$
 
-**比换语言高得多的杠杆**（都在 Python 内即可实现）：① 把"全体 agent × 全部并行 env"合成**一次**前向，杜绝 per-agent Python 循环；② `torch.compile` + CUDA graphs 砍 launch 开销（小模型大卡，launch 常比算力还贵）；③ AMP 混合精度，patch 用 uint8/fp16；④ 共享内存 zero-copy 传 uint8 patch、禁用 pickle；⑤ 采样与训练流水线重叠。
+**三种外层模式**（`trainers/train_il_reptile.py::ILReptileTrainer`，同一份 inner loop）：
 
-### 4.3 瓶颈定位顺序（先测后改）
-用 `utils/profiler.py` 拆分：env step / NN forward / batch 构造 / IPC 等待 / 序列化 / CPU→GPU 拷贝 / backward / optimizer / LaCAM 调用。按占比从大到小处理：
+| 模式 | 配置 | 外层更新 |
+|---|---|---|
+| **joint**（主模型用） | `reptile: false` | 普通连续 SGD，**保留优化器动量** |
+| **Reptile**（SQ2） | `reptile: true` | $\theta \leftarrow \theta + \text{meta\_lr}\,(\theta_K-\theta)$；每 task 起点重置、清动量 |
+| **FOMAML**（SQ2 第三臂） | `maml: true` | 查询集在 $\theta_K$ 处的梯度；**外层必须用 Adam**（见下） |
 
-1. **张量拷贝/序列化**：patch 以 **uint8 连续存储**于共享内存，actor 只传 `slot_id, episode_len, policy_version, task_id`，learner 按 slot 读连续数据；避免 pickle 大对象。
-2. **CPU→GPU 搬运**：`pin_memory=True` + `non_blocking=True` 异步拷贝；下一 batch 预取与本 batch 计算重叠。
-3. **96 体 GAT 注意力**：把"逐体逐步"改为**批量稀疏注意力**（一次处理整个 batch×time×agent 的 top-k 邻接，用 `index_select`/`scatter`，杜绝 Python 循环）；top-k 截断（k=6）把复杂度从 $O(N^2)$ 降到 $O(Nk)$。
-4. **GRU 展开**：用 cudnn 加速的 GRU 一次性展开整段 `sequence_len`，而非逐步 Python 循环；burn-in 与训练段一起前向。
-5. **整网编译**：`torch.compile` + CUDA graphs；AMP 混合精度。
-6. **向量化/并行环境**：见 §4.4 的多进程布局。
-7. **LaCAM 实时介入开销**：阶段三困难态触发阈值不要过敏，避免频繁唤醒 C++/Python 边界；对同一困难场景缓存 LaCAM 结果。
+> **★ FOMAML 的两个实现坑（`a138c09`）**：
+> ① 不能复用 `self.scaler` 做查询梯度缩放——inner loop 已对它 `unscale_()` 过，
+>    再调会抛 `unscale_() has already been called`。改用静态缩放 `2**16`。
+> ② **外层必须用 Adam**：Reptile 的 `meta_lr` 作用在**位移**上（已被 inner Adam 归一化），
+>    MAML 的作用在**原始梯度**上，量纲差几个数量级；沿用 `meta_lr=0.1` 会瞬间发散。
+> **结论：已放弃**（外层 lr 扫 4 档，最好 acc 0.754 vs Reptile 0.90~0.92，已定论 20）。
 
-> **诊断分流**：若 **GPU 利用率上不去** ⟹ 病因是 launch 开销/Python 循环（Rust 救不了，做①②⑤）；若 **GPU 满载但整体仍慢** ⟹ 网络太重（按 §4.6 简化 GAT）；只有 **profiler 明确指向某 CPU 观测构建热点且 numba 也压不下去** ⟹ 才轮到 Rust（§4.2）。
+**主模型训练配方**（`configs/train_il_cap_lr1e4.yaml` + `network_big.yaml`）：
+`batch_size=32`、`sequence_len=32`、`inner_steps=5`、`tasks_per_meta=2`、`inner_lr=1e-4`、
+`grad_clip=10`、`use_amp=true`、12 个族（random/maze × {32,48,64} × {a,b}）、`reptile: false`。
+**主检查点 = `ckpt_il/capbig_iter_20000.pt`。**
 
-### 4.4 元学习并行：两层并行（多进程是对的）
-**关键约束**：Reptile 的 inner loop 是 **K 步串行 SGD**（第 k 步依赖 k−1 步），**单 task 内部无法并行**。并行只能在两个轴上展开：
+> **★ 学习率的规模律（已定论 22/23）**：**最优 lr 随模型规模下降。**
+> 2.16M 偏好 **5e-4**（比 1e-4 高 +0.227 ★显著）；7.45M 在 **1e-4** 附近
+> （2e-4 打平 +0.031/−0.047 n.s.、**3e-4 第 15 步即塌缩成全 wait**）。
+> ⇒ 跨规模对照**必须每臂各自调 lr**，否则对照组被系统性低估（INVARIANT 16）。
 
-- **轴 1｜CPU 多进程做环境采样。** 阶段二自游走数据靠 env rollout 产生；Python **GIL 会使多线程 env 步进串行化，必须用多进程**（`spawn` 启动）。worker **只做 CPU/env/观测构建、不碰 CUDA**，产出 numpy 写入共享内存环形缓冲；trainer 进程独占 CUDA 上下文。
-- **轴 2｜双 GPU 做 task-并行（batched Reptile）。** 两卡各跑**一个不同 task** 的完整 K 步 inner loop，结束后平均增量做一次 outer 更新：
+### 4.3 判性能只看 rollout，不看 loss
 
-$$\theta \leftarrow \theta + \varepsilon \cdot \frac{1}{|\mathcal{B}|}\sum_{j\in \mathcal{B}}\big(\theta_{\text{inner}}^{(j)} - \theta\big),\qquad \mathcal{B}=\{\text{GPU0 task},\ \text{GPU1 task}\}$$
-
-  这天然契合 Reptile：**同步只在每个 meta-iter 发生一次**（K 步才同步一回），不像 DDP 每步 all-reduce。本方案 `batch_size=32`，逐步 DDP 多半不划算，故**用 task-并行而非 DDP**。它同时把元吞吐翻倍、降低元梯度方差。
-
-> 坑：用 `spawn`；CUDA 上下文只放在 2 个 trainer 进程，**不要在 env-worker 里做 GPU 计算**；worker 产 numpy，trainer 负责所有张量/CUDA 工作。
-
-### 4.5 目标硬件的进程布局（2×RTX 5090 + 47 核 CPU）
-显存对这个小模型绰绰有余，**始终盯吞吐与 GPU 利用率，而非显存**。
-
-**阶段二（DQfD + Reptile 预训练）**——用 §4.4 两层并行：
-```
-GPU0 trainer 进程   ── task A 的 inner loop（K 步 DQfD）  ┐
-GPU1 trainer 进程   ── task B 的 inner loop（K 步 DQfD）  ┘→ 平均 Δ → outer 更新
-~40 env-worker 进程 ── 自游走 rollout + 观测构建 → 共享内存(uint8 环形缓冲)
-~4 LaCAM-worker 进程 ── 数据生成/困难态按需调用（C++ 绑定）
-剩余 ~3 核          ── prefetch / collator / 主控 / OS
-```
-
-**阶段三（单目标地图、近 on-policy 微调）**——此时**没有 task 并行可用**，改 Ape-X / SEED-RL 式分工，避免一张卡闲置：
-```
-GPU0 = learner（训练）
-GPU1 = batched 推理 actor（为数十个并行 env 跑策略前向）
-~40 核 = 并行 env（同步段采样，lag≤1）
-```
-
-### 4.6 速度兜底（若预算被打爆）
-若 profile 显示 GAT 仍是主瓶颈且压不进预算，**按以下顺序降级**：
-1. 通信改为**每 N 步**做一次（而非每步）；
-2. 注意力降级为**对 top-k 邻居意图带权 mean-pool**（去掉多头 softmax）；
-3. 在 random 地图上关闭通信（拥堵少），只在 warehouse/room 开启。
-
-每降一级都用 §5 指标确认 SR/Deadlock 不显著恶化。
+训练 loss 约 2000 步就平台震荡，而 rollout CSR 到 20000+ 仍在涨。**别在 ≤25% 训练进度下结论**
+（v4 曾在 iter 1000/5000 下过三次相反结论，全被 20000 打脸）。
 
 ---
 
-## 5. 评价指标（必须能定位问题来源）
+## 5. 评测协议与解码规则（写死，不再改）
 
-仅看成功率不够。指标分八类：任务效果 / 路径质量 / 冲突死锁 / 学习稳定性 / Q 值诊断 / 专家与模仿 / 通信 / 系统性能。
+### 5.1 协议
 
-### 5.1 任务效果
-- **Episode 成功率 SR**：全体到达的 episode 占比。
-- **平均到达率 AR**：每 episode 到达智能体占比。AR 高但 SR 低 ⟹ 少数体卡死。
-- **最差体未达数 U**：统计 `mean(U), max(U), P(U≤1), P(U≤5)`，判断失败是否集中在少数体。
+`on_target=nothing`（标准 MAPF，到达即守位）、`max_episode_steps=128`、`collision_system=soft`、
+`observation_type=MAPF`、`validation-*` 全 128 图、`split="all"`。
+主指标 **CSR**（全体到达才算成功）、**ISR**、**SoC**、**makespan**（★右censored 于 128，失败记 128）。
 
-### 5.2 路径质量
-- **Makespan** $=\max_i T_i$；**SoC** $=\sum_i \text{len}_i$（SR 高但 SoC 大 ⟹ 能完成但低效）。
-- **膨胀率 Inflation** $=\text{len}_{\text{policy}}/\text{len}_{\text{LaCAM}}$（≫1 ⟹ 绕路/等待过多）。
-- **平均步数利用率**（接近 1 且 SR 低 ⟹ 常耗尽步数）。
+**与 leaderboard 的可比性（三条前提已逐一核对）**：地图逐字节相同；协议相同；
+实例相同（不重映射 seed）⇒ 与 SCRIMP/DCC/LaCAM **逐实例配对**可比。
+CSR/ISR 与 POGEMA 自带 `info['metrics']` **逐 episode 对拍一致**。
 
-### 5.3 冲突与死锁
-顶点冲突数、边冲突数（交换位置）、**WaitRate**（未移动比例）、**NoProgressRate**（仅用曼哈顿做**事后诊断**，不进 reward）、**RepeatRate**（反复经过自身足迹）、**死锁判定**（连续 $W$ 步无新增到达且平均位移极低 ⟹ 记 DeadlockCount/Duration/FirstTime）。
+**各族协议不同**（`--auto-protocol` 内置官方网格）：warehouse 是 1 图 × 128 seed、
+agents 32~192；movingai 是 256 步。混用会产出不可比数字。
 
-### 5.4 学习稳定性
-$L_{TD}, L_n, L_{margin}$ 走势、梯度范数（max/mean/裁剪比）、参数更新幅度。
+### 5.2 解码规则（本文的推断规则，须在论文声明；基线用各自默认解码）
 
-### 5.5 Q 值诊断
-Q 的 mean/max/min/std；**Expert Q advantage** $=Q(s,a^E)-\max_{a\ne a^E}Q(s,a)$（<0 ⟹ 网络认为非专家更好）；TD error 分布。
+| 组件 | 值 | 增益 |
+|---|---|---|
+| 动作选取 | **按策略分布采样**（非 argmax） | argmax 会让共享参数策略在对称局面互锁，CSR 0.30→0.88（已定论 1） |
+| 温度 | `base_temp = 1.0` | 温度不敏感；T=0.3 时 dev 从 2.094 崩到 0.656 |
+| `wait_bias` | **1.0**（wait 的 logit 减 1.0） | 同检查点 9.232 → **9.375（+0.143）**，零训练成本 |
+| **TTA** | D4 八视角逆置换后概率平均 | 第二个免费大幅提升（已定论 3），代价 8× 推断算力，须明说 |
 
-### 5.6 专家与模仿
-LaCAM 成功率、模仿匹配准确度 `Acc_E`、专家 wait 比率 `Wait_E`、微调实时干预占比 `InterventionRate`。
+> **★ 选模隔离**：检查点与解码超参**只在独立 dev 集上选**（`make_dev_maps.py`，
+> 64 图/族，`DEV_SEED_BASE=7_000_000`，与训练/测试 seed 段均不重叠），report 只用 `validation-*`。
+> **曾失效过**：`--maps-file` 自引入起未接到 `load_maps()`，使 32 个脚本的「dev」实际是
+> validation 的偶数下标 64 图子集（已修，去污染净代价 −0.018，见已定论 19）。
 
-### 5.7 通信图监控（规模 + 时间稳定性）
-在 $r_c$（FOV 内、软稀疏选择）下构建动态图 $G^t$：
-- **最大连通分支规模 MaxCC**：频繁接近 $N$ ⟹ 局部通信退化为大范围无序网络（拓扑雪崩，*规模*失控）。
-- **平均邻居数**：长期≈0 ⟹ $r_c$ 过小/分布过稀；过大 ⟹ 计算开销与噪声上升。
-- **边翻转率 EdgeFlipRate（闪烁指标，新增）**：相邻两步 $G^t$ 与 $G^{t+1}$ 的边集对称差占比 $\frac{|E^t \triangle E^{t+1}|}{|E^t \cup E^{t+1}|}$。高 ⟹ 通信图闪烁（*时间稳定性*失控），应加强迟滞/软化或调 $\tau_{in},\tau_{out}$。这是判断"是否被 hard 选择的边界抖动困扰"的直接证据。
-- **Attention 熵**：高熵（≈$\log k$）⟹ 无差别关注、避障混乱；低熵 ⟹ 聚焦关键冲突邻居（窄门口堵路者），通常对应更高效避碰。
-
-### 5.8 系统性能
-Actor FPS、Learner Update FPS、IPC 等待、序列化耗时、显存拷贝、策略版本滞后分布。
+> **★ makespan 不是越小越好（已定论 13 补注）**：三个解码变体中 **makespan 最短的 CSR 最低**
+> （分层温度 62.7 / 9.326），**最长的 CSR 最高**（wait_bias 1.5 → 75.8 / 9.393）。
+> 唯一奏效的干预是让智能体**多等**而非更快 ⇒ 约束是**冲突消解效率**，不是原始速度。
+> 「把 makespan 放进训练目标」这个方向的前提因此存疑。
 
 ---
 
-## 6. 如何根据指标定位问题
+## 6. 评价指标（v5 精简，删去 Q 值类）
 
-### 6.1 SR 低 且 Acc_E 也低
-可能：channel 2 目标投影编码失效；局部观测不足以区分两个专家动作（对称让行 ⟹ margin 拉不开，正是 §1.3 要剔除的样本）；网络容量不足；通信无效（$r_c$ 过小或 attention 崩溃）；margin 梯度占比过小。
-先查：`Acc_E, L_margin, Adv_E, NeighborCount, AttnEntropy, channel2 投影正确性`。
+v2 的八类指标中，**Q 值诊断（原 §5.5）整类废弃**（无 Q 头）；`L_TD/L_n/L_margin` 走势改为单一 CE loss。
+其余保留，且下列几项在 v5 中起了决定性作用：
 
-### 6.2 Acc_E 高 但 rollout SR 低
-可能：OOD 脆弱（自游走比例不足，偏离专家即崩）；纠偏/回退能力弱（TD 未有效传播）；专家 wait 被滥用（无全局时序同步 ⟹ 局部死锁）；Reptile 偏置到 random、对 warehouse/maze 适应差。
-先查：`SR/AR, RepeatRate, DeadlockCount, TD error 分布, InterventionRate, Acc_E(move) vs Acc_E(wait)`。
-
-### 6.3 WaitRate 很高
-可能：$c_{\text{coll}}$ 过高（move 的 Q 普遍低于 wait）；wait margin 权重过高；通信级联（MaxCC≈$N$ 的 Cascade Wait）；$\lambda_F$ 偏小不足以克服每步惩罚。
-先查：`Wait_E, WaitRate, Q_mean(wait) vs Q_mean(move), Adv_E(wait), MaxCC, NoProgressRate`。
-
-### 6.4 Q 值持续升高 但 SR 不升
-可能：非法动作未严格切片致 mellowmax 受污染；reward 尺度过大；target 更新过慢；replay 滞后致离线自举；$\alpha$ 过小退化为 hard max（见 §3.3.3）。
-先查：`Q_max/Q_mean, TD error 分布, policy version lag, reward scale, mellowmax α`。
-
-### 6.5 Loss 下降 但 Reward 也下降
-可能：策略版本滞后（拟合已被抛弃的旧动作分布）；recent buffer 过大混入过时序列；RL 对齐与模仿梯度冲突（$\lambda_E$ 退火过慢）。
-先查：`Policy Version Lag, L_TD/L_margin, Average Reward, Recent Buffer Age, InterventionRate`。
-
-### 6.6 训练速度低
-见 §4.3 的瓶颈定位顺序与 §4.2 的诊断分流。
-先查：`ActorFPS/UpdateFPS, T_IPC, T_ser, T_batch, T_copy, NN Forward Time, LaCAM Runtime`。
+- **CSR / ISR 联读**：`ISR@384 = 0.999` 而 `CSR` 低 ⇒ 失败集中在少数体、且不是死锁（已定论 13）。
+- **makespan（右censored 于 128）**：与专家比 2.0~3.7×。★注意删失：CSR 越高被记 128 的越少，
+  均值本该下降；若 CSR 升而 makespan 也升，说明成功 episode 确实变慢了。
+- **`avg_neighbors`**：= `(W>0)` 的真实度数（topk 封顶后），**即带宽/消息量口径**。
+- **`edge_flip_rate`** = 相邻两步边集对称差 / 并集。
+  ⚠️ **跨臂比较不可比**：分母是并集而各臂度数差 30%+；且 **dense softmax 的 `W>0` 恒为真**，
+  其边集只随 FOV 进出与 topk 排名变化，与 entmax 的注意力驱动通断**不是同一种量**。
+  迟滞的稳定作用只能在**同稀疏机制内部**比（madcl 0.1458 vs 无迟滞 0.1813 = −19.6%）。
+- **单步模仿准确率**：**不是 CSR 的好代理**——四个模型留出集准确率差 ≤0.005，而测试 CSR 差 0.339。
 
 ---
 
-## 7. 预期与验证（**全部降级为待验证假设**）
+## 7. 四条科学问题（论文骨架 = 实验骨架）
 
-> **[v3 调整]** v3 的核心待验证假设改为：**H-comm（头条）**——软稀疏+迟滞的通信图时间稳定性（低 EdgeFlipRate）/ 受限带宽鲁棒性，相比 dense 多轮通信（LC-MAPF 式）在协调/死锁/规模上更优或更省；**H-adapt（Reptile 重定位）**——Reptile meta-init 的通信策略在 held-out 族上比"普通预训练→微调"适应更快/更省数据（对位 active fine-tuning）。下列 H1/H3（自游走、BFS-PBRS）随范式转离线 IL 而**废弃**；H2（泛化）保留但**降为对照项、非卖点**（泛化是 LC-MAPF 的主张，不正面比）。H5 通信消融升级为头条实验。
+各条的完整结果与判决在 `SCHEDULE.md` §6.5；此处只记问题、贡献点与**当前立得住的边界**。
 
-> 以下为**假设**，需以对照实验证伪，不是承诺结论。
+| | 问题 | 贡献点 | 当前边界 |
+|---|---|---|---|
+| **SQ1** | 去中心化 PO 策略在标准 POGEMA 协议下能到什么位置 | MADCL 整体 | 主表 **9.375**（12 档和）。对 DCC/MAMBA/QMIX/VDN/IQL/QPLEX **两族全 12 档胜**；对 SCRIMP **mazes 赢（+0.194，5/6 档）、random 平（+0.018，噪声内）**；对 MAPF-GPT 输 |
+| **SQ2** | 元学习是否带来跨场景与快速适应 | Reptile | **零样本**跨族迁移全 6 档优于 joint 初始化（3.352 vs 3.062）；**"快速适应"不成立**——适应对两臂方向相反且收敛到同一水平。FOMAML 未能稳定训练。局限：基于 2.16M 档 |
+| **SQ3** | 通信机制是否提升去中心化协作 | FOV + 软稀疏 + 迟滞（**头条**） | **通信必要性极强**（去掉后 3.461 → 0.031）；迟滞降低闪烁（同机制内 −19.6%）；@64 档带宽 Pareto 优于 TarMAC（−32%，CSR 差在 CI 内）。**不可立住**：稀疏本身涨 CSR（效应 ≤ 基准 8%）、软稀疏省带宽（被迟滞抵消） |
+| **SQ4** | 持续分布漂移下是否保持性能 | Replay + Meta Update | 跨族 replay 显著抑制遗忘（BWT −0.027 → −0.008） |
 
-- **H1（训练稳定性）**：阶段二引入课程式自游走混合后，相比纯专家 DQfD，微调退火期的性能抖动显著下降、收敛更平稳。**验证**：对比 `自游走比例 ∈ {0, 课程}` 的 SR/Reward 方差与收敛步数。
-- **H2（泛化）**：Reptile 元参数 $\theta^\*$ 在少量微调（目标 < 30 epoch）后即可适应。**验证**：必须**留出一个训练中从未出现的地图族（held-out family）**作真正的泛化测试，而非用训练同族的新布局冒充"完全陌生"。
-- **H3（奖励）**：BFS 势函数 shaping 相比无稠密 shaping，在 maze/room 上降低 DeadlockCount 与 RepeatRate。**验证**：`{无稠密, BFS-PBRS}` 在 maze/room 上对比这两个指标；并验证 BFS-PBRS 不改变收敛到的策略质量（策略不变性的经验检查）。
-- **H4（速度）**：在 §4 优化后达到 ≥ 4×10³ env-step/s（对标的 1/10）。**验证**：profiler 报告 + 端到端吞吐。
-- **H5（通信复杂度是否值得）**：双向意图 + 注意力相比更朴素的聚合,在强协同地图(maze/room)上更优。**注意**:"和谁通信"(选择层:软稀疏/迟滞)与"通信内容+如何聚合"(意图向量+注意力)是两个不同层面,本假设只检验后者是否值得其复杂度。**验证——消融阶梯**(与 §4.6 降级路线挂钩,一举两得):
+### 7.1 方法学陷阱清单（本项目最贵的教训，每条都真实翻过车）
 
-  | 档 | 邻居选择 | 内容 | 聚合 |
-  |---|---|---|---|
-  | A 全量 | 软稀疏(entmax)+迟滞 | 双向意图 $\mathbf{z}_j$ | 多头注意力 |
-  | B 去注意力 | 软稀疏+迟滞 | 双向意图 | 带权 mean-pool |
-  | C 去意图 | 软稀疏+迟滞 | 仅相对位置/速度 | 多头注意力 |
-  | D 无通信 | — | — | — |
+1. **「记录值 ≠ 生效值」（三次）**：
+   `--map-size` 默认 64 覆盖配置的 20；`--base-temp` 默认 0.3 **在 sample 模式下从未生效**
+   （历史"T=0.3"实际都是 T=1.0）；`--maps-file` 自引入起未接到调用点。
+   ⇒ **引用任何历史结果前先查文件 mtime**，不能只信 json 里记录的 args。
+2. **「共享超参 ≠ 公平对照」（第四次同类）**：见 INVARIANT 16。比前三次更隐蔽，
+   因为命令行里两臂确实只差一个变量。
+3. **seed 写死 → 专家数据重复**：使两条结论作废。`--seed-start` + 首帧哈希查重是防线。
+4. **把「相关」当成可干预的「因果」**：探针显示专家解冲突时"有动量者胜 74.8%"（z=+95.7），
+   但解码端加惯性**单调有害**（2.359 → 1.828）。相关性不等于可干预。
+5. **清零式记忆消融会系统性高估时序重要性**：「每 N 步清零隐状态」测出记忆很重要
+   （+0.922 / +0.500），但**从零训练一个没有时序通路的模型并不掉分** ⇒ 清零度量的是
+   **分布外冲击**而非记忆价值。该类结论只能作为**上界**。
+6. **阴性结论要给上界，不要只说"不显著"**：例如"entmax 与迟滞对 CSR 的影响 ≤ 基准的 8%
+   （95% 置信）"比"不显著"有信息量，且不需要更多算力。
+7. **先算功效再花算力**：SQ3 内部消融曾计划 512 图重跑，功效计算显示迟滞那一臂需
+   **968×** 样本 ⇒ 阴性是结论本身，不是样本不足。省下约 20 小时。
+8. **单 seed 是全项目的共同软肋**：所有臂只训一个 seed，而判"显著"的效应量在 0.05~0.40。
+   训练 seed 方差**从未测过**，审稿最易问此处。
 
-  在 maze/room 上对比 **SR / DeadlockCount / WaitRate / EdgeFlipRate**：A≈D ⟹ 通信整体无用应砍；A≈B ⟹ 注意力多余,退 mean-pool（即 §4.6 档位 2）；A≈C ⟹ 意图向量多余,只传位置；A 显著最优 ⟹ 复杂度值得。**让数据判决"是否多余",不靠设计阶段论证。**
+### 7.2 两个有效杠杆 vs 十项阴性
+
+**有效**：① **加容量 + 更长训练**（2.16M→7.45M 且 8k→14k，+0.391 ★；⚠️ **等步数下只有 +0.164 n.s.**，
+见 INVARIANT 16）② **解码优化**（+0.143，**零训练成本**）。
+
+**阴性**（均唯一变量对照）：D4 训练增强、DAgger、更长训练（8k→30k）、2.56× 真·新数据、
+小幅加容量 +17%（CNN / GRU 两侧各一次）、Mamba 骨干（7.45M 档）、训练端 wait 降权、
+通信 2 轮、解码端动作惯性、一阶 MAML。
 
 ---
 
-## 8. 总结
+## 8. 判决原则（本项目最贵的教训，继续遵守）
 
-核心：**LaCAM 专家（特权，仅训练期）→ DQfD 模仿（off-policy 阶段二）→ Reptile 跨四地图族元初始化 → 目标地图低滞后近 on-policy 微调（阶段三）**。
+1. 让数据判决，不靠论证；每改一项 → 同图台重测 → 看 rollout CSR。
+2. **≤25% 训练进度不下结论。**
+3. **loss / 单步准确率 ≠ rollout CSR**（拟合更好但 rollout 更差是常态）。
+4. Deadlock 二值指标不可单独解读，必须与 ISR / WaitRate 联读。
+5. 任何一臂的结论必须在**唯一变量**下取得（warm 配 warm、同 iter、同 seed 集、**同 lr 调优待遇**）。
+6. **差值必须报合并 CI**；落在 CI 内就写"打平"，不得写"反超"。
+7. **不得用测试集选配置**：即使某个未被 dev 选中的配置测试分更高，也不能改报它。
 
-网络为**共享参数去中心化 Dueling DRQN**，不使用 QMIX、不构造 $Q_{tot}$；输入为 **Pogema 原生 3 通道（障碍/智能体含自身/目标边界投影）+ 追加足迹通道 + 标量特征（目标方向/上一步动作/到达）**；用 **FOV 内软稀疏(entmax)+迟滞的双向意图注意力**实现避让（控制通信图*规模*与*时间稳定性*,top-k 仅作算力上限）；用**数值安全 masked mellowmax**抑制高估；用 **BFS 测地距离的势函数 shaping**（策略不变、不破坏部分可观测）替代被删除的点积对齐奖励，规避迷宫绕行陷阱。已如实声明 IQL 非平稳性、中心化→去中心化的时序模仿丢失、hard top-k 闪烁等核心风险，并配以指标（含 EdgeFlipRate）与机制缓解，通信复杂度由 H5 消融判决。
+---
+
+## 9. 归档（v2 / v3 原文，**已不是现行方案**）
+
+保留目的：追溯设计决策的由来。**其中的 DQfD 损失、在线阶段三、reward shaping、
+Dueling Q 头、双 GPU 布局均已废弃**，不要据此写代码。
+
+### 9.1 v3 战略转向（2026-06-15）—— 方向性判断仍然有效
+
+**触发**：同实验室（CogAI/AIRI）的 `When-to-Switch` / `MAPF-GPT`（~10 亿 (obs,action) 离线 IL）/
+`LC-MAPF`（MAPF-GPT + 多轮通信）已占据本赛道；本项目 `meta_iter_20000` 实测 ≈ 经典 MARL 档。
+⇒ **用 CNN+GRU + ~10× 更少数据、在人家造的 benchmark 上比"泛化/刷 SR"，赢不了。**
+
+**因此（仍然有效的判断）**：
+- 头条押**通信**（软稀疏 + 迟滞的图时间稳定性 / 通信效率 / 受限带宽鲁棒性），不比"泛化"。
+- **换骨干是入场券，不是贡献。**
+- 训练范式转**离线 IL**，去掉在线 RL 机器。
+- Reptile 保留但重定位为"对新环境的快速适应"，且**必须保留一个适应评估**。
+- 阶段三在线微调 → 离线 few-shot 适应评估，对位 MAPF-GPT active fine-tuning。
+
+**v3 当时的"待定"现已定**：
+- Transformer vs Mamba → **都不是主线**，主模型用 GRU；Mamba 的增益已查明是前馈的（§3.3）。
+- 是否保留 DQfD 价值项 → **未保留**，纯 IL。
+- 通信贡献的窄口 → **通信必要性 + 迟滞的图稳定性 + 带宽 Pareto**（见 §7 SQ3 边界）。
+
+### 9.2 v2 已废弃部分索引
+
+| v2 章节 | 内容 | v5 状态 |
+|---|---|---|
+| §1.2 `train_reptile_dqfd.yaml` / `finetune_online.yaml` | DQfD 与在线微调配方 | 文件保留，**不用** |
+| §2.7 Dueling Q Head | 5 维 Q 值 + 非法位 -inf | **换成动作 logits + CE**（-inf 掩码保留） |
+| §3.3.2~3.3.5 | 1-step TD / masked mellowmax target / n-step / margin | **全部废弃** |
+| §3.3.1 | 专家/自游走课程式混合 | 废弃（无自游走） |
+| §3.6 / §3.7 / §3.8 | 阶段三在线微调 / LaCAM 实时介入 / 损失退火 | **废弃** |
+| §4.4 / §4.5 | 双 GPU task-并行 Reptile / 2×5090 + 47 核布局 | **废弃**（单卡 4080S 32G + 16 vCPU） |
+| §5.5 | Q 值诊断整类 | **废弃** |
+| §6.4 | "Q 值升高但 SR 不升"的定位流程 | 废弃 |
+| §7 | v2 的量化预期 | 已被实测取代，见 `SCHEDULE.md` |
+
+> v2 正文全文见 git 历史：`git show 04faaaa:Lacam_DQfD_Reptile_MAPF_Plan_v2.md`。
+
+---
+
+## 10. 仍然开放的方向（截至 2026-09-25）
+
+| 方向 | 成本 | 说明 |
+|---|---|---|
+| **训练 seed 方差标定** | ~3.8h × 2 | 性价比最高。所有臂单 seed，而效应量 0.05~0.40，审稿最易问 |
+| 架构 A/B 每臂各扫 lr | ~30~45h | `smamba` / `dconv1` / `gprenorm` 最优 lr 未测 ⇒ 对 GRU 的优势量级与 lr 不可分离。纯严谨性，**不抬主表** |
+| 通信 2 轮从零训 | ~23h | 唯一只做了筛选、未做完整实验的轴 |
+| SQ2 在 7.45M 规模复现 | ~105h | 已决定**接受局限**并在论文写明（等步数对 Reptile 不公平，需两臂各训 40k 步） |
+| ~~SQ3 512 图重跑~~ | — | **已判定不做**：功效计算显示迟滞需 968× 样本（§7.1 第 7 条） |
+| ~~makespan 进目标~~ | — | **已降级**：前提被自家数据削弱（§5.2 末） |
