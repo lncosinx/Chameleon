@@ -37,8 +37,6 @@ def build_net(nc: dict) -> MAPFCommNet:
         head_hidden=nc.get("head_hidden", 128),
         spatial_pool=nc.get("spatial_pool", 0),   # 0=全展平（保留空间布局）
         comm_type=nc.get("comm_type", "madcl"),   # SQ3：只换通信模块的消融轴
-        # 默认 False=历史行为；True 修复迟滞分支缺失的候选掩码（见 communication.py）
-        confine_sticky_to_fov=nc.get("confine_sticky_to_fov", False),
         intent_mode=nc.get("intent_mode", "feature"),  # SQ3：消息内容（特征 vs 显式动作意图）
         hard_topk_select=nc.get("hard_topk_select", False),
     )

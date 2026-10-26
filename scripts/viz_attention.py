@@ -337,8 +337,7 @@ def main():
     ap.add_argument("--network-config", default="configs/network_big.yaml")
     ap.add_argument("--set-net", action="append", default=[], metavar="K=V",
                     help="覆盖网络配置项（与 eval_bench 同语义）。例："
-                         "--set-net confine_sticky_to_fov=true 画**修复后**的通信图；"
-                         "不传则按配置文件/默认值，即保持历史（泄漏）行为。")
+                         "--set-net comm_radius=3。迟滞边已恒限制在通信半径内（离开半径即断开）。")
     ap.add_argument("--family", default="mazes", choices=["random", "mazes"])
     ap.add_argument("--map-index", type=int, default=0, help="族内第几张 validation 图")
     ap.add_argument("--maps-file", default=None)
@@ -372,8 +371,7 @@ def main():
     maps = load_maps(args.family, 128, args.maps_file)
     name, map_str = maps[args.map_index]
     print(f"[viz] {args.ckpt} | {args.family}/{name} | N={args.num_agents} seed={args.seed} "
-          f"| comm_radius={comm_radius} | TTA=off(机制展示用) "
-          f"| confine_sticky_to_fov={bool(nc.get('confine_sticky_to_fov', False))}", flush=True)
+          f"| comm_radius={comm_radius} | TTA=off(机制展示用)", flush=True)
 
     w, obs = make_env(map_str, name, args.num_agents, args.max_steps, "nothing", args.seed)
     attn, pos, goals, occ, solved = rollout_with_attn(
