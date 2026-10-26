@@ -27,7 +27,6 @@ comm_radius: 4
 comm_topk_cap: 6
 entmax_alpha: 1.5
 tau_in: 0.05
-tau_out: 0.02
 stickiness_bonus: 0.1
 ema_decay: 0.0
 num_attention_heads: 4

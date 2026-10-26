@@ -29,7 +29,6 @@ scalar_feat_dim: 8
 spatial_pool: 0
 stickiness_bonus: 0.1
 tau_in: 0.05
-tau_out: 0.02
 temporal_backend: mamba
 temporal_checkpoint: false
 temporal_layers: 2

@@ -21,7 +21,7 @@ v5 统一评测台（SCHEDULE.md §4 协议）。所有 SQ / 所有臂共用这�
       --num-maps 128 --action-mode escape --out /root/autodl-tmp/eval/xxx.json
 """
 from __future__ import annotations
-import sys, os, argparse, json, time, tempfile
+import sys, os, argparse, csv, json, time, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np, torch, yaml
 
@@ -96,8 +96,14 @@ def make_env(map_str: str, name: str, num_agents: int, max_steps: int, on_target
 def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                   on_target="nothing", action_mode="argmax", escape_k=3, escape_temp=1.0,
                   escape_no_wait_after=8, base_temp=1.0, goal_hold="none", tta=False, rng=None,
-                  reset_hidden_every=0, zero_channels=(), wait_bias=0.0, momentum_bias=0.0):
-    """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。"""
+                  reset_hidden_every=0, zero_channels=(), wait_bias=0.0, momentum_bias=0.0,
+                  traj_sink=None):
+    """specs: [(map_str, name, seed)] 长度 E，全部同 num_agents。返回每个 episode 的指标 dict。
+
+    traj_sink: 给定 list 时，把逐步位置 (T+1,E,N,2) 与目标/障碍一并塞进去，用于画轨迹图。
+               默认 None ⇒ 完全不记录，对现有调用零影响。轨迹走的是与指标**同一条**
+               前向路径（含 TTA），所以图与表同源，不存在"图用非 TTA、表用 TTA"的错位。
+    """
     E, N = len(specs), num_agents
     rng = rng or np.random.default_rng(0)
     envs, obs_l, builders = [], [], []
@@ -123,6 +129,8 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
     at_goal_hist = np.zeros((E, N, max_steps + 1), dtype=bool)
     n_escape = 0
     comm_neighbors, comm_flips = [], []
+
+    traj = [] if traj_sink is not None else None
 
     for t in range(max_steps):
         patches = np.empty((E, N, (5 if use_c2g else 4), 11, 11), dtype=np.float32)
@@ -277,9 +285,21 @@ def rollout_chunk(net, specs, num_agents, max_steps, device, use_c2g, c2g_clip,
                 acts = np.where(stuck, samp, acts)
                 n_escape += int(stuck.sum())
 
+        if traj is not None:
+            traj.append(pos.astype(np.int16).copy())      # 本步决策时的位置
+
         for e, w in enumerate(envs):
             obs_l[e], _, _, _ = w.step(acts[e].tolist())
         prev = acts.astype(np.int64)
+
+    if traj is not None:
+        traj.append(np.array([w.get_agents_xy() for w in envs], dtype=np.int16))  # 终局位置
+        traj_sink.append(dict(
+            traj=np.stack(traj),                                   # (T+1,E,N,2)
+            goals=np.stack(goals).astype(np.int16),                # (E,N,2)
+            grids=np.stack([(g != 0).astype(np.uint8) for g in grids]),
+            names=[nm for _ms, nm, _sd in specs],
+            seeds=[sd for _ms, _nm, sd in specs]))
 
     # ---- 终局指标 ----
     out = []
@@ -348,6 +368,19 @@ def main():
     ap.add_argument("--goal-hold", default="none", choices=["none", "greedy", "wait"],
                     help="sample 模式下已到达目标的体是否停止采样（nothing 协议守位）")
     ap.add_argument("--seeds", default="0")
+    ap.add_argument("--dump-traj", default=None,
+                    help="把逐步位置存成 npz（画轨迹图用）。轨迹与指标走同一条前向路径"
+                         "（含 TTA），故图与表同源。配合 --traj-maps 限定少数几张图使用。")
+    ap.add_argument("--traj-maps", default=None,
+                    help="逗号分隔的地图名；给了就只跑这几张（通常配合 --dump-traj）。")
+    ap.add_argument("--dump-episodes", default=None,
+                    help="把**每个 episode** 的原始指标写到该 csv（family/num_agents/map_name/"
+                         "seed + 各指标）。JSON 只存聚合值，逐 seed / 逐图的原始数据一旦不落盘"
+                         "就永久丢失，事后无法做聚类 bootstrap 或与基线的配对检验。"
+                         "★ 只有 CSR/ISR/SoC/makespan 是逐 episode 的；"
+                         "escape_frac/avg_neighbors/edge_flip 是 **chunk 级**（在整批 "
+                         "--batch-envs 个 env 上平均后同值写给该批每个 episode），"
+                         "不要拿这三列做逐 episode 的统计推断。")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default=None)
     ap.add_argument("--tag", default="")
@@ -391,6 +424,13 @@ def main():
         elif tok:
             seeds.append(int(tok))
     results = {}
+    # 逐 episode 落盘：表头在跑出第一批 rows 后才知道（指标键由 rollout_chunk 决定），
+    # 故 writer 延迟到第一次写入时创建；每档跑完即 flush，中断也能保住已完成的档位。
+    ep_fh, ep_writer = None, None
+    if args.dump_episodes:
+        os.makedirs(os.path.dirname(args.dump_episodes) or ".", exist_ok=True)
+        ep_fh = open(args.dump_episodes, "w", newline="")
+
     for fam in fams:
         # --auto-protocol：按各族**官方**网格跑（agents/图数/seed/步数），避免产出
         # 与 leaderboard 不可比的数字。warehouse 是 1 图×128 seed、movingai 是 256 步。
@@ -403,6 +443,11 @@ def main():
         # ★ 2026-09-23 修：--maps-file 自 5bf5042 引入起从未接到此处，所有标注 "dev" 的
         #   历史数字实际跑在 validation-* 测试集上（= 在测试集上调超参）。
         maps = load_maps(fam, f_maps, args.maps_file)
+        if args.traj_maps:
+            want = {x.strip() for x in args.traj_maps.split(",") if x.strip()}
+            maps = [(nm, ms) for nm, ms in maps if nm in want]
+            if not maps:
+                print(f"  [skip] {fam}: --traj-maps 未命中任何图"); continue
         print(f"\n===== {fam}: {len(maps)} maps × {len(f_seeds)} seed(s) "
               f"× {f_steps} steps | agents={f_acs} =====", flush=True)
         results[fam] = {}
@@ -410,6 +455,7 @@ def main():
             t0 = time.time()
             specs = [(ms, nm, sd) for sd in f_seeds for nm, ms in maps]
             rows = []
+            tsink = [] if args.dump_traj else None
             for i in range(0, len(specs), args.batch_envs):
                 chunk = [(ms, nm, sd) for (ms, nm, sd) in specs[i:i + args.batch_envs]]
                 rows += rollout_chunk(net, chunk, na, f_steps, device, use_c2g,
@@ -423,7 +469,33 @@ def main():
                                       zero_channels=tuple(int(x) for x in args.zero_channels.split(",") if x.strip()),
                                       wait_bias=args.wait_bias,
                                       momentum_bias=args.momentum_bias,
+                                      traj_sink=tsink,
                                       rng=np.random.default_rng(1234 + i))
+            if tsink:
+                import itertools
+                np.savez_compressed(
+                    f"{args.dump_traj.rstrip('.npz')}_{fam}_{na}.npz",
+                    traj=np.concatenate([c["traj"] for c in tsink], axis=1),
+                    goals=np.concatenate([c["goals"] for c in tsink], axis=0),
+                    grids=np.concatenate([c["grids"] for c in tsink], axis=0),
+                    names=np.array(list(itertools.chain(*[c["names"] for c in tsink]))),
+                    seeds=np.array(list(itertools.chain(*[c["seeds"] for c in tsink]))),
+                    CSR=np.array([r["CSR"] for r in rows]),
+                    ISR=np.array([r["ISR"] for r in rows]),
+                    family=fam, num_agents=na)
+                print(f"  saved traj -> {args.dump_traj.rstrip('.npz')}_{fam}_{na}.npz", flush=True)
+
+            if ep_fh is not None:
+                # specs 与 rows 严格同序（rollout_chunk 按 chunk 顺序 append），故可直接 zip
+                # 还原每个 episode 的 (map_name, seed)。specs 是 seed-major 排的。
+                keys = list(rows[0].keys())
+                if ep_writer is None:
+                    ep_writer = csv.writer(ep_fh)
+                    ep_writer.writerow(["family", "num_agents", "map_name", "seed"] + keys)
+                for (_ms, nm, sd), r in zip(specs, rows):
+                    ep_writer.writerow([fam, na, nm, sd] + [r[k] for k in keys])
+                ep_fh.flush()
+
             agg = {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
             agg["n"] = len(rows)
             # CSR 的 95% CI（二项）
@@ -434,6 +506,10 @@ def main():
                   f"ISR={agg['ISR']:.3f}  SoC={agg['SoC']:.1f}  mkspn={agg['makespan']:.1f}  "
                   f"nbr={agg['avg_neighbors']:.2f} flip={agg['edge_flip']:.3f} "
                   f"esc={agg['escape_frac']:.3f}  (n={agg['n']}, {time.time()-t0:.0f}s)", flush=True)
+
+    if ep_fh is not None:
+        ep_fh.close()
+        print(f"\nsaved per-episode -> {args.dump_episodes}")
 
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

@@ -18,7 +18,6 @@ comm_topk_cap: 6       # 算力上限：非零邻居超过此数时封顶（非�
                        # 邻居选择用软稀疏(entmax)+迟滞，不用 hard top-k
 entmax_alpha: 1.5      # 软稀疏度：1=softmax，2=sparsemax，1.5 产生稀疏但连续分布
 tau_in: 0.05           # 迟滞进入阈值（非活跃邻居进入需 weight ≥ tau_in）
-tau_out: 0.02          # 迟滞退出阈值（tau_out < tau_in，活跃邻居踢出需 weight < tau_out）
 stickiness_bonus: 0.1  # 已活跃邻居在注意力 logit 上的加分（增强时间稳定性）
 ema_decay: 0.0         # 跨步通信特征 EMA 平滑系数（0=不平滑）
 num_attention_heads: 4 # 多头注意力头数

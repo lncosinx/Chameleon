@@ -41,7 +41,6 @@ class MAPFCommNet(nn.Module):
         comm_topk_cap: int = 6,
         entmax_alpha: float = 1.5,
         tau_in: float = 0.05,
-        tau_out: float = 0.02,
         stickiness_bonus: float = 0.1,
         ema_decay: float = 0.0,
         num_attention_heads: int = 4,
@@ -90,7 +89,7 @@ class MAPFCommNet(nn.Module):
             self.communication = BiIntentAttention(
                 intent_dim=intent_dim, comm_dim=comm_dim, comm_radius=comm_radius,
                 comm_topk_cap=comm_topk_cap, num_heads=num_attention_heads,
-                entmax_alpha=entmax_alpha, tau_in=tau_in, tau_out=tau_out,
+                entmax_alpha=entmax_alpha, tau_in=tau_in,
                 stickiness_bonus=stickiness_bonus, ema_decay=ema_decay,
                 hard_topk_select=hard_topk_select,
             )

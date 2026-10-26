@@ -23,7 +23,6 @@ comm_radius: 4         # r_c < obs_radius=5，FOV 内（INVARIANT 10）
 comm_topk_cap: 6       # 算力上限（非邻居选择机制）
 entmax_alpha: 1.5      # 软稀疏度（1=softmax,2=sparsemax）
 tau_in: 0.05           # 迟滞进入阈值
-tau_out: 0.02          # 迟滞退出阈值（< tau_in）
 stickiness_bonus: 0.1  # 活跃边权重加分（时间稳定性）
 ema_decay: 0.0
 num_attention_heads: 4 # 通信多头数

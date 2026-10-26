@@ -25,7 +25,7 @@ def build_net(nc: dict) -> MAPFCommNet:
         comm_rounds=nc.get("comm_rounds", 1), intent_dim=nc.get("intent_dim", 128),
         comm_dim=nc.get("comm_dim", 128), comm_radius=nc.get("comm_radius", 4),
         comm_topk_cap=nc.get("comm_topk_cap", 6), entmax_alpha=nc.get("entmax_alpha", 1.5),
-        tau_in=nc.get("tau_in", 0.05), tau_out=nc.get("tau_out", 0.02),
+        tau_in=nc.get("tau_in", 0.05),
         stickiness_bonus=nc.get("stickiness_bonus", 0.1), ema_decay=nc.get("ema_decay", 0.0),
         num_attention_heads=nc.get("num_attention_heads", 4),
         temporal_backend=nc.get("temporal_backend", "mamba"),
@@ -37,6 +37,8 @@ def build_net(nc: dict) -> MAPFCommNet:
         head_hidden=nc.get("head_hidden", 128),
         spatial_pool=nc.get("spatial_pool", 0),   # 0=全展平（保留空间布局）
         comm_type=nc.get("comm_type", "madcl"),   # SQ3：只换通信模块的消融轴
+        # 默认 False=历史行为；True 修复迟滞分支缺失的候选掩码（见 communication.py）
+        confine_sticky_to_fov=nc.get("confine_sticky_to_fov", False),
         intent_mode=nc.get("intent_mode", "feature"),  # SQ3：消息内容（特征 vs 显式动作意图）
         hard_topk_select=nc.get("hard_topk_select", False),
     )

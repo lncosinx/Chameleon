@@ -20,8 +20,7 @@ comm_dim: 128
 comm_radius: 4
 comm_topk_cap: 6
 entmax_alpha: 1.5      # 消融轴：1.0=softmax(非稀疏) / 1.5 软稀疏 / 2.0 sparsemax
-tau_in: 0.05           # 迟滞进入；消融轴：tau_in=tau_out=0 → 无迟滞
-tau_out: 0.02          # 迟滞退出
+tau_in: 0.05           # 迟滞进入门限；消融轴：tau_in=0 + stickiness_bonus=0 → 无迟滞
 stickiness_bonus: 0.1
 ema_decay: 0.0
 num_attention_heads: 4

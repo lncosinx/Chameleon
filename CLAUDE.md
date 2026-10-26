@@ -226,7 +226,7 @@ python scripts/make_sq1_table.py --ours <json>:MADCL --metric CSR
 | `d_model` / `cnn_channels` / `n_res_blocks` | 320 / 128 / 3 | |
 | `comm_radius` / `comm_topk_cap` | 4 / 6 | r_c < obs_radius；topk **仅算力上限** |
 | `entmax_alpha` | 1.5 | 软稀疏 |
-| `tau_in` / `tau_out` / `stickiness_bonus` | 0.05 / 0.02 / 0.1 | 迟滞 |
+| `tau_in` / `stickiness_bonus` | 0.05 / 0.1 | 迟滞。★ `tau_out` 已于 2026-10-12 删除：`b_s=0.1 ≥ tau_out=0.02` 使其判据恒真、从未生效。现行语义=已激活边只要仍在候选集内就无条件保留，断开由几何决定 |
 | `comm_dim` / `intent_dim` / `intent_mode` | 192 / 192 / `action` | |
 | `temporal_backend` / `temporal_layers` | `gru` / 2 | |
 | `batch_size` / `sequence_len` | 32 / 32 | |

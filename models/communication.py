@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -161,7 +163,8 @@ class BiIntentAttention(nn.Module):
 
     输出:
         comm_features: (B, N, D)  通信聚合后的特征
-        info:          dict with attn_weights, edge_flip_rate, etc.
+        info:          dict：edge_flip_rate / avg_neighbors / avg_active_neighbors / entmax_alpha
+                       （**不含**注意力权重矩阵；要取权重见下面的 store_attn）
     """
 
     def __init__(
@@ -175,7 +178,7 @@ class BiIntentAttention(nn.Module):
         entmax_alpha: float = 1.5,    # 1=softmax, 2=sparsemax, 默认 1.5
         # 迟滞参数
         tau_in: float = 0.05,         # 进入活跃集的注意力阈值
-        tau_out: float = 0.02,        # 退出活跃集的阈值 (τ_out < τ_in)
+        tau_out=None,                 # ★ 已废弃并忽略，见下方说明。仅为兼容遗留调用保留
         stickiness_bonus: float = 0.1,  # 已活跃邻居的加分
         # 平滑参数
         ema_decay: float = 0.0,       # 跨步 EMA 平滑（0=不平滑）
@@ -189,7 +192,11 @@ class BiIntentAttention(nn.Module):
         self.num_heads = num_heads
         self.entmax_alpha = entmax_alpha
         self.tau_in = tau_in
-        self.tau_out = tau_out
+       
+        if tau_out is not None:
+            warnings.warn(
+                "tau_out 已废弃且被忽略（b_s >= tau_out 使其判据恒真，见分析章命题 2′）。"
+                "请从配置中删除该键。", DeprecationWarning, stacklevel=2)
         self.stickiness_bonus = stickiness_bonus
         self.ema_decay = ema_decay
         self.hard_topk_select = hard_topk_select
@@ -201,6 +208,11 @@ class BiIntentAttention(nn.Module):
         self.v_proj = nn.Linear(intent_dim, comm_dim)
         self.out_proj = nn.Linear(comm_dim, intent_dim)
 
+        # 注意力权重留痕：**默认关闭**。开启后每次 _aggregate 把最终权重矩阵
+        # W (B,T,N,N) 存到 self.last_attn，供可视化/诊断取用。训练与评测路径不要开——
+        # (B,T,N,N) 在 B=32,T=32,N=64 下是 1.3 亿个 float，会直接吃爆显存。
+        self.store_attn = False
+        self.last_attn: Optional[torch.Tensor] = None
         # 跨时间步状态（由外部管理）
         self._active_mask: Optional[torch.Tensor] = None  # (B, N, N) bool
         self._prev_edge_set: Optional[torch.Tensor] = None  # (B, N, N) bool
@@ -211,6 +223,7 @@ class BiIntentAttention(nn.Module):
         self._active_mask = None
         self._prev_edge_set = None
         self._ema_c = None
+        self.last_attn = None
 
     def forward(
         self,
@@ -297,8 +310,8 @@ class BiIntentAttention(nn.Module):
                 # 后-entmax stickiness（替代原预-entmax 加分；sb=0 时无影响）
                 if self.stickiness_bonus > 0:
                     w = w + self.stickiness_bonus * prev_active.float()
-                threshold = torch.where(prev_active, self.tau_out, self.tau_in)
-                w = w.masked_fill(w < threshold, 0.0)
+                w = w * is_candidate[:, t].float()
+                w = torch.where(prev_active, w, w.masked_fill(w < self.tau_in, 0.0))
                 w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-12)
             prev_active = (w > 0).detach()                        # active 在 topk 前更新（B5）
             w_list.append(w)
@@ -320,6 +333,9 @@ class BiIntentAttention(nn.Module):
 
     def _aggregate(self, W, intents, B, T, N):
         """把权重矩阵 W (B,T,N,N) 聚合成通信特征 + 统计量（主臂/消融臂共用，保证口径一致）。"""
+        if self.store_attn:
+            # W 已是 topk 封顶 + 迟滞 scan 之后的**最终生效权重**（行归一化，非零即实际通信边）
+            self.last_attn = W.detach().clone()
         nonzero_count = (W > 0).sum(dim=-1)
         # ===== 并行段：多头聚合 =====
         V_raw = self.v_proj(intents)                              # (B,T,N,comm_dim)

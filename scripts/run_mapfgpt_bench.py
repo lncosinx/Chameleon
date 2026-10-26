@@ -53,6 +53,11 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", required=True)
     ap.add_argument("--tag", default="")
+    # ★ 2026-10-12：探针用的步数覆盖。**默认 0 = 用官方 yaml 的步数**（INVARIANT 17：
+    #   新增旋钮必须默认 no-op，不得静默改变既有调用者的协议）。
+    #   >0 时产出的数字**不可与主表/leaderboard 混读**，只能同口径内部比。
+    ap.add_argument("--max-steps", type=int, default=0,
+                    help="0=用官方协议步数；>0 覆盖（仅探针用，不可与主表混读）")
     args = ap.parse_args()
 
     algo = MAPFGPTInference(MAPFGPTInferenceConfig(
@@ -63,6 +68,9 @@ def main():
     results = {}
     for fam in [f.strip() for f in args.families.split(",") if f.strip()]:
         agents, map_names, seeds, steps = load_protocol(fam)
+        if args.max_steps > 0:
+            print(f"  ⚠️ 步数被覆盖：官方 {steps} → {args.max_steps}（探针口径，勿与主表混读）")
+            steps = args.max_steps
         all_maps = yaml.safe_load(open(os.path.join("eval_configs", FAM_DIR[fam], "maps.yaml")))
         if args.num_maps > 0:
             map_names = map_names[:args.num_maps]
