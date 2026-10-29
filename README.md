@@ -188,3 +188,10 @@ results_v5/ 各实验的结果 JSON 与汇总
 ## 🙏 致谢
 
 [POGEMA](https://github.com/Cognitive-AI-Systems/pogema) · [pogema-toolbox](https://github.com/Cognitive-AI-Systems/pogema-toolbox) · [pogema-benchmark](https://github.com/Cognitive-AI-Systems/pogema-benchmark) · [LaCAM3](https://github.com/Kei18/lacam3) · [MAPF-GPT](https://github.com/Cognitive-AI-Systems/MAPF-GPT) · [SCRIMP](https://github.com/marmotlab/SCRIMP)
+
+## 📄 许可
+
+本项目自己的代码以 [MIT 许可](LICENSE) 发布。例外：
+- `baseline_patches/` 是对第三方仓库（EPH、MAPF-GPT、marl-gpt）评测脚本的修改，沿用各原仓库的许可；
+- `lacam/_lacam.so` 由 [LaCAM3](https://github.com/Kei18/lacam3)（Keisuke Okumura，MIT）编译而来；
+- `SCRIMP/`、`pogema-toolbox/`、`pogema-benchmark/` 是本地克隆的第三方仓库，不在本仓库里分发，许可见各自仓库。

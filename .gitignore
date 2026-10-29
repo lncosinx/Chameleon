@@ -73,3 +73,6 @@ data_c2g_nothing
 data_c2g_small
 
 attnviz
+
+# 独立仓库（github.com/lncosinx/MAPF-Classroom），不作为子仓库放进来
+MAPF-Classroom/
